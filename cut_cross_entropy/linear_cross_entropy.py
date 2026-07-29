@@ -65,6 +65,10 @@ def linear_cross_entropy(
     filter_c_grad: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
+    mile_enabled: bool = False,
+    mile_gamma: float = 1.0,
+    mu_loss_enabled: bool = False,
+    mu_loss_lambda: float = 1e-4,
 ) -> torch.Tensor: ...
 
 
@@ -86,6 +90,10 @@ def linear_cross_entropy(
     filter_c_grad: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
+    mile_enabled: bool = False,
+    mile_gamma: float = 1.0,
+    mu_loss_enabled: bool = False,
+    mu_loss_lambda: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -107,6 +115,10 @@ def linear_cross_entropy(
     filter_c_grad: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
+    mile_enabled: bool = False,
+    mile_gamma: float = 1.0,
+    mu_loss_enabled: bool = False,
+    mu_loss_lambda: float = 1e-4,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -131,6 +143,10 @@ def linear_cross_entropy(
     filter_c_grad: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
+    mile_enabled: bool = False,
+    mile_gamma: float = 1.0,
+    mu_loss_enabled: bool = False,
+    mu_loss_lambda: float = 1e-4,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     :param vocab_parallel_options: Used to enable vocab parallelism."""
@@ -199,8 +215,16 @@ def linear_cross_entropy(
             **cce_opts,
             vocab_parallel_options=vocab_parallel_options,
             return_lse=return_lse,
+            mile_enabled=mile_enabled,
+            mile_gamma=mile_gamma,
+            mu_loss_enabled=mu_loss_enabled,
+            mu_loss_lambda=mu_loss_lambda,
         )
     elif impl == "torch_compile":
+        if mile_enabled:
+            raise ValueError("mile_enabled is only supported by CCE implementations.")
+        if mu_loss_enabled:
+            raise ValueError("mu_loss_enabled is only supported by CCE implementations.")
         loss, lse = torch_compile_linear_cross_entropy(
             e,
             c,
@@ -237,6 +261,10 @@ class LinearCrossEntropy(nn.Module):
         filter_c_grad: bool = True,
         impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
         return_lse: bool = False,
+        mile_enabled: bool = False,
+        mile_gamma: float = 1.0,
+        mu_loss_enabled: bool = False,
+        mu_loss_lambda: float = 1e-4,
     ):
         super().__init__()
         self.ignore_index = ignore_index
@@ -253,6 +281,10 @@ class LinearCrossEntropy(nn.Module):
 
         self.impl = impl
         self.return_lse = return_lse
+        self.mile_enabled = mile_enabled
+        self.mile_gamma = mile_gamma
+        self.mu_loss_enabled = mu_loss_enabled
+        self.mu_loss_lambda = mu_loss_lambda
 
     def forward(
         self,
@@ -277,4 +309,8 @@ class LinearCrossEntropy(nn.Module):
             filter_c_grad=self.filter_c_grad,
             impl=self.impl,
             return_lse=self.return_lse,
+            mile_enabled=self.mile_enabled,
+            mile_gamma=self.mile_gamma,
+            mu_loss_enabled=self.mu_loss_enabled,
+            mu_loss_lambda=self.mu_loss_lambda,
         )

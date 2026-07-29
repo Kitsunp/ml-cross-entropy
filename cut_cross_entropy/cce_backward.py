@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
+from cut_cross_entropy.mu_loss import add_mu_loss_gradient_kernel
 from cut_cross_entropy.tl_autotune import cce_backward_autotune
 from cut_cross_entropy.tl_utils import (
     b_bin_fn,
@@ -81,6 +82,7 @@ def _cce_backward_kernel(
     C,
     Bias,
     LSE,
+    MiLeWeight,
     dOut,
     grad_scale,
     dLSE,
@@ -128,6 +130,7 @@ def _cce_backward_kernel(
     HAS_TARGETS: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
     HAS_DLSE: tl.constexpr,
+    HAS_MILE: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     KAHAN_E: tl.constexpr,
     KAHAN_C: tl.constexpr,
@@ -194,8 +197,9 @@ def _cce_backward_kernel(
         lse = tl.load(LSE + offs_b, mask=offs_b < B, other=float("inf"))
 
     accum = accum.cast(tl.float32)
-    d_accum = tl.exp(accum - lse[:, None])
-    d_accum = tl.where(offs_v[None, :] < V, d_accum, 0.0)
+    probabilities = tl.exp(accum - lse[:, None])
+    probabilities = tl.where(offs_v[None, :] < V, probabilities, 0.0)
+    d_accum = probabilities
 
     if HAS_TARGETS:
         if HAS_SHIFT:
@@ -209,12 +213,24 @@ def _cce_backward_kernel(
     else:
         is_target = None
 
+    if HAS_MILE:
+        if HAS_VALIDS:
+            mile_offs_b = direct_offs_b
+        else:
+            mile_offs_b = offs_b
+        mile_row_mask = mile_offs_b < B
+        mile_weight = tl.load(
+            MiLeWeight + mile_offs_b, mask=mile_row_mask, other=0.0
+        )[:, None]
+        d_accum = mile_weight * d_accum
+
     should_skip = False
-    if (FILTER_E_GRAD and COMPUTE_DE) and (FILTER_C_GRAD and COMPUTE_DC):
-        if _block_is_filtered(tl.abs(d_accum), filter_eps):
-            return
-    elif (FILTER_E_GRAD and COMPUTE_DE) or (FILTER_C_GRAD and COMPUTE_DC):
-        should_skip = _block_is_filtered(tl.abs(d_accum), filter_eps)
+    if not (HAS_MILE and HAS_DLSE):
+        if (FILTER_E_GRAD and COMPUTE_DE) and (FILTER_C_GRAD and COMPUTE_DC):
+            if _block_is_filtered(tl.abs(d_accum), filter_eps):
+                return
+        elif (FILTER_E_GRAD and COMPUTE_DE) or (FILTER_C_GRAD and COMPUTE_DC):
+            should_skip = _block_is_filtered(tl.abs(d_accum), filter_eps)
 
     if ITEM_DO:
         d_out = tl.load(dOut)
@@ -236,9 +252,12 @@ def _cce_backward_kernel(
 
         d_lse = tl.load(dLSE + d_lse_offs_b, mask=d_lse_offs_b < BMax, other=0.0)[:, None]
 
-        d_accum *= d_out + d_lse
+        if HAS_MILE:
+            d_accum = d_accum * d_out + probabilities * d_lse
+        else:
+            d_accum *= d_out + d_lse
 
-        if HAS_TARGETS:
+        if HAS_TARGETS and not HAS_MILE:
             # We have d_accum = d_mm - is_target
             # We then want to get d_accum = d_mm * (d_out + d_lse) - is_target * d_out
             # If we do d_accum * (d_out + d_lse), we get d_mm * (d_out + d_lse) - is_target * (d_out + d_lse)
@@ -328,6 +347,7 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "HAS_TARGETS": lambda args: args["Targets"] is not None,
         "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
         "HAS_DLSE": lambda args: args["dLSE"] is not None,
+        "HAS_MILE": lambda args: args["MiLeWeight"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "ITEM_DO": lambda args: args["dOut"].numel() == 1,
         "GROUP_B": lambda args: 8,
@@ -354,6 +374,10 @@ def cce_backward_kernel(
     bias: torch.Tensor | None,
     bias_info: TensorInfo | None,
     lse: torch.Tensor,
+    mile_weight: torch.Tensor | None,
+    mu: torch.Tensor | None,
+    mu_vocab_size: torch.Tensor | None,
+    mu_loss_lambda: float | None,
     valids: torch.Tensor | None,
     softcap: float | None,
     filter_eps: float | None,
@@ -387,6 +411,13 @@ def cce_backward_kernel(
 
     do = do.contiguous()
     lse = lse.contiguous()
+    if mile_weight is not None:
+        mile_weight = mile_weight.contiguous()
+    if mu is not None:
+        assert mu_vocab_size is not None
+        assert mu_loss_lambda is not None
+        mu = mu.contiguous()
+        mu_vocab_size = mu_vocab_size.contiguous()
 
     de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
     de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
@@ -473,6 +504,7 @@ def cce_backward_kernel(
         c,
         bias,
         lse,
+        mile_weight,
         do,
         grad_scale,
         dlse,
@@ -505,6 +537,11 @@ def cce_backward_kernel(
         FILTER_E_GRAD=filter_e_grad and de is not None,
         FILTER_C_GRAD=filter_c_grad and dc is not None,
     )
+
+    if dc is not None and mu is not None:
+        assert mu_vocab_size is not None
+        assert mu_loss_lambda is not None
+        add_mu_loss_gradient_kernel(dc, mu, mu_vocab_size, do, mu_loss_lambda)
 
     if reduce_e_grad and de is not None:
         de = vp_reduce_e_grad(de, pg)

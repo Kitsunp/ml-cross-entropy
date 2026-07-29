@@ -25,7 +25,15 @@ linear-cross-entropy using `torch.compile`. This implementation will be set to t
 
 **Installation**
 ```bash
-pip install "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
+```
+
+If replacing an existing upstream installation with this fork, force reinstall
+the package without downloading PyTorch and Triton again:
+
+```bash
+pip install --force-reinstall --no-deps \
+  "cut-cross-entropy @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Usage**
@@ -108,6 +116,110 @@ There are several other implementations available depending on your needs.
 | cce_kahan | Uses Kahan summation (or fp32) to improve numerical precision. This comes at the cost of more memory usage (albeit only a temporary buffer in the backward pass). This is useful for long sequence lengths or if the model is particularly sensitive to numerical imprecision.
 | cce_kahan_full_c | Same as cce_kahan and removes gradient filtering on the classifier gradient. This is useful for pretraining but will be slower.
 | cce_kahan_full_c_full_e (cce_exact) | This additionally removes gradient filtering from the embedding gradient. This is useful as a reference point/sanity check. |
+
+
+### MiLe Loss
+
+MiLe loss can be explicitly enabled on any CCE implementation with
+`mile_enabled=True`. The
+recommended pretraining configuration keeps the complete classifier gradient
+and Kahan/FP32 accumulation while retaining block filtering for the embedding
+gradient:
+
+```python
+loss = linear_cross_entropy(
+    embeddings,
+    classifier,
+    labels,
+    impl="cce_kahan_full_c",
+    mile_enabled=True,
+    mile_gamma=1.0,
+)
+```
+
+CCE computes the entropy statistic in the fused forward kernel and applies the
+MiLe-weighted CE gradient in the fused backward kernel. Enabling MiLe always applies the
+stop-gradient and valid-token weight normalization used by the released MiLe
+training code. It does not materialize logits or probabilities in global
+memory. With `mile_enabled=False` (the default), the ordinary CCE path is used
+and no MiLe statistics are allocated. `mile_gamma` only selects the exponent
+while MiLe is enabled. MiLe is not supported by `impl="torch_compile"`.
+
+### Mu loss
+
+The output-classifier mean penalty can be enabled independently or together
+with MiLe:
+
+```python
+loss = linear_cross_entropy(
+    embeddings,
+    classifier,
+    labels,
+    impl="cce_kahan_full_c",
+    mile_enabled=True,
+    mu_loss_enabled=True,
+    mu_loss_lambda=1e-4,
+)
+```
+
+This adds `mu_loss_lambda * ||classifier.float().mean(dim=0)||^2` to the
+mean-reduced loss. Its reduction and direct classifier-gradient update are
+implemented with Triton kernels, without materializing logits. The gradient is
+added once to `dC` and does not alter `dE` or the bias gradient. This is a
+classifier-centering regularizer, not logit centering: it does not subtract the
+mean from the classifier during the forward pass. Mu loss currently requires
+`reduction="mean"` and is not supported by `impl="torch_compile"`.
+
+### MEAP input masking
+
+[Mask-Enhanced Autoregressive Prediction (MEAP)](https://arxiv.org/abs/2502.07490)
+is available as an explicit input operation. It is called **before** the model
+forward, not from inside CCE: CCE receives hidden states after MEAP has changed
+their causal context. Labels and the causal/padding attention masks remain
+unchanged.
+
+Reserve the mask token before model initialization so its input and output rows
+use the model's normal vocabulary initialization. For this repository's padding
+convention, `padding_mask=True` means that a position cannot be replaced.
+
+```python
+from cut_cross_entropy import linear_cross_entropy, meap_mask_inputs
+
+# Keep clean_input_ids/labels unchanged for targets and evaluation.
+model_input_ids = meap_mask_inputs(
+    clean_input_ids,
+    mask_token_id=tokenizer.mask_token_id,
+    enabled=True,                 # explicit on/off switch
+    mask_ratio=0.15,
+    padding_mask=padding_mask,    # no boolean inverse allocation
+    seed=global_step,
+)
+
+hidden = model(model_input_ids, padding_mask)
+loss = linear_cross_entropy(
+    hidden,
+    model.get_output_embeddings().weight,
+    labels,
+    shift=1,
+    impl="cce_kahan_full_c",
+    mile_enabled=True,
+    mile_gamma=1.0,
+    mu_loss_enabled=True,
+    mu_loss_lambda=1e-4,
+)
+```
+
+The Triton kernel samples a fixed number of positions without replacement in
+each sequence, excludes the last eligible input by default for `shift=1`, and
+supports padded, non-packed batches up to sequence length 4096. It allocates
+only the output IDs unless `return_mask=True`; `enabled=False` is a zero-copy
+no-op. Use a seed derived from global step, microstep, and distributed rank, and
+create the masked IDs outside activation-checkpointed regions. A readable
+`implementation="torch"` path is provided for validation. See
+[`docs/meap.md`](docs/meap.md) for the contract and integration details. The
+kernel maps eligible positions through twelve keyed
+swap-or-not permutation rounds, avoiding rejection loops, random-score tensors,
+sorting, and top-k selection.
 
 
 ### Vocabulary Parallelism
@@ -224,7 +336,7 @@ This is a very general and encompasses vision models, contrastive losses, e.g. C
 
 Install cut-cross-entropy with transformers dependencies
 ```bash
-pip install "cut-cross-entropy[transformers] @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy[transformers] @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Usage**
@@ -285,7 +397,7 @@ We provide a training in `training/train.py`.
 
 **Installation**
 ```bash
-pip install "cut-cross-entropy[all] @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy[all] @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Training**

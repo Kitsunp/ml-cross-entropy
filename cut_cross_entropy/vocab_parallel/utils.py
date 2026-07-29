@@ -66,6 +66,18 @@ def vp_reduce_correct_logit(
 
 
 @torch.compile(fullgraph=True)
+def vp_reduce_mean_logit(
+    vp_lse: torch.Tensor,
+    vp_mean_logit: torch.Tensor,
+    lse: torch.Tensor,
+    pg: torch.distributed.ProcessGroup | None,
+) -> torch.Tensor:
+    mean_logit = (vp_lse - lse).exp() * vp_mean_logit
+    torch.distributed.all_reduce(mean_logit, group=pg)
+    return mean_logit
+
+
+@torch.compile(fullgraph=True)
 def vp_reduce_e_grad(
     e_grad: torch.Tensor,
     pg: torch.distributed.ProcessGroup | None,

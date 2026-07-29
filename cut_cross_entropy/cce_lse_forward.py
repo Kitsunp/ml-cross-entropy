@@ -14,6 +14,7 @@ def _cce_lse_forward_kernel(
     C,
     Bias,
     LSE,
+    MeanLogit,
     LA,
     NegCorrectLogit,
     Locks,
@@ -42,6 +43,7 @@ def _cce_lse_forward_kernel(
     GROUP_B: tl.constexpr,  #
     EVEN_D: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
+    HAS_MEAN_LOGIT: tl.constexpr,
     HAS_LA: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     HAS_TARGETS: tl.constexpr,
@@ -121,19 +123,38 @@ def _cce_lse_forward_kernel(
         offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
 
     this_mx = tl.max(logits, axis=1)
-    this_lse = this_mx + tl.log(tl.sum(tl.exp(logits - this_mx[:, None]), axis=1))
+    this_exp = tl.exp(logits - this_mx[:, None])
+    this_exp_sum = tl.sum(this_exp, axis=1)
+    this_lse = this_mx + tl.log(this_exp_sum)
+    if HAS_MEAN_LOGIT:
+        finite_logits = tl.where(offs_v[None, :] < V, logits, 0.0)
+        this_mean_logit = tl.sum(this_exp * finite_logits, axis=1) / this_exp_sum
 
     o_mask = offs_b < B
 
     lse_ptrs = LSE + offs_b
+    mean_logit_ptrs = MeanLogit + offs_b if HAS_MEAN_LOGIT else None
 
     this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
     while tl.atomic_cas(this_locks, 0, 1) == 1:
         pass
 
-    lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
-    lse = tl_logaddexp(lse, this_lse)
-    lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
+    old_lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
+    new_lse = tl_logaddexp(old_lse, this_lse)
+    if HAS_MEAN_LOGIT:
+        old_mean_logit = tl.load(
+            mean_logit_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last"
+        )
+        old_weight = tl.exp(old_lse - new_lse)
+        this_weight = tl.exp(this_lse - new_lse)
+        new_mean_logit = old_weight * old_mean_logit + this_weight * this_mean_logit
+        tl.store(
+            mean_logit_ptrs,
+            new_mean_logit,
+            mask=o_mask,
+            eviction_policy="evict_last",
+        )
+    tl.store(lse_ptrs, new_lse, mask=o_mask, eviction_policy="evict_last")
 
     tl.debug_barrier()
     tl.atomic_xchg(this_locks, 0)
@@ -146,11 +167,17 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
         "HAS_BIAS": lambda args: args["Bias"] is not None,
         "HAS_VALIDS": lambda args: args["Valids"] is not None,
         "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
+        "HAS_MEAN_LOGIT": lambda args: args["MeanLogit"] is not None,
         "HAS_LA": lambda args: args["LA"] is not None,
         "GROUP_B": lambda args: 8,
-        "DOT_PRECISION": lambda args: "tf32"
-        if torch.get_float32_matmul_precision() == "high"
-        else "ieee",
+        # MiLe's entropy statistic is sensitive to the weighted-logit moment.
+        # Keep the ordinary CE path on its configured fast precision, but use
+        # IEEE products when that additional statistic is requested.
+        "DOT_PRECISION": lambda args: "ieee"
+        if args["MeanLogit"] is not None
+        else (
+            "tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"
+        ),
         "HAS_TARGETS": lambda args: args["Targets"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
     }
@@ -163,6 +190,7 @@ class LSEReturn:
     lse: torch.Tensor
     logit_avg: torch.Tensor | None
     neg_correct_logit: torch.Tensor | None
+    mean_logit: torch.Tensor | None
 
 
 def cce_lse_forward_kernel(
@@ -174,6 +202,7 @@ def cce_lse_forward_kernel(
     targets: torch.Tensor | None = None,
     shift: int = 0,
     return_logit_avg: bool = False,
+    return_mean_logit: bool = False,
 ) -> LSEReturn:
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
@@ -191,6 +220,7 @@ def cce_lse_forward_kernel(
     V, D = c.shape
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
+    mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
     neg_correct_logit = e.new_full((B,), 0.0, dtype=torch.float32) if targets is not None else None
     assert lse.stride(0) == 1
 
@@ -214,6 +244,7 @@ def cce_lse_forward_kernel(
         c,
         bias,
         lse,
+        mean_logit,
         logit_avg,
         neg_correct_logit,
         locks,
@@ -235,4 +266,4 @@ def cce_lse_forward_kernel(
         B_BIN=b_bin_fn(B),
     )
 
-    return LSEReturn(lse, logit_avg, neg_correct_logit)
+    return LSEReturn(lse, logit_avg, neg_correct_logit, mean_logit)
