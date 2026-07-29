@@ -33,6 +33,10 @@ def _target_fn_test_vp(
     error_tol: float,
     invalids: bool,
     z_loss: bool,
+    mile_enabled: bool = False,
+    mile_gamma: float = 1.0,
+    mu_loss_enabled: bool = False,
+    mu_loss_lambda: float = 1e-4,
 ):
     device = (
         torch.device("cpu")
@@ -86,11 +90,23 @@ def _target_fn_test_vp(
             impl=impl,
             vocab_parallel_options=vocab_parallel_options,
             return_lse=True,
+            mile_enabled=mile_enabled,
+            mile_gamma=mile_gamma,
+            mu_loss_enabled=mu_loss_enabled,
+            mu_loss_lambda=mu_loss_lambda,
         )
         vp_loss += compute_z_loss(lse, targets)
     else:
         vp_loss = linear_cross_entropy(
-            e, vp_c, targets, impl=impl, vocab_parallel_options=vocab_parallel_options
+            e,
+            vp_c,
+            targets,
+            impl=impl,
+            vocab_parallel_options=vocab_parallel_options,
+            mile_enabled=mile_enabled,
+            mile_gamma=mile_gamma,
+            mu_loss_enabled=mu_loss_enabled,
+            mu_loss_lambda=mu_loss_lambda,
         )
     vp_loss.backward()
 
@@ -101,10 +117,29 @@ def _target_fn_test_vp(
     c.requires_grad_(True)
 
     if z_loss:
-        loss, lse = linear_cross_entropy(e, c, targets, impl=impl, return_lse=True)
+        loss, lse = linear_cross_entropy(
+            e,
+            c,
+            targets,
+            impl=impl,
+            return_lse=True,
+            mile_enabled=mile_enabled,
+            mile_gamma=mile_gamma,
+            mu_loss_enabled=mu_loss_enabled,
+            mu_loss_lambda=mu_loss_lambda,
+        )
         loss += compute_z_loss(lse, targets)
     else:
-        loss = linear_cross_entropy(e, c, targets, impl=impl)
+        loss = linear_cross_entropy(
+            e,
+            c,
+            targets,
+            impl=impl,
+            mile_enabled=mile_enabled,
+            mile_gamma=mile_gamma,
+            mu_loss_enabled=mu_loss_enabled,
+            mu_loss_lambda=mu_loss_lambda,
+        )
 
     loss.backward()
 
@@ -146,6 +181,72 @@ def test_vocab_parallel(
         _target_fn_test_vp,
         args=(nprocs, find_free_port(), impl, dtype, error_tol, invalids, z_loss),
         nprocs=nprocs,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires two CUDA devices")
+def test_vocab_parallel_mile():
+    nprocs = 2
+    mp_spawn(
+        _target_fn_test_vp,
+        args=(
+            nprocs,
+            find_free_port(),
+            "cce_kahan_full_c",
+            torch.bfloat16,
+            3e-2,
+            True,
+            False,
+            True,
+            1.0,
+        ),
+        nprocs=nprocs,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires two CUDA devices")
+def test_vocab_parallel_mu_loss():
+    nprocs = 2
+    mp_spawn(
+        _target_fn_test_vp,
+        args=(
+            nprocs,
+            find_free_port(),
+            "cce_kahan_full_c",
+            torch.bfloat16,
+            3e-2,
+            True,
+            False,
+            True,
+            1.0,
+            True,
+            7e-4,
+        ),
+        nprocs=nprocs,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_vocab_parallel_mu_loss_single_rank():
+    mp_spawn(
+        _target_fn_test_vp,
+        args=(
+            1,
+            find_free_port(),
+            "cce_kahan_full_c",
+            torch.bfloat16,
+            3e-2,
+            True,
+            False,
+            True,
+            1.0,
+            True,
+            7e-4,
+        ),
+        nprocs=1,
         join=True,
     )
 

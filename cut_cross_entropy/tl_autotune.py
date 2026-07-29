@@ -504,7 +504,7 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
                 "perf_model": estimate_matmul_time,
                 "top_k": 10,
             },
-            restore_value=["LSE"],
+            restore_value=["LSE", "MeanLogit"],
             reset_to_zero=["LA"],
         )
     else:

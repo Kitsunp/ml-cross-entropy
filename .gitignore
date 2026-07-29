@@ -3,6 +3,9 @@ __pycache__
 *.pyc
 *.egg-info
 dist
+build
+.pytest_cache
+.ruff_cache
 
 # Log
 *.log
@@ -14,15 +17,25 @@ dist
 
 # Editor
 .idea
+.vscode
 *.swp
 
 # Other
 .DS_Store
+.serena
+.codex
 wandb
 output
+tmp
 
 checkpoints
 ckpts*
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.gguf
 
 .ipynb_checkpoints
 *.ipynb
@@ -40,3 +53,8 @@ my_scripts/
 .autoenv*.zsh
 
 .model_cache/
+
+# Local credentials and machine-specific benchmark outputs
+.env
+.env.*
+!.env.example
