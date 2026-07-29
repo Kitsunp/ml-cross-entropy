@@ -25,7 +25,15 @@ linear-cross-entropy using `torch.compile`. This implementation will be set to t
 
 **Installation**
 ```bash
-pip install "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
+```
+
+If replacing an existing upstream installation with this fork, force reinstall
+the package without downloading PyTorch and Triton again:
+
+```bash
+pip install --force-reinstall --no-deps \
+  "cut-cross-entropy @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Usage**
@@ -328,7 +336,7 @@ This is a very general and encompasses vision models, contrastive losses, e.g. C
 
 Install cut-cross-entropy with transformers dependencies
 ```bash
-pip install "cut-cross-entropy[transformers] @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy[transformers] @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Usage**
@@ -389,7 +397,7 @@ We provide a training in `training/train.py`.
 
 **Installation**
 ```bash
-pip install "cut-cross-entropy[all] @ git+https://github.com/apple/ml-cross-entropy.git"
+pip install "cut-cross-entropy[all] @ git+https://github.com/Kitsunp/ml-cross-entropy.git@main"
 ```
 
 **Training**
