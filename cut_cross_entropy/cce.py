@@ -41,6 +41,7 @@ class CCEParams:
     filter_c_grad: bool
     vocab_parallel_options: VocabParallelOptions | None
     return_lse: bool
+    return_loss_metrics: bool
     mile_gamma: float | None
     mu_loss_lambda: float | None
 
@@ -59,7 +60,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         c: torch.Tensor,
         bias: torch.Tensor | None,
         params: CCEParams,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         needs_grad = e.requires_grad or c.requires_grad
         if bias is not None:
             needs_grad = needs_grad or bias.requires_grad
@@ -149,12 +150,17 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
         if params.mile_gamma is not None:
             assert mean_logit is not None
-            mile_weight, token_loss = cce_mile_forward_kernel(
-                lse, mean_logit, nll, params.mile_gamma
+            mile_weight, token_loss, unweighted_nll_sum = cce_mile_forward_kernel(
+                lse,
+                mean_logit,
+                nll,
+                params.mile_gamma,
+                return_unweighted_nll_sum=params.return_loss_metrics,
             )
         else:
             token_loss = nll
             mile_weight = None
+            unweighted_nll_sum = None
 
         ctx.save_for_backward(
             e,
@@ -180,23 +186,49 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
         reduction = params.reduction
         if reduction == "mean":
-            loss = token_loss.mean()
+            objective_loss = token_loss.mean()
         elif reduction == "sum":
-            loss = token_loss.sum()
+            objective_loss = token_loss.sum()
         elif reduction == "none":
-            loss = handle_reduction_none(params.batch_shape, params.valids, params.shift, token_loss)
+            objective_loss = handle_reduction_none(
+                params.batch_shape, params.valids, params.shift, token_loss
+            )
         else:
             raise ValueError(f"Unknown reduction {reduction}")
 
+        if params.return_loss_metrics:
+            assert reduction == "mean"
+            if unweighted_nll_sum is None:
+                unweighted_ce = objective_loss
+            else:
+                unweighted_ce = unweighted_nll_sum / max(nll.numel(), 1)
+            mu_loss_metric = (
+                mu_loss if mu_loss is not None else objective_loss.new_zeros(())
+            )
+            loss_metrics = torch.stack(
+                (
+                    unweighted_ce,
+                    objective_loss - unweighted_ce,
+                    mu_loss_metric,
+                )
+            ).detach()
+            ctx.mark_non_differentiable(loss_metrics)
+        else:
+            loss_metrics = None
+
+        loss = objective_loss
         if mu_loss is not None:
             loss = loss + mu_loss
 
-        return loss, ret_lse
+        return loss, ret_lse, loss_metrics
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(
-        ctx, grad_out: torch.Tensor, grad_lse_out: torch.Tensor | None
+        ctx,
+        grad_out: torch.Tensor,
+        grad_lse_out: torch.Tensor | None,
+        grad_loss_metrics_out: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
         (
             e,
@@ -287,9 +319,9 @@ def linear_cross_entropy_apply(
     c: torch.Tensor,
     bias: torch.Tensor | None,
     params: CCEParams,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    loss, lse = cast(
-        tuple[torch.Tensor, torch.Tensor | None],
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    loss, lse, loss_metrics = cast(
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
         LinearCrossEntropyFunction.apply(e, c, bias, params),
     )
 
@@ -300,7 +332,7 @@ def linear_cross_entropy_apply(
         assert lse is not None
         lse = lse[..., params.shift :]
 
-    return loss, lse
+    return loss, lse, loss_metrics
 
 
 @add_doc_start(LINEAR_CROSS_ENTROPY_DOC)
@@ -315,6 +347,7 @@ def cce_linear_cross_entropy(
     reduction: str = "mean",
     shift: bool | int = 0,
     return_lse: bool = False,
+    return_loss_metrics: bool = False,
     filter_eps: float | str | None = "auto",
     accum_e_fp32: bool = False,
     accum_c_fp32: bool = False,
@@ -325,7 +358,7 @@ def cce_linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     assert e.size()[0:-1] == targets.size()
     assert e.size(-1) == c.size(1)
     if mile_enabled and (not math.isfinite(mile_gamma) or mile_gamma < 0):
@@ -336,6 +369,8 @@ def cce_linear_cross_entropy(
         )
     if mu_loss_enabled and reduction != "mean":
         raise ValueError("mu_loss_enabled requires reduction='mean'.")
+    if return_loss_metrics and reduction != "mean":
+        raise ValueError("return_loss_metrics requires reduction='mean'.")
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError(
             "Cut Cross Entropy requires an ampere GPU or newer. "
@@ -373,6 +408,7 @@ def cce_linear_cross_entropy(
         filter_c_grad=filter_c_grad and filter_eps is not None,
         vocab_parallel_options=vocab_parallel_options,
         return_lse=return_lse,
+        return_loss_metrics=return_loss_metrics,
         mile_gamma=mile_gamma if mile_enabled else None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
     )

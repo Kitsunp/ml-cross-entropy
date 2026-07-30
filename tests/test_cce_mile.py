@@ -106,11 +106,70 @@ def test_cce_mile_forward_kernel_matches_torch(size: int, gamma: float) -> None:
     expected_weight = (1.0 + entropy).pow(gamma)
     expected_weight *= expected_weight.mean().reciprocal()
     expected_loss = nll * expected_weight
-    actual_weight, actual_loss = cce_mile_forward_kernel(lse, mean_logit, nll, gamma)
+    actual_weight, actual_loss, unweighted_nll_sum = cce_mile_forward_kernel(
+        lse, mean_logit, nll, gamma, return_unweighted_nll_sum=True
+    )
+    assert unweighted_nll_sum is not None
 
     torch.testing.assert_close(actual_weight, expected_weight, rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(actual_loss, expected_loss, rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(actual_weight.mean(), torch.ones((), device="cuda"))
+    torch.testing.assert_close(unweighted_nll_sum, nll.sum(), rtol=2e-5, atol=2e-5)
+
+
+@skip_no_cuda
+def test_cce_loss_metrics_reconcile_without_materializing_logits() -> None:
+    torch.manual_seed(41)
+    e = torch.randn(4, 16, 64, device="cuda", dtype=torch.bfloat16) / 8
+    e.requires_grad_(True)
+    c = torch.randn(257, 64, device="cuda", dtype=torch.bfloat16)
+    c.requires_grad_(True)
+    targets = torch.randint(0, 257, (4, 16), device="cuda")
+    targets[1, -5:] = IGNORE_INDEX
+
+    loss, metrics = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        shift=1,
+        impl="cce_kahan_full_c",
+        mile_enabled=True,
+        mile_gamma=1.0,
+        mu_loss_enabled=True,
+        mu_loss_lambda=1e-4,
+        return_loss_metrics=True,
+    )
+
+    reconstructed = (
+        metrics["ntp_ce_unweighted"]
+        + metrics["mile_reweighting_delta"]
+        + metrics["mu_loss"]
+    )
+    torch.testing.assert_close(reconstructed, loss.detach(), rtol=2e-5, atol=2e-5)
+    assert not any(metric.requires_grad for metric in metrics.values())
+    loss.backward()
+    assert e.grad is not None and torch.isfinite(e.grad).all()
+    assert c.grad is not None and torch.isfinite(c.grad).all()
+
+
+@skip_no_cuda
+def test_plain_cce_loss_metrics_have_zero_extension_terms() -> None:
+    torch.manual_seed(43)
+    e = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(257, 64, device="cuda", dtype=torch.bfloat16)
+    targets = torch.randint(0, 257, (32,), device="cuda")
+
+    loss, metrics = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        impl="cce_exact",
+        return_loss_metrics=True,
+    )
+
+    torch.testing.assert_close(metrics["ntp_ce_unweighted"], loss.detach())
+    torch.testing.assert_close(metrics["mile_reweighting_delta"], torch.zeros_like(loss))
+    torch.testing.assert_close(metrics["mu_loss"], torch.zeros_like(loss))
 
 
 @skip_no_cuda
@@ -272,8 +331,19 @@ def test_mile_rejects_unsupported_options() -> None:
     targets = torch.zeros(2, dtype=torch.long)
     with pytest.raises(ValueError, match="mile_enabled"):
         linear_cross_entropy(e, c, targets, impl="torch_compile", mile_enabled=True)
+    with pytest.raises(ValueError, match="return_loss_metrics"):
+        linear_cross_entropy(e, c, targets, impl="torch_compile", return_loss_metrics=True)
     with pytest.raises(ValueError, match="mile_gamma"):
         linear_cross_entropy(e, c, targets, impl="cce", mile_enabled=True, mile_gamma=-1.0)
+    with pytest.raises(ValueError, match="return_loss_metrics"):
+        linear_cross_entropy(
+            e,
+            c,
+            targets,
+            impl="cce",
+            reduction="sum",
+            return_loss_metrics=True,
+        )
 
 
 @skip_no_cuda

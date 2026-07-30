@@ -40,6 +40,9 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
 
         Integer values must be in [0, T)
     :param return_lse: Whether or not to return the log-sum-exp. Useful for computing Z loss.
+    :param return_loss_metrics: Return compact scalar diagnostics for unweighted NTP cross
+        entropy, the MiLe reweighting delta, and mu loss. Supported by CCE implementations
+        with ``reduction="mean"`` only; no token-by-vocabulary tensor is materialized.
     :param mile_enabled: Explicitly enable MiLe loss with detached, mean-normalized entropy weights.
         Supported by CCE implementations only.
     :param mile_gamma: Non-negative MiLe entropy-weight exponent, used only when MiLe is enabled.
