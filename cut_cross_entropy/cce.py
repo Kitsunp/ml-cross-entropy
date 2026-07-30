@@ -8,6 +8,7 @@ import torch.amp
 
 from cut_cross_entropy.cce_backward import cce_backward_kernel
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+from cut_cross_entropy.cce_mile import cce_mile_forward_kernel
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.doc import CCE_OPTS_DOC, LINEAR_CROSS_ENTROPY_DOC, add_doc_start
 from cut_cross_entropy.mu_loss import mu_loss_forward_kernel
@@ -148,10 +149,9 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
         if params.mile_gamma is not None:
             assert mean_logit is not None
-            entropy = (lse - mean_logit).clamp_min(0.0)
-            mile_weight = (1.0 + entropy).pow(params.mile_gamma)
-            mile_weight = mile_weight * mile_weight.mean().reciprocal()
-            token_loss = nll * mile_weight
+            mile_weight, token_loss = cce_mile_forward_kernel(
+                lse, mean_logit, nll, params.mile_gamma
+            )
         else:
             token_loss = nll
             mile_weight = None

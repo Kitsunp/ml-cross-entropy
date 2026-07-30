@@ -3,6 +3,7 @@ import torch
 
 from cut_cross_entropy import linear_cross_entropy
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+from cut_cross_entropy.cce_mile import cce_mile_forward_kernel
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.utils import softcapping
 
@@ -90,6 +91,26 @@ CASES = [
     (1.0, None, True, 1, True, "mean"),
     (2.0, 20.0, True, 0, True, "none"),
 ]
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("size", [1, 257, 4097, 20000])
+@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0, 2.0])
+def test_cce_mile_forward_kernel_matches_torch(size: int, gamma: float) -> None:
+    torch.manual_seed(4)
+    lse = torch.rand(size, device="cuda", dtype=torch.float32) * 8
+    entropy = torch.rand(size, device="cuda", dtype=torch.float32) * 5
+    mean_logit = lse - entropy
+    nll = torch.rand(size, device="cuda", dtype=torch.float32) * 10
+
+    expected_weight = (1.0 + entropy).pow(gamma)
+    expected_weight *= expected_weight.mean().reciprocal()
+    expected_loss = nll * expected_weight
+    actual_weight, actual_loss = cce_mile_forward_kernel(lse, mean_logit, nll, gamma)
+
+    torch.testing.assert_close(actual_weight, expected_weight, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(actual_weight.mean(), torch.ones((), device="cuda"))
 
 
 @skip_no_cuda

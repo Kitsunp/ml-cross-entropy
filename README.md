@@ -120,6 +120,8 @@ There are several other implementations available depending on your needs.
 
 ### MiLe Loss
 
+![MiLe kernel data flow](assets/mile_kernel.svg)
+
 MiLe loss can be explicitly enabled on any CCE implementation with
 `mile_enabled=True`. The
 recommended pretraining configuration keeps the complete classifier gradient
@@ -144,8 +146,12 @@ training code. It does not materialize logits or probabilities in global
 memory. With `mile_enabled=False` (the default), the ordinary CCE path is used
 and no MiLe statistics are allocated. `mile_gamma` only selects the exponent
 while MiLe is enabled. MiLe is not supported by `impl="torch_compile"`.
+See [`docs/mile.md`](docs/mile.md) for the objective, fused weight-kernel
+branches, detached backward, memory contract, and validation coverage.
 
 ### Mu loss
+
+![Mu-loss kernel data flow](assets/mu_loss_kernel.svg)
 
 The output-classifier mean penalty can be enabled independently or together
 with MiLe:
@@ -169,8 +175,13 @@ added once to `dC` and does not alter `dE` or the bias gradient. This is a
 classifier-centering regularizer, not logit centering: it does not subtract the
 mean from the classifier during the forward pass. Mu loss currently requires
 `reduction="mean"` and is not supported by `impl="torch_compile"`.
+See [`docs/mu_loss.md`](docs/mu_loss.md) for the forward reduction, optional
+vocabulary-parallel synchronization, direct classifier gradient, and memory
+contract.
 
 ### MEAP input masking
+
+![MEAP kernel data flow](assets/meap_kernel.svg)
 
 [Mask-Enhanced Autoregressive Prediction (MEAP)](https://arxiv.org/abs/2502.07490)
 is available as an explicit input operation. It is called **before** the model
