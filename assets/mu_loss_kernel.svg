@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="920" viewBox="0 0 1800 920" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Mu-loss Triton kernel data flow</title>
+  <desc id="desc">Three spacious panels show an FP32 reduction over classifier rows, optional vocabulary-parallel synchronization and penalty finalization, and direct in-place addition of the shared mu-loss gradient to the classifier gradient.</desc>
+  <defs>
+    <marker id="muArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#59616a"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Georgia, serif; fill: #222a31; }
+      .subtitle { font: 18px Arial, sans-serif; fill: #5e6872; }
+      .panel-title { font: 700 25px Georgia, serif; fill: #222a31; }
+      .section { font: 700 16px Arial, sans-serif; letter-spacing: .7px; fill: #6a737c; }
+      .label { font: 18px Arial, sans-serif; fill: #404a53; }
+      .small { font: 16px Arial, sans-serif; fill: #4f5962; }
+      .tiny { font: 14px Arial, sans-serif; fill: #5f6972; }
+      .math { font: italic 23px Georgia, serif; fill: #ffffff; }
+      .math-dark { font: italic 21px Georgia, serif; fill: #303941; }
+      .mono { font: 16px 'Courier New', monospace; fill: #303941; }
+      .white { fill: #ffffff; }
+      .flow { stroke: #59616a; stroke-width: 2.6; fill: none; marker-end: url(#muArrow); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="920" fill="#ffffff"/>
+  <text x="900" y="46" text-anchor="middle" class="title">Mu Loss inside Cut Cross Entropy</text>
+  <text x="900" y="78" text-anchor="middle" class="subtitle">Reduce the classifier center in FP32 · retain O(D) state · add one shared row-gradient directly into dC</text>
+
+  <!-- Panel A: local sum -->
+  <rect x="30" y="112" width="560" height="700" rx="16" fill="#fbfaf7" stroke="#d7d3ca" stroke-width="2"/>
+  <text x="310" y="151" text-anchor="middle" class="panel-title">(a) Sum classifier rows</text>
+  <text x="310" y="180" text-anchor="middle" class="section">OUTPUT CLASSIFIER C ∈ ℝ V×D</text>
+
+  <text x="92" y="224" class="small">V vocabulary rows</text>
+  <text x="370" y="224" class="small">D features</text>
+  <rect x="75" y="242" width="340" height="360" fill="#aebbc8"/>
+  <line x1="75" y1="302" x2="415" y2="302" stroke="#ffffff" stroke-width="3"/>
+  <line x1="75" y1="362" x2="415" y2="362" stroke="#ffffff" stroke-width="3"/>
+  <line x1="75" y1="422" x2="415" y2="422" stroke="#ffffff" stroke-width="3"/>
+  <line x1="75" y1="482" x2="415" y2="482" stroke="#ffffff" stroke-width="3"/>
+  <line x1="75" y1="542" x2="415" y2="542" stroke="#ffffff" stroke-width="3"/>
+  <line x1="160" y1="242" x2="160" y2="602" stroke="#ffffff" stroke-width="3"/>
+  <line x1="245" y1="242" x2="245" y2="602" stroke="#ffffff" stroke-width="3"/>
+  <line x1="330" y1="242" x2="330" y2="602" stroke="#ffffff" stroke-width="3"/>
+  <rect x="76" y="363" width="338" height="118" fill="#3f82b7" opacity=".94"/>
+  <rect x="246" y="243" width="83" height="358" fill="#eda336" opacity=".88"/>
+  <rect x="246" y="363" width="83" height="118" fill="#555d66"/>
+  <text x="287" y="430" text-anchor="middle" class="math">Cᵥd</text>
+
+  <path d="M 416 422 L 466 422" class="flow"/>
+  <rect x="468" y="300" width="76" height="244" fill="#c8a5a0"/>
+  <rect x="468" y="380" width="76" height="84" fill="#bd665c"/>
+  <text x="506" y="430" text-anchor="middle" class="math">Σᵥ</text>
+  <text x="506" y="570" text-anchor="middle" class="tiny">FP32 vector [D]</text>
+
+  <rect x="102" y="650" width="416" height="58" rx="8" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
+  <text x="310" y="676" text-anchor="middle" class="small">one program per feature tile</text>
+  <text x="310" y="698" text-anchor="middle" class="tiny">stream BLOCK_V × BLOCK_D tiles</text>
+  <path d="M 310 709 L 310 742" class="flow"/>
+  <rect x="185" y="744" width="250" height="42" rx="7" fill="#bd665c"/>
+  <text x="310" y="771" text-anchor="middle" class="small white">local_sum[D], FP32</text>
+
+  <!-- Panel B: global mean and loss -->
+  <rect x="620" y="112" width="560" height="700" rx="16" fill="#fbfaf7" stroke="#d7d3ca" stroke-width="2"/>
+  <text x="900" y="151" text-anchor="middle" class="panel-title">(b) Global center and penalty</text>
+  <text x="900" y="180" text-anchor="middle" class="section">SYNCHRONIZE ONLY WHEN THE VOCABULARY IS SHARDED</text>
+
+  <rect x="655" y="214" width="190" height="52" rx="7" fill="#bd665c"/>
+  <text x="750" y="247" text-anchor="middle" class="small white">local_sum[D]</text>
+  <rect x="955" y="214" width="190" height="52" rx="7" fill="#d69a70"/>
+  <text x="1050" y="247" text-anchor="middle" class="small white">local V</text>
+  <path d="M 750 267 L 830 322" class="flow"/>
+  <path d="M 1050 267 L 970 322" class="flow"/>
+
+  <rect x="715" y="319" width="370" height="104" rx="10" fill="#eef4f7" stroke="#6f94ad" stroke-width="2" stroke-dasharray="8 7"/>
+  <text x="900" y="350" text-anchor="middle" class="small">optional vocabulary-parallel synchronization</text>
+  <text x="900" y="381" text-anchor="middle" class="mono">all_reduce(local_sum, SUM)</text>
+  <text x="900" y="407" text-anchor="middle" class="mono">all_reduce(local V, SUM)</text>
+
+  <path d="M 900 424 L 900 463" class="flow"/>
+  <rect x="725" y="465" width="350" height="78" rx="9" fill="#555d66"/>
+  <text x="900" y="502" text-anchor="middle" class="math">μ = (1 / V) Σᵥ Cᵥ</text>
+  <text x="900" y="529" text-anchor="middle" class="tiny white">finalize kernel; FP32 vector [D]</text>
+
+  <path d="M 900 544 L 900 584" class="flow"/>
+  <rect x="710" y="586" width="380" height="76" rx="9" fill="#4fa765"/>
+  <text x="900" y="622" text-anchor="middle" class="math">Lμ = λ ‖μ‖²₂</text>
+  <text x="900" y="648" text-anchor="middle" class="tiny white">one scalar, added to mean-reduced CCE</text>
+
+  <path d="M 820 663 L 760 718" class="flow"/>
+  <path d="M 980 663 L 1040 718" class="flow"/>
+  <rect x="655" y="720" width="210" height="48" rx="7" fill="#86bb93"/>
+  <text x="760" y="750" text-anchor="middle" class="small white">save μ[D]</text>
+  <rect x="935" y="720" width="210" height="48" rx="7" fill="#86bb93"/>
+  <text x="1040" y="750" text-anchor="middle" class="small white">return scalar Lμ</text>
+
+  <!-- Panel C: direct backward -->
+  <rect x="1210" y="112" width="560" height="700" rx="16" fill="#fbfaf7" stroke="#d7d3ca" stroke-width="2"/>
+  <text x="1490" y="151" text-anchor="middle" class="panel-title">(c) Add the direct gradient in place</text>
+  <text x="1490" y="180" text-anchor="middle" class="section">THE SAME D-VECTOR IS ADDED TO EVERY VOCABULARY ROW</text>
+
+  <rect x="1250" y="216" width="190" height="52" rx="7" fill="#4fa765"/>
+  <text x="1345" y="249" text-anchor="middle" class="small white">saved μ[D]</text>
+  <rect x="1540" y="216" width="190" height="52" rx="7" fill="#c8a5a0"/>
+  <text x="1635" y="249" text-anchor="middle" class="small white">upstream dOut</text>
+  <path d="M 1345 269 L 1435 333" class="flow"/>
+  <path d="M 1635 269 L 1545 333" class="flow"/>
+
+  <rect x="1335" y="330" width="310" height="104" rx="9" fill="#555d66"/>
+  <text x="1490" y="372" text-anchor="middle" class="math">r = dOut · (2λ / V) μ</text>
+  <text x="1490" y="402" text-anchor="middle" class="small white">r ∈ ℝᴰ; independent of row v</text>
+
+  <path d="M 1490 435 L 1490 478" class="flow"/>
+  <rect x="1265" y="480" width="450" height="204" fill="#aebbc8"/>
+  <line x1="1265" y1="548" x2="1715" y2="548" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1265" y1="616" x2="1715" y2="616" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1377" y1="480" x2="1377" y2="684" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1490" y1="480" x2="1490" y2="684" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1603" y1="480" x2="1603" y2="684" stroke="#ffffff" stroke-width="3"/>
+  <rect x="1378" y="548" width="224" height="68" fill="#3f82b7"/>
+  <text x="1490" y="590" text-anchor="middle" class="math">dCᵥ += r</text>
+
+  <text x="1490" y="717" text-anchor="middle" class="small">32 × 32 Triton tiles; write into the existing dC allocation</text>
+  <rect x="1255" y="744" width="200" height="42" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
+  <text x="1355" y="771" text-anchor="middle" class="tiny">no direct ∇E</text>
+  <rect x="1525" y="744" width="200" height="42" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
+  <text x="1625" y="771" text-anchor="middle" class="tiny">no direct ∇bias</text>
+
+  <!-- Legend and key conclusion -->
+  <rect x="30" y="838" width="1740" height="56" rx="10" fill="#f4f6f7" stroke="#d7dde1"/>
+  <rect x="58" y="855" width="25" height="20" fill="#bd665c"/><text x="94" y="871" class="tiny">FP32 reduction</text>
+  <rect x="232" y="855" width="25" height="20" fill="#4fa765"/><text x="268" y="871" class="tiny">penalty / saved μ</text>
+  <rect x="435" y="855" width="25" height="20" fill="#3f82b7"/><text x="471" y="871" class="tiny">in-place dC update</text>
+  <text x="1740" y="871" text-anchor="end" class="label">Mu loss penalizes the center over optimizer steps; it does not hard-center C in the forward pass.</text>
+</svg>

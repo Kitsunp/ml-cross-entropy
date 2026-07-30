@@ -7,6 +7,57 @@ The implementation follows the separation used by the
 corrupts autoregressive inputs, while CCE computes the objective from the
 resulting hidden states and the original clean labels.
 
+![MEAP kernel data flow](../assets/meap_kernel.svg)
+
+## How to read the diagram
+
+`T` is the padded sequence length, `N` is the number of eligible positions in
+one sequence after exclusions, and `K` is the exact number that MEAP replaces.
+The Triton launch uses one program per batch row.
+
+- **Panel (a)** loads the IDs and, when supplied, the existing padding or
+  eligibility mask. A prefix sum simultaneously counts eligible positions and
+  maps sparse positions onto the dense rank domain `[0, N)`. `exclude_last`
+  acts before this count, so the protected final position is not part of `N`.
+- **Panel (b)** permutes those dense ranks using two Philox-derived sequence
+  keys and twelve fixed swap-or-not rounds. Every round pairs ranks and gives
+  both members of a pair the same swap decision, so each round is an
+  involution and their composition remains a bijection.
+- **Panel (c)** compares each unique permuted rank with `K`. The predicate
+  `permuted_rank < K` therefore selects exactly `K` distinct positions without
+  scores, sorting, top-k, collision handling, or retry loops. `tl.where` then
+  chooses between the original ID and the mask-token ID. The output IDs are the
+  only required global write; the selected-position mask is optional.
+- **Panel (d)** places the operation in the training pipeline. Corrupted IDs
+  enter the causal Transformer, while clean labels and the original
+  causal/padding masks remain unchanged. CCE, MiLe, and mu loss operate later
+  on the resulting contextual hidden states.
+
+MEAP has no differentiable backward kernel because it is an integer input
+augmentation. Its training effect comes from changing the causal context from
+which hidden states are computed, not from adding another term to the loss.
+
+## Kernel architecture
+
+The wrapper launches `_meap_mask_inputs_kernel` with grid `(batch_size,)`.
+Consequently, one Triton program owns one complete sequence and can perform the
+prefix sum, reductions, and permutation without communication between rows.
+
+| Component | Kernel design | Consequence |
+| --- | --- | --- |
+| Program shape | `BLOCK_T = next_power_of_2(sequence_length)` | One static lane domain covers the complete row; lanes beyond `T` are masked. |
+| Launch | Four warps through `BLOCK_T=512`, eight above it, one stage | Fixed launch policy with no runtime autotuner lookup. |
+| Compile-time flags | Existing-mask presence, padding-mask convention, `exclude_last`, and `return_mask` are `tl.constexpr` | Unused mask reads, branches, and diagnostic stores are removed from the compiled specialization. |
+| Row state | Eligibility, prefix ranks, permutation state, and selection stay in registers | No global random-score, sorting workspace, top-k workspace, or atomic counter. |
+| Required I/O | Read IDs and an optional existing mask; write masked IDs | Global memory traffic is linear in the input size. |
+| Optional I/O | Write one boolean per position only for `return_mask=True` | Training avoids the diagnostic allocation by default. |
+| Work | `O(B * T)` with twelve fixed permutation rounds | Execution does not grow as `T log T` as sorting would. |
+
+The current register-resident design deliberately caps the Triton path at
+sequence length 4096. Raising that limit is not a constant-only change: the
+larger power-of-two block would increase register pressure and can reduce
+occupancy, so it would require a separate multi-block design and benchmark.
+
 ## Data flow
 
 1. Collate clean token IDs, clean shifted labels, and the padding mask.
