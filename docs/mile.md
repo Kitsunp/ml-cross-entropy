@@ -10,53 +10,61 @@ detached from autograd.
 
 ## How to read the diagram
 
-`N` is the number of valid tokens after shift, padding, and `ignore_index`
-filtering; `V` is the vocabulary size. Subscript `n` selects a token block and
-subscript `v` selects a vocabulary tile.
+$N$ is the number of valid tokens after shift, padding, and `ignore_index`
+filtering; $V$ is the vocabulary size. Subscript $n$ selects a token block and
+subscript $v$ selects a vocabulary tile.
 
 - **Panel (a)** is still the ordinary blockwise CCE forward. Each temporary
-  `z_nv` tile lives in registers. While vocabulary tiles stream through the
-  program, CCE reduces them into three FP32 values per valid token: `LSE_n`,
-  `m_n = E_p[z_n]`, and `NLL_n`.
-- **Panel (b)** is the MiLe-specific post-processing. `LSE_n - m_n` gives the
-  predictive entropy, the entropy produces a raw weight `a_n`, and the global
+  $z_{nv}$ tile lives in registers. While vocabulary tiles stream through the
+  program, CCE reduces them into three FP32 values per valid token:
+  $\operatorname{LSE}_n$, $m_n=\mathbb E_{p_n}[z_n]$, and
+  $\operatorname{NLL}_n$.
+- **Panel (b)** is the MiLe-specific post-processing.
+  $\operatorname{LSE}_n-m_n$ gives the predictive entropy, the entropy produces
+  a raw weight $a_n$, and the global
   mean makes the final weights average to one. The two blue boxes are execution
   strategies for the same formula, not two different objectives.
 - **Panel (c)** is CCE backward. It reconstructs one logit tile, forms the usual
-  cross-entropy gradient, loads one saved scalar `w_n`, and multiplies the whole
-  token row by it before accumulating `dE` and `dC`.
+  cross-entropy gradient, loads one saved scalar $w_n$, and multiplies the whole
+  token row by it before accumulating $\mathrm dE$ and $\mathrm dC$.
 
-The long `NLL_n` route in panel (b) is intentionally separate from weight
+The long $\operatorname{NLL}_n$ route in panel (b) is intentionally separate from weight
 normalization: NLL does not determine the weight. It meets the detached weight
-only at the final product `w_n * NLL_n`.
+only at the final product $w_n\operatorname{NLL}_n$.
 
 ## Objective
 
-For valid token `i`, logits `z_i`, probabilities `p_i`, and target `y_i`:
+For valid token $i$, logits $z_i$, probabilities $p_i$, and target $y_i$:
 
-```text
-H_i = logsumexp(z_i) - sum_j p_ij z_ij
-a_i = (1 + H_i) ** gamma
-w_i = stop_gradient(a_i / mean_valid(a))
-L_MiLe = mean_valid(w_i * -log p_i,y_i)
-```
+$$
+\begin{aligned}
+H_i &= \operatorname{logsumexp}(z_i)-\sum_j p_{ij}z_{ij}, \\
+a_i &= (1+H_i)^\gamma, \\
+w_i &= \operatorname{stop\_gradient}\!\left(\frac{a_i}{\operatorname{mean}_{k\in\mathcal V}(a_k)}\right), \\
+\mathcal L_{\mathrm{MiLe}} &= \operatorname{mean}_{i\in\mathcal V}\!\left(-w_i\log p_{i,y_i}\right),
+\end{aligned}
+$$
 
-The normalization preserves `mean_valid(w) = 1`, so MiLe changes the allocation
+where $\mathcal V$ is the set of valid tokens. The normalization preserves
+$\operatorname{mean}_{i\in\mathcal V}(w_i)=1$, so MiLe changes the allocation
 of gradient across tokens rather than deliberately increasing the average loss
 scale. The stop-gradient does **not** remove the effect of the weight:
 
-```text
-dL/dtheta = mean_valid(w_i * dCE_i/dtheta)
-```
+$$
+\frac{\partial \mathcal L_{\mathrm{MiLe}}}{\partial\theta}
+= \operatorname{mean}_{i\in\mathcal V}\!\left(
+w_i\frac{\partial\operatorname{CE}_i}{\partial\theta}
+\right).
+$$
 
 It only removes the additional `CE_i * dw_i/dtheta` term. Weights are recomputed
 from the current model on every forward pass and then treated as constants for
 that backward pass.
 
-For `gamma > 0`, higher-entropy tokens receive a larger weight relative to
+For $\gamma>0$, higher-entropy tokens receive a larger weight relative to
 lower-entropy tokens in the same valid-token batch. Because the weight is
 detached, this is an allocation rule for the CE gradient; it is not a direct
-entropy-minimization gradient. At `gamma=0`, every normalized weight is one and
+entropy-minimization gradient. At $\gamma=0$, every normalized weight is one and
 the objective reduces to ordinary CCE.
 
 ## CCE execution path
@@ -76,9 +84,9 @@ MiLe is integrated into the existing CCE pipeline and never materializes the
 
 The entropy identity in step 2 is exact for the logits processed by CCE:
 
-```text
-H(p_i) = logsumexp(z_i) - E_p[z_i]
-```
+$$
+H(p_i)=\operatorname{logsumexp}(z_i)-\mathbb E_{p_i}[z_i].
+$$
 
 No probability or full-logit matrix is stored.
 
@@ -94,8 +102,9 @@ The token-wise post-processing has two execution paths:
 
 The valid-token count is a runtime value, so different padding counts do not
 compile one kernel per exact token count. Only the power-of-two block shape and
-the specialized gamma mode affect compilation. `gamma=0` and `gamma=1` avoid a
-general power operation; other values use `exp(gamma * log(1 + H))`.
+the specialized gamma mode affect compilation. $\gamma=0$ and $\gamma=1$ avoid a
+general power operation; other values use
+$\exp\!\left[\gamma\log(1+H)\right]$.
 
 ## Memory contract
 
@@ -130,6 +139,12 @@ loss = linear_cross_entropy(
 MiLe can be combined with mu loss by setting both explicit flags. Padding and
 `ignore_index` entries do not participate in the weight mean. MiLe is supported
 by CCE implementations and is intentionally rejected by `impl="torch_compile"`.
+
+Setting `return_loss_metrics=True` with `reduction="mean"` returns the loss and
+a dictionary containing `ntp_ce_unweighted`, `mile_reweighting_delta`, and
+`mu_loss`. These compact device scalars satisfy
+$\mathcal L=\mathcal L_{\mathrm{NTP}}+\Delta_{\mathrm{MiLe}}+\mathcal L_\mu$; the unweighted
+NLL sum is reduced inside the MiLe kernel rather than reconstructed from logits.
 
 ## Precision and gradient filtering
 

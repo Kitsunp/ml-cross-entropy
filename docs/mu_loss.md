@@ -9,12 +9,12 @@ or centering the classifier during the forward pass.
 
 ## How to read the diagram
 
-`C` is the output classifier, `V` is its number of vocabulary rows, and `D` is
-the embedding width. `C_v` denotes one vocabulary row, not a token activation.
+$C$ is the output classifier, $V$ is its number of vocabulary rows, and $D$ is
+the embedding width. $C_v$ denotes one vocabulary row, not a token activation.
 
 - **Panel (a)** streams `C` in `BLOCK_V x BLOCK_D` tiles and reduces over the
-  vocabulary axis in FP32. Its output is one local vector of length `D`, not a
-  second `V x D` tensor.
+  vocabulary axis in FP32. Its output is one local vector of length $D$, not a
+  second $V\times D$ tensor.
 - **Panel (b)** synchronizes that vector and the row count only when vocabulary
   parallelism is active. The finalize kernel divides by global `V`, saves `mu`,
   and returns the scalar penalty.
@@ -29,18 +29,20 @@ forward goes directly from the local reduction to finalization.
 
 ## Objective
 
-For output classifier `C` with vocabulary size `V` and embedding width `D`:
+For output classifier $C$ with vocabulary size $V$ and embedding width $D$:
 
-```text
-mu = mean(C, dim=0) = (1 / V) * sum_v C_v
-L_mu = lambda * ||mu||_2 ** 2
-```
+$$
+\mu=\frac{1}{V}\sum_{v=1}^{V}C_v,
+\qquad
+\mathcal L_\mu=\lambda\lVert\mu\rVert_2^2.
+$$
 
 The derivative is identical for every vocabulary row:
 
-```text
-dL_mu/dC_v = (2 * lambda / V) * mu
-```
+$$
+\frac{\partial\mathcal L_\mu}{\partial C_v}
+=\frac{2\lambda}{V}\mu.
+$$
 
 This is the classifier's common-row direction. It is complementary to ordinary
 cross-entropy and detached MiLe gradients, which act primarily through
@@ -48,15 +50,17 @@ differences between vocabulary rows.
 
 Geometrically, each classifier row can be decomposed as:
 
-```text
-C_v = mu + delta_v,    with sum_v delta_v = 0
-```
+$$
+C_v=\mu+\delta_v,
+\qquad
+\sum_{v=1}^{V}\delta_v=0.
+$$
 
-The direct mu-loss gradient acts only on the shared `mu` component. It does not
-directly change the centered row differences `delta_v`, which continue to learn
+The direct mu-loss gradient acts only on the shared $\mu$ component. It does not
+directly change the centered row differences $\delta_v$, which continue to learn
 from CCE or MiLe. Repeated optimizer steps tend to shrink the common component,
 but other loss gradients can rebuild it, so the result is a soft correction
-rather than an exact projection onto `mu=0`.
+rather than an exact projection onto $\mu=0$.
 
 ## Triton forward
 
@@ -65,7 +69,7 @@ The forward uses two Triton kernels:
 1. `_output_embedding_sum_kernel` traverses classifier rows in vocabulary tiles
    and accumulates an FP32 sum for every embedding dimension.
 2. `_mu_loss_finalize_kernel` divides by the global vocabulary size, stores the
-   compact vector `mu`, and produces the scalar `lambda * sum(mu ** 2)`.
+   compact vector $\mu$, and produces the scalar $\lambda\lVert\mu\rVert_2^2$.
 
 With vocabulary parallelism, each rank first computes its local row sum. The
 local sums and vocabulary sizes are then combined with distributed
@@ -74,24 +78,26 @@ the same global `mu` and global `V`.
 
 The scalar mu loss is added to the mean-reduced CCE or MiLe loss:
 
-```text
-L_total = L_CCE_or_MiLe + L_mu
-```
+$$
+\mathcal L_{\mathrm{total}}
+=\mathcal L_{\mathrm{CCE\ or\ MiLe}}+\mathcal L_\mu.
+$$
 
 Mu loss currently requires `reduction="mean"`; this keeps its scale independent
 of the number of valid training tokens.
 
 ## Triton backward
 
-The CCE backward first computes the ordinary classifier gradient `dC`. The
-`_add_mu_loss_gradient_kernel` then visits `dC` in `32 x 32` tiles and adds:
+The CCE backward first computes the ordinary classifier gradient $\mathrm dC$.
+The `_add_mu_loss_gradient_kernel` then visits $\mathrm dC$ in $32\times32$
+tiles and adds
 
-```text
-dOut * (2 * lambda / V) * mu
-```
+$$
+\mathrm{dOut}\,\frac{2\lambda}{V}\mu
+$$
 
 to every vocabulary row in place. There is no separate dense gradient tensor.
-The direct mu-loss term does not modify the hidden-state gradient `dE` or the
+The direct mu-loss term does not modify the hidden-state gradient $\mathrm dE$ or the
 bias gradient because its objective depends only on `C`.
 
 When input and output embeddings are tied, the shared parameter can still
@@ -109,9 +115,9 @@ loss:          one FP32 scalar
 vocab_size:    one FP32 scalar
 ```
 
-The backward adds directly into the existing `dC` allocation. Compute scales as
-`O(V * D)`, which is the minimum work required to read the classifier and apply
-the row-wise regularizer, while auxiliary memory remains `O(D)`.
+The backward adds directly into the existing $\mathrm dC$ allocation. Compute
+scales as $O(VD)$, which is the minimum work required to read the classifier and
+apply the row-wise regularizer, while auxiliary memory remains $O(D)$.
 
 ## Mu loss is not hard centering
 
@@ -121,7 +127,7 @@ Mu loss penalizes the center but does not execute:
 classifier = classifier - classifier.mean(dim=0)
 ```
 
-Consequently, `mu` approaches zero according to the optimizer, learning rate,
+Consequently, $\mu$ approaches zero according to the optimizer, learning rate,
 coefficient, and training duration; it is not forced to zero after every step.
 This also means that a small coefficient such as `1e-4` can act slowly in short
 training runs.

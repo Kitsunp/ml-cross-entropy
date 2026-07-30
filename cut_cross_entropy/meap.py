@@ -40,6 +40,7 @@ def _meap_mask_inputs_kernel(
     SelectionMask,
     OutputIds,
     OutputMask,
+    Metrics,
     sequence_length,
     mask_token_id,
     mask_ratio,
@@ -56,6 +57,7 @@ def _meap_mask_inputs_kernel(
     MASK_IS_PADDING: tl.constexpr,
     EXCLUDE_LAST: tl.constexpr,
     RETURN_MASK: tl.constexpr,
+    RETURN_METRICS: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -110,6 +112,9 @@ def _meap_mask_inputs_kernel(
             selected,
             mask=in_bounds,
         )
+    if RETURN_METRICS:
+        tl.atomic_add(Metrics, eligible_count)
+        tl.atomic_add(Metrics + 1, requested_count)
 
 
 def _validate_meap_inputs(
@@ -158,7 +163,8 @@ def _torch_meap_mask_inputs(
     padding_mask: torch.Tensor | None,
     seed: int,
     exclude_last: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_metrics: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Readable reference used for validation and torch.compile benchmarks."""
     if padding_mask is not None:
         eligible = ~padding_mask
@@ -189,7 +195,12 @@ def _torch_meap_mask_inputs(
     selected_by_rank = ranks < requested_count.unsqueeze(1)
     selected = torch.zeros_like(eligible).scatter_(1, order, selected_by_rank)
     selected &= eligible
-    return input_ids.masked_fill(selected, mask_token_id), selected
+    metrics = (
+        torch.stack((eligible_count.sum(), requested_count.sum())).to(torch.int32)
+        if return_metrics
+        else None
+    )
+    return input_ids.masked_fill(selected, mask_token_id), selected, metrics
 
 
 def _triton_meap_mask_inputs(
@@ -201,7 +212,8 @@ def _triton_meap_mask_inputs(
     seed: int,
     exclude_last: bool,
     return_mask: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_metrics: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     sequence_length = input_ids.size(1)
     block_t = triton.next_power_of_2(sequence_length)
     if block_t > 4096:
@@ -210,6 +222,10 @@ def _triton_meap_mask_inputs(
         )
     output = torch.empty_like(input_ids)
     selected = torch.empty_like(input_ids, dtype=torch.bool) if return_mask else input_ids
+    metrics = (
+        torch.zeros(2, device=input_ids.device, dtype=torch.int32) if return_metrics else None
+    )
+    metrics_arg = metrics if metrics is not None else input_ids
     selection_mask = padding_mask if padding_mask is not None else eligible_mask
     eligible_arg = selection_mask if selection_mask is not None else input_ids
     _meap_mask_inputs_kernel[(input_ids.size(0),)](
@@ -217,6 +233,7 @@ def _triton_meap_mask_inputs(
         eligible_arg,
         output,
         selected,
+        metrics_arg,
         sequence_length,
         mask_token_id,
         mask_ratio,
@@ -233,11 +250,12 @@ def _triton_meap_mask_inputs(
         MASK_IS_PADDING=padding_mask is not None,
         EXCLUDE_LAST=exclude_last,
         RETURN_MASK=return_mask,
+        RETURN_METRICS=return_metrics,
         BLOCK_T=block_t,
         num_warps=4 if block_t <= 512 else 8,
         num_stages=1,
     )
-    return output, selected
+    return output, selected, metrics
 
 
 def meap_mask_inputs(
@@ -251,8 +269,9 @@ def meap_mask_inputs(
     seed: int = 0,
     exclude_last: bool = True,
     return_mask: bool = False,
+    return_metrics: bool = False,
     implementation: str = "triton",
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Corrupt autoregressive inputs with a fixed MEAP mask ratio per sequence.
 
     ``padding_mask`` is ``True`` where replacement is forbidden and avoids
@@ -264,6 +283,8 @@ def meap_mask_inputs(
     The last eligible input is excluded by default because its hidden state has
     no clean next-token target when CCE is called with ``shift=1``. A positive
     ratio masks at least one token in each row that still has eligible tokens.
+    With ``return_metrics=True``, the final tuple item is a two-element device
+    tensor ``[eligible_count, masked_count]`` reduced by the masking kernel.
     """
     _validate_meap_inputs(
         input_ids, mask_token_id, mask_ratio, eligible_mask, padding_mask, seed
@@ -271,24 +292,32 @@ def meap_mask_inputs(
     if implementation not in {"triton", "torch"}:
         raise ValueError(f"Unknown MEAP implementation {implementation!r}.")
     if not enabled:
+        if not return_mask and not return_metrics:
+            return input_ids
+        outputs = [input_ids]
         if return_mask:
-            return input_ids, torch.zeros_like(input_ids, dtype=torch.bool)
-        return input_ids
+            outputs.append(torch.zeros_like(input_ids, dtype=torch.bool))
+        if return_metrics:
+            outputs.append(torch.zeros(2, device=input_ids.device, dtype=torch.int32))
+        return tuple(outputs)
 
     if input_ids.numel() == 0:
         output = input_ids.clone()
+        outputs = [output]
         if return_mask:
-            return output, torch.zeros_like(input_ids, dtype=torch.bool)
-        return output
+            outputs.append(torch.zeros_like(input_ids, dtype=torch.bool))
+        if return_metrics:
+            outputs.append(torch.zeros(2, device=input_ids.device, dtype=torch.int32))
+        return tuple(outputs) if len(outputs) > 1 else output
 
-    if mask_ratio == 0.0:
+    if mask_ratio == 0.0 and not return_metrics:
         output = input_ids.clone()
         if return_mask:
             return output, torch.zeros_like(input_ids, dtype=torch.bool)
         return output
 
     if implementation == "torch":
-        output, selected = _torch_meap_mask_inputs(
+        output, selected, metrics = _torch_meap_mask_inputs(
             input_ids,
             mask_token_id,
             mask_ratio,
@@ -296,11 +325,12 @@ def meap_mask_inputs(
             padding_mask,
             seed,
             exclude_last,
+            return_metrics,
         )
     else:
         if not input_ids.is_cuda:
             raise ValueError("The Triton MEAP implementation requires CUDA tensors.")
-        output, selected = _triton_meap_mask_inputs(
+        output, selected, metrics = _triton_meap_mask_inputs(
             input_ids,
             mask_token_id,
             mask_ratio,
@@ -309,9 +339,16 @@ def meap_mask_inputs(
             seed,
             exclude_last,
             return_mask,
+            return_metrics,
         )
 
-    return (output, selected) if return_mask else output
+    outputs = [output]
+    if return_mask:
+        outputs.append(selected)
+    if return_metrics:
+        assert metrics is not None
+        outputs.append(metrics)
+    return tuple(outputs) if len(outputs) > 1 else output
 
 
 __all__ = ["meap_mask_inputs"]

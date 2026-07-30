@@ -149,6 +149,11 @@ while MiLe is enabled. MiLe is not supported by `impl="torch_compile"`.
 See [`docs/mile.md`](docs/mile.md) for the objective, fused weight-kernel
 branches, detached backward, memory contract, and validation coverage.
 
+For training diagnostics, `return_loss_metrics=True` with `reduction="mean"`
+returns `(loss, metrics)`. The compact device scalars
+`ntp_ce_unweighted`, `mile_reweighting_delta`, and `mu_loss` sum back to
+`loss`; no full-logit tensor is reconstructed.
+
 ### Mu loss
 
 ![Mu-loss kernel data flow](assets/mu_loss_kernel.svg)
@@ -168,7 +173,7 @@ loss = linear_cross_entropy(
 )
 ```
 
-This adds `mu_loss_lambda * ||classifier.float().mean(dim=0)||^2` to the
+This adds $\lambda\lVert\operatorname{mean}(C,\mathrm{dim}=0)\rVert_2^2$ to the
 mean-reduced loss. Its reduction and direct classifier-gradient update are
 implemented with Triton kernels, without materializing logits. The gradient is
 added once to `dC` and does not alter `dE` or the bias gradient. This is a
@@ -231,6 +236,9 @@ create the masked IDs outside activation-checkpointed regions. A readable
 kernel maps eligible positions through twelve keyed
 swap-or-not permutation rounds, avoiding rejection loops, random-score tensors,
 sorting, and top-k selection.
+With `return_metrics=True`, the kernel additionally returns the two scalar
+counters `[eligible_count, masked_count]` without allocating the boolean token
+mask required by `return_mask=True`.
 
 
 ### Vocabulary Parallelism

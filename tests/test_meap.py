@@ -24,13 +24,14 @@ def test_meap_fixed_count_padding_and_last_token(implementation: str) -> None:
             [False, False, False, False, False, False, False, False],
         ]
     )
-    output, selected = meap_mask_inputs(
+    output, selected, metrics = meap_mask_inputs(
         input_ids,
         99,
         mask_ratio=0.4,
         eligible_mask=eligible,
         seed=17,
         return_mask=True,
+        return_metrics=True,
         implementation=implementation,
     )
     effective = eligible.clone()
@@ -40,6 +41,8 @@ def test_meap_fixed_count_padding_and_last_token(implementation: str) -> None:
     assert not selected[~effective].any()
     assert torch.equal(output[selected], torch.full_like(output[selected], 99))
     assert torch.equal(output[~selected], input_ids[~selected])
+    assert int(metrics[0]) == int(effective.sum())
+    assert int(metrics[1]) == int(selected.sum())
 
 
 def test_meap_explicit_disable_is_noop() -> None:
@@ -54,11 +57,16 @@ def test_meap_explicit_disable_is_noop() -> None:
 @pytest.mark.parametrize("shape", [(0, 8), (3, 0)])
 def test_meap_empty_input(shape: tuple[int, int]) -> None:
     input_ids = torch.empty(shape, dtype=torch.long)
-    output, selected = meap_mask_inputs(
-        input_ids, 99, implementation="torch", return_mask=True
+    output, selected, metrics = meap_mask_inputs(
+        input_ids,
+        99,
+        implementation="torch",
+        return_mask=True,
+        return_metrics=True,
     )
     assert output.shape == shape
     assert selected.shape == shape
+    assert torch.equal(metrics, torch.zeros(2, dtype=torch.int32))
 
 
 @pytest.mark.parametrize(
@@ -88,13 +96,14 @@ def test_meap_triton_invariants(dtype: torch.dtype, sequence_length: int) -> Non
     lengths = torch.tensor([sequence_length - row for row in range(batch_size)], device="cuda")
     positions = torch.arange(sequence_length, device="cuda")
     eligible = positions.unsqueeze(0) < lengths.unsqueeze(1)
-    output, selected = meap_mask_inputs(
+    output, selected, metrics = meap_mask_inputs(
         input_ids,
         32000,
         mask_ratio=0.15,
         eligible_mask=eligible,
         seed=1234,
         return_mask=True,
+        return_metrics=True,
     )
     effective_count = (lengths - 1).clamp_min(0)
     assert torch.equal(selected.sum(1), _expected_count(effective_count, 0.15))
@@ -102,6 +111,19 @@ def test_meap_triton_invariants(dtype: torch.dtype, sequence_length: int) -> Non
     assert not selected[torch.arange(batch_size), lengths - 1].any()
     assert torch.equal(output[selected], torch.full_like(output[selected], 32000))
     assert torch.equal(output[~selected], input_ids[~selected])
+    assert int(metrics[0]) == int(effective_count.sum())
+    assert int(metrics[1]) == int(selected.sum())
+
+    output_without_mask, metrics_without_mask = meap_mask_inputs(
+        input_ids,
+        32000,
+        mask_ratio=0.15,
+        eligible_mask=eligible,
+        seed=1234,
+        return_metrics=True,
+    )
+    assert torch.equal(output_without_mask, output)
+    assert torch.equal(metrics_without_mask, metrics)
 
 
 @skip_no_cuda
@@ -221,7 +243,7 @@ def test_meap_combines_with_cce_mile_and_mu_loss() -> None:
     )
     hidden = torch.nn.functional.embedding(masked_ids, token_weight)
 
-    loss = linear_cross_entropy(
+    loss, metrics = linear_cross_entropy(
         hidden,
         classifier,
         targets,
@@ -231,6 +253,15 @@ def test_meap_combines_with_cce_mile_and_mu_loss() -> None:
         mile_gamma=1.0,
         mu_loss_enabled=True,
         mu_loss_lambda=1e-4,
+        return_loss_metrics=True,
+    )
+    torch.testing.assert_close(
+        loss.detach(),
+        metrics["ntp_ce_unweighted"]
+        + metrics["mile_reweighting_delta"]
+        + metrics["mu_loss"],
+        rtol=2e-5,
+        atol=2e-5,
     )
     loss.backward()
     assert torch.isfinite(loss)

@@ -16,9 +16,11 @@ def _mile_single_block_kernel(
     NLL,
     MiLeWeight,
     TokenLoss,
+    UnweightedNLLSum,
     gamma,
     B,
     GAMMA_MODE: tl.constexpr,
+    RETURN_METRICS: tl.constexpr,
     BLOCK_B: tl.constexpr,
 ):
     offs_b = tl.arange(0, BLOCK_B)
@@ -36,6 +38,8 @@ def _mile_single_block_kernel(
     nll = tl.load(NLL + offs_b, mask=mask, other=0.0).to(tl.float32)
     tl.store(MiLeWeight + offs_b, weight, mask=mask)
     tl.store(TokenLoss + offs_b, nll * weight, mask=mask)
+    if RETURN_METRICS:
+        tl.store(UnweightedNLLSum, tl.sum(tl.where(mask, nll, 0.0), axis=0))
 
 
 @triton.jit
@@ -70,7 +74,9 @@ def _mile_normalize_loss_kernel(
     MiLeWeight,
     WeightSum,
     TokenLoss,
+    UnweightedNLLSum,
     B,
+    RETURN_METRICS: tl.constexpr,
     BLOCK_B: tl.constexpr,
 ):
     offs_b = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -80,6 +86,8 @@ def _mile_normalize_loss_kernel(
     nll = tl.load(NLL + offs_b, mask=mask, other=0.0).to(tl.float32)
     tl.store(MiLeWeight + offs_b, weight, mask=mask)
     tl.store(TokenLoss + offs_b, nll * weight, mask=mask)
+    if RETURN_METRICS:
+        tl.atomic_add(UnweightedNLLSum, tl.sum(tl.where(mask, nll, 0.0), axis=0))
 
 
 def cce_mile_forward_kernel(
@@ -87,15 +95,27 @@ def cce_mile_forward_kernel(
     mean_logit: torch.Tensor,
     nll: torch.Tensor,
     gamma: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return detached mean-normalized MiLe weights and weighted token losses."""
+    return_unweighted_nll_sum: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return MiLe weights, weighted token losses, and an optional compact NLL sum."""
     if lse.shape != mean_logit.shape or lse.shape != nll.shape:
         raise ValueError("MiLe LSE, mean-logit, and NLL tensors must have matching shapes.")
     if lse.numel() == 0:
-        return torch.empty_like(nll), torch.empty_like(nll)
+        unweighted_nll_sum = (
+            torch.zeros((), device=nll.device, dtype=torch.float32)
+            if return_unweighted_nll_sum
+            else None
+        )
+        return torch.empty_like(nll), torch.empty_like(nll), unweighted_nll_sum
 
     mile_weight = torch.empty_like(nll)
     token_loss = torch.empty_like(nll)
+    unweighted_nll_sum = (
+        torch.zeros((), device=nll.device, dtype=torch.float32)
+        if return_unweighted_nll_sum
+        else None
+    )
+    unweighted_nll_sum_arg = unweighted_nll_sum if unweighted_nll_sum is not None else nll
     gamma_mode = 0 if gamma == 0.0 else 1 if gamma == 1.0 else 2
     # One program avoids global synchronization for ordinary microbatches;
     # larger vectors use bounded blocks to avoid excessive register pressure.
@@ -107,14 +127,16 @@ def cce_mile_forward_kernel(
             nll,
             mile_weight,
             token_loss,
+            unweighted_nll_sum_arg,
             gamma,
             nll.numel(),
             GAMMA_MODE=gamma_mode,
+            RETURN_METRICS=return_unweighted_nll_sum,
             BLOCK_B=block_b,
             num_warps=4 if block_b <= 4096 else 8,
             num_stages=1,
         )
-        return mile_weight, token_loss
+        return mile_weight, token_loss, unweighted_nll_sum
 
     weight_sum = torch.zeros((), device=nll.device, dtype=torch.float32)
     block_b = _MULTI_BLOCK_TOKENS
@@ -136,9 +158,11 @@ def cce_mile_forward_kernel(
         mile_weight,
         weight_sum,
         token_loss,
+        unweighted_nll_sum_arg,
         nll.numel(),
+        RETURN_METRICS=return_unweighted_nll_sum,
         BLOCK_B=block_b,
         num_warps=4,
         num_stages=1,
     )
-    return mile_weight, token_loss
+    return mile_weight, token_loss, unweighted_nll_sum

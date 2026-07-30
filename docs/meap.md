@@ -11,20 +11,21 @@ resulting hidden states and the original clean labels.
 
 ## How to read the diagram
 
-`T` is the padded sequence length, `N` is the number of eligible positions in
-one sequence after exclusions, and `K` is the exact number that MEAP replaces.
+$T$ is the padded sequence length, $N$ is the number of eligible positions in
+one sequence after exclusions, and $K$ is the exact number that MEAP replaces.
 The Triton launch uses one program per batch row.
 
 - **Panel (a)** loads the IDs and, when supplied, the existing padding or
   eligibility mask. A prefix sum simultaneously counts eligible positions and
-  maps sparse positions onto the dense rank domain `[0, N)`. `exclude_last`
-  acts before this count, so the protected final position is not part of `N`.
+  maps sparse positions onto the dense rank domain $[0,N)$. `exclude_last`
+  acts before this count, so the protected final position is not part of $N$.
 - **Panel (b)** permutes those dense ranks using two Philox-derived sequence
   keys and twelve fixed swap-or-not rounds. Every round pairs ranks and gives
   both members of a pair the same swap decision, so each round is an
   involution and their composition remains a bijection.
-- **Panel (c)** compares each unique permuted rank with `K`. The predicate
-  `permuted_rank < K` therefore selects exactly `K` distinct positions without
+- **Panel (c)** compares each unique permuted rank with $K$. The predicate
+  $\operatorname{permuted\_rank}<K$ therefore selects exactly $K$ distinct
+  positions without
   scores, sorting, top-k, collision handling, or retry loops. `tl.where` then
   chooses between the original ID and the mask-token ID. The output IDs are the
   only required global write; the selected-position mask is optional.
@@ -45,12 +46,12 @@ prefix sum, reductions, and permutation without communication between rows.
 
 | Component | Kernel design | Consequence |
 | --- | --- | --- |
-| Program shape | `BLOCK_T = next_power_of_2(sequence_length)` | One static lane domain covers the complete row; lanes beyond `T` are masked. |
+| Program shape | `BLOCK_T = next_power_of_2(sequence_length)` | One static lane domain covers the complete row; lanes beyond $T$ are masked. |
 | Launch | Four warps through `BLOCK_T=512`, eight above it, one stage | Fixed launch policy with no runtime autotuner lookup. |
-| Compile-time flags | Existing-mask presence, padding-mask convention, `exclude_last`, and `return_mask` are `tl.constexpr` | Unused mask reads, branches, and diagnostic stores are removed from the compiled specialization. |
+| Compile-time flags | Existing-mask presence, padding-mask convention, `exclude_last`, `return_mask`, and `return_metrics` are `tl.constexpr` | Unused mask reads, branches, and diagnostic stores are removed from the compiled specialization. |
 | Row state | Eligibility, prefix ranks, permutation state, and selection stay in registers | No global random-score, sorting workspace, top-k workspace, or atomic counter. |
 | Required I/O | Read IDs and an optional existing mask; write masked IDs | Global memory traffic is linear in the input size. |
-| Optional I/O | Write one boolean per position only for `return_mask=True` | Training avoids the diagnostic allocation by default. |
+| Optional I/O | Write one boolean per position only for `return_mask=True`; atomically reduce two counters for `return_metrics=True` | Training can log exact eligible/masked counts without allocating a token mask. |
 | Work | `O(B * T)` with twelve fixed permutation rounds | Execution does not grow as `T log T` as sorting would. |
 
 The current register-resident design deliberately caps the Triton path at
@@ -94,8 +95,8 @@ meap_mask_inputs(
 - Alternatively, `eligible_mask=True` means replacement is allowed. Use this
   form when padding and protected-token exclusions are already combined. The
   two mask arguments are mutually exclusive.
-- Each row receives `max(1, floor(mask_ratio * eligible_tokens))` replacements
-  when the ratio and eligible count are positive.
+- Each row receives $\max(1,\lfloor rN\rfloor)$ replacements, where $r$ is
+  `mask_ratio`, when the ratio and eligible count are positive.
 - Sampling is without replacement and independent between rows.
 - `exclude_last=True` removes the last eligible input from sampling. This is
   appropriate when CCE uses `shift=1`, because that hidden state has no valid
@@ -117,22 +118,23 @@ The kernel does not create a random score per token and does not execute sort,
 argsort, or top-k. Its selection is constructed as follows:
 
 1. A prefix sum maps every eligible position to a unique dense rank in
-   `[0, N)`, even when eligibility contains holes.
+   $[0,N)$, even when eligibility contains holes.
 2. Philox generates two keys per sequence, rather than one random value per
    token.
-3. Each of twelve swap-or-not rounds draws a keyed pivot `p` in `[0, N)` and
-   pairs rank `x` with `(p - x) mod N`.
+3. Each of twelve swap-or-not rounds draws a keyed pivot $p\in[0,N)$ and
+   pairs rank $x$ with $(p-x)\bmod N$.
 4. A keyed hash of the pair chooses whether both partners swap or both stay.
    Because both ranks use the same pair identifier and decision, every round
    is an involution and therefore a bijection.
 5. The composition of the twelve rounds is a permutation over the exact
-   `[0, N)` domain. A token is selected exactly when its permuted rank is below
-   `K`.
+   $[0,N)$ domain. A token is selected exactly when its permuted rank is below
+   $K$.
 
-The permuted ranks are unique and exactly `K` positions satisfy `rank < K`:
+The permuted ranks are unique and exactly $K$ positions satisfy
+$\operatorname{rank}<K$:
 there are no collisions, rejection duplicates, data-dependent retry loops,
 atomic updates, or approximate Bernoulli counts. Twelve fixed rounds make the
-selection work `O(T)` with the same execution structure for dense and padded
+selection work $O(T)$ with the same execution structure for dense and padded
 rows.
 
 The implementation uses four warps through block length 512 and eight warps at
@@ -178,7 +180,8 @@ The initial supported experiment keeps the mechanisms independent and explicit:
 
 MEAP changes the context before the Transformer. MiLe then reweights the clean
 next-token losses using detached predictive entropy. Mu loss adds
-`1e-4 * ||mean(classifier, dim=0)||^2`. Neither MiLe nor mu loss changes how
+$10^{-4}\lVert\operatorname{mean}(C,\mathrm{dim}=0)\rVert_2^2$. Neither MiLe
+nor mu loss changes how
 MEAP positions are sampled.
 
 Validation and inference should use clean inputs (`enabled=False`). A corrupted
