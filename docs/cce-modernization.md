@@ -37,7 +37,7 @@ $$
 \frac{\partial \mathcal{L}_b}{\partial z_{bv}}
 = p_{bv} - \mathbf{1}[v=y_b],
 \qquad
-p_{bv}=\exp(z_{bv}-\operatorname{LSE}_b).
+p_{bv}=\exp(z_{bv}-\mathrm{LSE}_b).
 $$
 
 It then accumulates
@@ -68,6 +68,15 @@ compensation tensor. With Triton 3.4+ the FP32 output buffer is the simpler and
 more accurate representation. The legacy preset name must therefore not be
 interpreted as a statement about the current reduction algorithm.
 
+The same naming caveat applies to the upstream `cce_kahan` label: it is not a
+selectable preset in this checkout. In the current code, the `*_full_*` presets
+select FP32-safe accumulation and gradient-filter policies; the word “Kahan” is
+kept only for API familiarity with the upstream names. The active reduction uses
+lock-protected or relaxed FP32 atomic updates, depending on the destination and
+the selected reduction mode. It does not allocate a Kahan compensation tensor.
+`cce_kahan_full_c` specifically means `filter_c_grad=False` and
+`filter_e_grad=True`; `cce_kahan_full_c_full_e`/`cce_exact` disables both filters.
+
 ## Forward architectures
 
 ### Lock reduction
@@ -77,7 +86,7 @@ covering the same token rows merge their local LSE under a spinlock:
 
 $$
 \ell_{\mathrm{new}}
-= \operatorname{logaddexp}(\ell_{\mathrm{old}},\ell_{\mathrm{tile}}).
+= \mathrm{logaddexp}(\ell_{\mathrm{old}},\ell_{\mathrm{tile}}).
 $$
 
 For MiLe's softmax-weighted logit moment, the corresponding stable merge is
@@ -183,7 +192,7 @@ the low-precision reduction. Otherwise it remains FP32.
 For MiLe, the backward multiplier is the detached normalized weight
 
 $$
-w_b = \frac{(1+H_b)^\gamma}{\operatorname{mean}_{b'}(1+H_{b'})^\gamma},
+w_b = \frac{(1+H_b)^\gamma}{\mathrm{mean}_{b'}(1+H_{b'})^\gamma},
 \qquad 0\le H_b\le\log V.
 $$
 
