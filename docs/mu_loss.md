@@ -89,8 +89,8 @@ of the number of valid training tokens.
 ## Triton backward
 
 The CCE backward first computes the ordinary classifier gradient $\mathrm dC$.
-The `_add_mu_loss_gradient_kernel` then visits $\mathrm dC$ in $32\times32$
-tiles and adds
+The conservative path uses `_add_mu_loss_gradient_kernel`, which visits
+$\mathrm dC$ in $32\times32$ tiles and adds
 
 $$
 \mathrm{dOut}\,\frac{2\lambda}{V}\mu
@@ -104,6 +104,48 @@ When input and output embeddings are tied, the shared parameter can still
 receive other gradients through its input-embedding role. The statement above
 describes only the direct derivative of `L_mu`.
 
+### Fused cast path and forced FP16 validation
+
+`cce_kahan_full_c` also has an experimental fused-finalization path. When
+`CCE_MU_FUSED_CAST` is enabled, `_scaled_gradient_cast_mu_kernel` combines
+
+$$
+\operatorname{cast}\!\left(\frac{\mathrm dC_{\mathrm{CCE}}}{s}\right)
+\quad\text{and}\quad
+\mathrm dOut\,\frac{2\lambda}{V}\mu
+$$
+
+in one read of the accumulated classifier-gradient tile. This removes the
+second full-buffer read/write that would otherwise be needed to add μ-loss
+after the CCE cast. The mathematical gradient is unchanged.
+
+Automatic FP16 accumulation is deliberately guarded. It requires a supported
+SM12+ device, contiguous BF16 inputs, no external `dLSE`, no vocabulary-parallel
+reduction, and a sufficiently large work surface. The current shape gates are
+
+```text
+D >= 256 and (B_effective + V) * D >= 8,388,608
+or
+min(B_effective, V) * D >= 1,048,576
+```
+
+Small models therefore remain on the FP32 classifier accumulator by default.
+For an explicit numerical stress test, an expert caller can force the fused
+FP16 route with:
+
+```bash
+CCE_MU_FUSED_CAST=1
+CCE_DE_ACCUM_DTYPE=fp16
+CCE_DC_ACCUM_DTYPE=fp16
+```
+
+This override is for validation and benchmarking, not a production guarantee.
+Set `CCE_MU_FUSED_CAST=0` (and optionally force both accumulation dtypes to
+`fp32`) to reproduce the historical separate μ-gradient path. The fused
+mixed-precision implementation is experimental and has not been hardened as a
+universal production kernel; validate it on the target GPU and training
+trajectory before adopting it for long pretraining runs.
+
 ## Memory contract
 
 Mu loss does not materialize logits. Its persistent and temporary state is:
@@ -115,9 +157,11 @@ loss:          one FP32 scalar
 vocab_size:    one FP32 scalar
 ```
 
-The backward adds directly into the existing $\mathrm dC$ allocation. Compute
-scales as $O(VD)$, which is the minimum work required to read the classifier and
-apply the row-wise regularizer, while auxiliary memory remains $O(D)$.
+The backward adds directly into the existing $\mathrm dC$ allocation. The
+conservative path uses one additional $O(VD)$ read/write for the row-wise
+regularizer. The fused cast path combines that update with the final cast and
+therefore avoids that second full-buffer traversal; its auxiliary state remains
+$O(D)$, while the accumulated gradient uses FP16 only under the guards above.
 
 ## Mu loss is not hard centering
 

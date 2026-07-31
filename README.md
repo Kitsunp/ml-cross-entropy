@@ -28,6 +28,11 @@ The conservative FP32 rationale and the bounded SM12 FP16 path for MiLe,
 μ-loss, and MEAP are described in its
 [mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
 
+> **Experimental status:** the fused mixed-precision μ-loss finalization is
+> research/benchmark code, not a production-hardened guarantee. Keep the
+> conservative FP32 path for critical training unless the forced or automatic
+> route has been validated on the target GPU and training trajectory.
+
 ### Basic usage
 
 **Installation**
@@ -121,7 +126,7 @@ There are several other implementations available depending on your needs.
 | cce  | The CCE implementation as described in the paper. This is may be the fastest and uses the least amount of memory. Generally recommended to start here. |
 | torch_compile | A highly optimized `torch.compile` implementation. This is typically the fastest but uses the most amount of memory. Good as a reference and for systems that don't support Triton. |
 | cce_kahan | Legacy upstream name; it is not a selectable preset in this checkout. The active `*_full_*` presets below provide the corresponding FP32-safe accumulation controls. |
-| cce_kahan_full_c | Legacy compatibility name for FP32-safe accumulation with classifier-gradient filtering disabled (embedding filtering remains enabled). The current Triton path uses FP32 lock/atomic reductions, not a separate classic Kahan/2Sum compensation tensor. On guarded SM12 BF16 shapes the automatic path may use bounded mixed FP16 buffers; set `CCE_DE_ACCUM_DTYPE=fp32` and `CCE_DC_ACCUM_DTYPE=fp32` to force FP32. |
+| cce_kahan_full_c | Legacy compatibility name for FP32-safe accumulation with classifier-gradient filtering disabled (embedding filtering remains enabled). The current Triton path uses FP32 lock/atomic reductions, not a separate classic Kahan/2Sum compensation tensor. On guarded SM12 BF16 shapes the automatic path may use bounded mixed FP16 buffers; with μ-loss enabled, the fused finalization adds its correction in the same cast pass. Set `CCE_DE_ACCUM_DTYPE=fp32` and `CCE_DC_ACCUM_DTYPE=fp32` to force FP32. |
 | cce_kahan_full_c_full_e (cce_exact) | Same compatibility family with both gradient filters disabled. It is retained as an audit/reference point rather than a claim that the reduction uses classic Kahan arithmetic. |
 
 
@@ -188,8 +193,11 @@ classifier-centering regularizer, not logit centering: it does not subtract the
 mean from the classifier during the forward pass. Mu loss currently requires
 `reduction="mean"` and is not supported by `impl="torch_compile"`.
 See [`docs/mu_loss.md`](docs/mu_loss.md) for the forward reduction, optional
-vocabulary-parallel synchronization, direct classifier gradient, and memory
-contract.
+vocabulary-parallel synchronization, direct classifier gradient, fused
+FP32/guarded-FP16 finalization, and memory contract. A small-shape FP16 stress
+test can explicitly set `CCE_MU_FUSED_CAST=1`,
+`CCE_DE_ACCUM_DTYPE=fp16`, and `CCE_DC_ACCUM_DTYPE=fp16`; this is an expert
+validation override, not a default production setting.
 
 ### MEAP input masking
 

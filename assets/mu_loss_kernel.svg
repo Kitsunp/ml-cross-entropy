@@ -23,7 +23,7 @@
 
   <rect width="1800" height="920" fill="#ffffff"/>
   <text x="900" y="46" text-anchor="middle" class="title">Mu Loss inside Cut Cross Entropy</text>
-  <text x="900" y="78" text-anchor="middle" class="subtitle">Reduce the classifier center in FP32 · retain O(D) state · add one shared row-gradient directly into dC</text>
+  <text x="900" y="78" text-anchor="middle" class="subtitle">Reduce the classifier center · retain O(D) state · fuse the μ correction into the final dC cast when the guarded path is active</text>
 
   <!-- Panel A: local sum -->
   <rect x="30" y="112" width="560" height="700" rx="16" fill="#fbfaf7" stroke="#d7d3ca" stroke-width="2"/>
@@ -95,8 +95,8 @@
 
   <!-- Panel C: direct backward -->
   <rect x="1210" y="112" width="560" height="700" rx="16" fill="#fbfaf7" stroke="#d7d3ca" stroke-width="2"/>
-  <text x="1490" y="151" text-anchor="middle" class="panel-title">(c) Add the direct gradient in place</text>
-  <text x="1490" y="180" text-anchor="middle" class="section">THE SAME D-VECTOR IS ADDED TO EVERY VOCABULARY ROW</text>
+  <text x="1490" y="151" text-anchor="middle" class="panel-title">(c) Fused cast and direct gradient</text>
+  <text x="1490" y="180" text-anchor="middle" class="section">FP32 FALLBACK OR GUARDED FP16 FINALIZATION</text>
 
   <rect x="1250" y="216" width="190" height="52" rx="7" fill="#4fa765"/>
   <text x="1345" y="249" text-anchor="middle" class="small white">saved μ[D]</text>
@@ -109,26 +109,32 @@
   <text x="1490" y="372" text-anchor="middle" class="math">r = dOut · (2λ / V) μ</text>
   <text x="1490" y="402" text-anchor="middle" class="small white">r ∈ ℝᴰ; independent of row v</text>
 
-  <path d="M 1490 435 L 1490 478" class="flow"/>
-  <rect x="1265" y="480" width="450" height="204" fill="#aebbc8"/>
-  <line x1="1265" y1="548" x2="1715" y2="548" stroke="#ffffff" stroke-width="3"/>
-  <line x1="1265" y1="616" x2="1715" y2="616" stroke="#ffffff" stroke-width="3"/>
-  <line x1="1377" y1="480" x2="1377" y2="684" stroke="#ffffff" stroke-width="3"/>
-  <line x1="1490" y1="480" x2="1490" y2="684" stroke="#ffffff" stroke-width="3"/>
-  <line x1="1603" y1="480" x2="1603" y2="684" stroke="#ffffff" stroke-width="3"/>
-  <rect x="1378" y="548" width="224" height="68" fill="#3f82b7"/>
-  <text x="1490" y="590" text-anchor="middle" class="math">dCᵥ += r</text>
+  <path d="M 1490 435 L 1490 458" class="flow"/>
+  <rect x="1290" y="460" width="400" height="82" rx="9" fill="#d69a70"/>
+  <text x="1490" y="491" text-anchor="middle" class="small white">dC_accum / scale + r → cast(dtype)</text>
+  <text x="1490" y="519" text-anchor="middle" class="tiny white">_scaled_gradient_cast_mu_kernel · one tile pass</text>
 
-  <text x="1490" y="717" text-anchor="middle" class="small">32 × 32 Triton tiles; write into the existing dC allocation</text>
-  <rect x="1255" y="744" width="200" height="42" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
-  <text x="1355" y="771" text-anchor="middle" class="tiny">no direct ∇E</text>
-  <rect x="1525" y="744" width="200" height="42" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
-  <text x="1625" y="771" text-anchor="middle" class="tiny">no direct ∇bias</text>
+  <path d="M 1490 543 L 1490 566" class="flow"/>
+  <rect x="1265" y="568" width="450" height="142" fill="#aebbc8"/>
+  <line x1="1265" y1="615" x2="1715" y2="615" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1265" y1="662" x2="1715" y2="662" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1377" y1="568" x2="1377" y2="710" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1490" y1="568" x2="1490" y2="710" stroke="#ffffff" stroke-width="3"/>
+  <line x1="1603" y1="568" x2="1603" y2="710" stroke="#ffffff" stroke-width="3"/>
+  <rect x="1378" y="615" width="224" height="47" fill="#3f82b7"/>
+  <text x="1490" y="646" text-anchor="middle" class="math">dCᵥ += r</text>
+
+  <text x="1490" y="738" text-anchor="middle" class="small">FP32 fallback uses the separate add kernel; FP16 uses the fused cast</text>
+  <rect x="1255" y="757" width="200" height="32" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
+  <text x="1355" y="779" text-anchor="middle" class="tiny">no direct ∇E</text>
+  <rect x="1525" y="757" width="200" height="32" rx="7" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
+  <text x="1625" y="779" text-anchor="middle" class="tiny">no direct ∇bias</text>
 
   <!-- Legend and key conclusion -->
   <rect x="30" y="838" width="1740" height="56" rx="10" fill="#f4f6f7" stroke="#d7dde1"/>
   <rect x="58" y="855" width="25" height="20" fill="#bd665c"/><text x="94" y="871" class="tiny">FP32 reduction</text>
   <rect x="232" y="855" width="25" height="20" fill="#4fa765"/><text x="268" y="871" class="tiny">penalty / saved μ</text>
   <rect x="435" y="855" width="25" height="20" fill="#3f82b7"/><text x="471" y="871" class="tiny">in-place dC update</text>
-  <text x="1740" y="871" text-anchor="end" class="label">Mu loss penalizes the center over optimizer steps; it does not hard-center C in the forward pass.</text>
+  <rect x="685" y="855" width="25" height="20" fill="#d69a70"/><text x="721" y="871" class="tiny">fused final cast</text>
+  <text x="1740" y="871" text-anchor="end" class="label">Mu loss is a soft optimizer correction; the fused FP16 branch is experimental and guarded.</text>
 </svg>

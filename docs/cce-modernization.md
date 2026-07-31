@@ -207,11 +207,30 @@ $$
 \nabla_C \leftarrow \nabla_C + d_{out}\,\frac{2\lambda}{V}\,\mu.
 $$
 
-Therefore automatic mixed accumulation uses FP16 for $\nabla_E$ but keeps the
-classifier accumulator in FP32 whenever μ-loss is enabled. The final API cast
-still matches the BF16 parameter dtype. MEAP is an input-side masking operation,
-so it does not add a CCE gradient branch; its padding/selection masks simply
-flow into the same valid-token indexing.
+With the fused μ finalization enabled, automatic mixed accumulation can use
+FP16 for both $\nabla_E$ and $\nabla_C$ on an eligible shape. The accumulated CCE
+tile is unscaled and the μ term is added in the same final cast kernel, so the
+regularizer is not swallowed by the scaled accumulator. If the fused path is
+disabled, or any guard fails, the classifier accumulator remains FP32. The
+final API cast still matches the BF16 parameter dtype. MEAP is an input-side
+masking operation, so it does not add a CCE gradient branch; its
+padding/selection masks simply flow into the same valid-token indexing.
+
+The shape guards are intentionally conservative:
+
+```text
+D >= 256 and (B_effective + V) * D >= 8,388,608
+or
+min(B_effective, V) * D >= 1,048,576
+```
+
+For a deliberate small-shape stress test, an expert caller may set
+`CCE_MU_FUSED_CAST=1`, `CCE_DE_ACCUM_DTYPE=fp16`, and
+`CCE_DC_ACCUM_DTYPE=fp16`. This bypasses only the size gate; it does not change
+the μ-loss formula. Set `CCE_MU_FUSED_CAST=0` or force both accumulation dtypes
+to `fp32` to reproduce the historical path. The fused FP16 implementation is
+experimental and not a universal production guarantee; validate it on the
+target GPU and training trajectory before using it for long pretraining.
 
 To force the historical accumulator contract for an A/B run, set both
 `CCE_DE_ACCUM_DTYPE=fp32` and `CCE_DC_ACCUM_DTYPE=fp32`. The automatic mode is
