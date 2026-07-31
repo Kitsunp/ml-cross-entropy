@@ -38,6 +38,31 @@ def _scaled_gradient_cast_kernel(
     tl.store(Output + offsets, values * inverse_scale, mask=mask)
 
 
+@triton.jit
+def _scaled_gradient_cast_mu_kernel(
+    Input,
+    Output,
+    Mu,
+    VocabSize,
+    dOut,
+    n_elements,
+    D,
+    inverse_scale,
+    mu_loss_lambda,
+    BLOCK: tl.constexpr,
+):
+    """Cast the accumulated dC while adding μ-loss in the same memory pass."""
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(Input + offsets, mask=mask, other=0.0).to(tl.float32)
+    dim = offsets % D
+    mu = tl.load(Mu + dim, mask=mask, other=0.0).to(tl.float32)
+    vocab_size = tl.load(VocabSize)
+    d_out = tl.load(dOut)
+    mu_gradient = d_out * (2.0 * mu_loss_lambda / vocab_size) * mu
+    tl.store(Output + offsets, values * inverse_scale + mu_gradient, mask=mask)
+
+
 def _finalize_scaled_gradient(
     gradient: torch.Tensor,
     output_dtype: torch.dtype,
@@ -50,6 +75,37 @@ def _finalize_scaled_gradient(
         output,
         gradient.numel(),
         1.0 / scale,
+        BLOCK=256,
+        num_warps=4,
+    )
+    return output
+
+
+def _finalize_scaled_gradient_with_mu(
+    gradient: torch.Tensor,
+    output_dtype: torch.dtype,
+    scale: float,
+    mu: torch.Tensor,
+    mu_vocab_size: torch.Tensor,
+    d_out: torch.Tensor,
+    mu_loss_lambda: float,
+) -> torch.Tensor:
+    """Cast dC and add μ-loss without a second read/write over the FP32 buffer."""
+    assert gradient.is_contiguous()
+    assert mu.ndim == 1 and mu.numel() == gradient.size(1)
+    assert mu_vocab_size.numel() == 1
+    assert d_out.numel() == 1
+    output = torch.empty_like(gradient, dtype=output_dtype)
+    _scaled_gradient_cast_mu_kernel[(triton.cdiv(gradient.numel(), 256),)](
+        gradient,
+        output,
+        mu,
+        mu_vocab_size,
+        d_out,
+        gradient.numel(),
+        gradient.size(1),
+        1.0 / scale,
+        mu_loss_lambda,
         BLOCK=256,
         num_warps=4,
     )
@@ -155,9 +211,11 @@ def _auto_fp16_accumulation_dtypes(
     if not eligible:
         return False, False
 
-    # μ-loss contributes an independent FP32 regularizer to dC after the CCE
-    # reduction. Keep that destination FP32 while still allowing FP16 dE.
-    return True, mu is None
+    # With the fused μ cast, μ is added after the scaled CCE accumulation has
+    # been converted back to the output dtype. This keeps the same guarded
+    # FP16 CCE path as the no-μ case without mixing the regularizer into the
+    # scaled accumulator. The opt-out keeps the historical FP32 destination.
+    return True, mu is None or os.getenv("CCE_MU_FUSED_CAST", "1") != "0"
 
 
 @triton.jit
@@ -611,8 +669,18 @@ def cce_backward_kernel(
         de_accum_dtype = "fp16" if use_fp16_e else "fp32"
         dc_accum_dtype = "fp16" if use_fp16_c else "fp32"
 
-    # An explicit FP16 request must not swallow μ-loss's independent dC term.
-    if mu is not None and dc_accum_dtype != "fp32":
+    # The fused path can keep the CCE accumulation in the same conservative
+    # scaled-FP16 mode used by cce_kahan_full_c. μ is added after the CCE
+    # value is unscaled, so it does not need to share the FP32 accumulator.
+    mu_fp16_fastpath = (
+        mu is not None
+        and os.getenv("CCE_MU_FUSED_CAST", "1") != "0"
+        and auto_mixed_grad_accum
+        and dc_accum_dtype == "fp16"
+    )
+    # Outside that explicitly guarded path, keep the original FP32 guarantee
+    # for the independent μ-loss dC term.
+    if mu is not None and dc_accum_dtype != "fp32" and not mu_fp16_fastpath:
         dc_accum_dtype = "fp32"
 
     if accum_e_fp32:
@@ -669,7 +737,9 @@ def cce_backward_kernel(
     de_accum_scale = safe_scale if de is not None and de.dtype == torch.float16 else 1.0
     dc_accum_scale = (
         safe_scale
-        if dc is not None and dc.dtype == torch.float16 and mu is None
+        if dc is not None
+        and dc.dtype == torch.float16
+        and (mu is None or mu_fp16_fastpath)
         else 1.0
     )
 
@@ -800,11 +870,6 @@ def cce_backward_kernel(
         FILTER_C_GRAD=filter_c_grad and dc is not None,
     )
 
-    if dc is not None and mu is not None:
-        assert mu_vocab_size is not None
-        assert mu_loss_lambda is not None
-        add_mu_loss_gradient_kernel(dc, mu, mu_vocab_size, do, mu_loss_lambda)
-
     if reduce_e_grad and de is not None:
         de = vp_reduce_e_grad(de, pg)
 
@@ -813,10 +878,46 @@ def cce_backward_kernel(
         dbias = dbias.to(dtype=bias_info.dtype)
 
     if dc is not None:
+        fused_mu_cast = (
+            mu is not None
+            and os.getenv("CCE_MU_FUSED_CAST", "1") != "0"
+            and (dc.dtype == torch.float32 or mu_fp16_fastpath)
+            and c_info.dtype != torch.float32
+        )
+        if mu is not None and not fused_mu_cast:
+            assert mu_vocab_size is not None
+            assert mu_loss_lambda is not None
+            add_mu_loss_gradient_kernel(dc, mu, mu_vocab_size, do, mu_loss_lambda)
         if dc_accum_scale != 1.0:
-            dc = _finalize_scaled_gradient(dc, c_info.dtype, dc_accum_scale)
+            if fused_mu_cast:
+                assert mu_vocab_size is not None
+                assert mu_loss_lambda is not None
+                dc = _finalize_scaled_gradient_with_mu(
+                    dc,
+                    c_info.dtype,
+                    dc_accum_scale,
+                    mu,
+                    mu_vocab_size,
+                    do,
+                    mu_loss_lambda,
+                )
+            else:
+                dc = _finalize_scaled_gradient(dc, c_info.dtype, dc_accum_scale)
         else:
-            dc = dc.to(dtype=c_info.dtype)
+            if fused_mu_cast:
+                assert mu_vocab_size is not None
+                assert mu_loss_lambda is not None
+                dc = _finalize_scaled_gradient_with_mu(
+                    dc,
+                    c_info.dtype,
+                    1.0,
+                    mu,
+                    mu_vocab_size,
+                    do,
+                    mu_loss_lambda,
+                )
+            else:
+                dc = dc.to(dtype=c_info.dtype)
 
     if de is not None:
         if de_accum_scale != 1.0:

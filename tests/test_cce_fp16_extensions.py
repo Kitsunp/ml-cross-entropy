@@ -16,12 +16,13 @@ skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test re
 def test_auto_fp16_extensions_with_meap_padding(
     monkeypatch: pytest.MonkeyPatch, mile: bool, mu: bool
 ) -> None:
-    """Exercise the eligible SM12 route and keep μ's dC term in FP32."""
+    """Exercise the eligible SM12 route with the fused μ dC finalization."""
     for name, value in {
         "CCE_DE_ACCUM_DTYPE": "auto",
         "CCE_DC_ACCUM_DTYPE": "auto",
         "CCE_FP16_ACCUM_SCALE": "auto",
         "CCE_BACKWARD_REDUCTION": "lock",
+        "CCE_MU_FUSED_CAST": "1",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -92,4 +93,23 @@ def test_auto_fp16_extensions_with_meap_padding(
         pg=None,
     )
     assert de_fp16 is True
-    assert dc_fp16 is (not mu)
+    assert dc_fp16 is True
+
+    if mu:
+        monkeypatch.setenv("CCE_MU_FUSED_CAST", "0")
+        _, dc_fp32 = _auto_fp16_accumulation_dtypes(
+            e_flat,
+            TensorInfo(e_flat.dtype, True),
+            classifier.detach(),
+            TensorInfo(classifier.dtype, True),
+            valid_tokens,
+            accum_e_fp32=True,
+            accum_c_fp32=True,
+            dlse=None,
+            mile_weight=torch.ones(valid_tokens, device="cuda") if mile else None,
+            mu=torch.ones(dim, device="cuda"),
+            mile_gamma=1.0 if mile else None,
+            reduce_e_grad=False,
+            pg=None,
+        )
+        assert dc_fp32 is False
