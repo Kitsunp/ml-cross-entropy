@@ -136,5 +136,5 @@
   <rect x="232" y="855" width="25" height="20" fill="#4fa765"/><text x="268" y="871" class="tiny">penalty / saved μ</text>
   <rect x="435" y="855" width="25" height="20" fill="#3f82b7"/><text x="471" y="871" class="tiny">in-place dC update</text>
   <rect x="685" y="855" width="25" height="20" fill="#d69a70"/><text x="721" y="871" class="tiny">fused final cast</text>
-  <text x="1740" y="871" text-anchor="end" class="label">Mu loss is a soft optimizer correction; the fused FP16 branch is experimental and guarded.</text>
+  <text x="1740" y="871" text-anchor="end" class="label">Mu loss is soft; fused FP16 supports Blackwell CC10.x/CC12.x (CC10.x needs target validation; Hopper CC9.x unvalidated).</text>
 </svg>
