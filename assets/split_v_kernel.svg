@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title desc">
+  <title id="title">Opt-in Split-V CCE forward kernel</title>
+  <desc id="desc">Architecture diagram showing the explicit Split-V flag, tiled partial log-sum-exp kernels, FP32 workspace, stable reduction, outputs, and the lock-path fallback.</desc>
+  <defs>
+    <linearGradient id="header" x1="0" x2="1">
+      <stop offset="0" stop-color="#17324d"/>
+      <stop offset="1" stop-color="#256b84"/>
+    </linearGradient>
+    <linearGradient id="stage" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff8e8"/>
+      <stop offset="1" stop-color="#f5e4bc"/>
+    </linearGradient>
+    <linearGradient id="workspace" x1="0" x2="1">
+      <stop offset="0" stop-color="#e5f0f5"/>
+      <stop offset="1" stop-color="#c7dce6"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#31566d"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#c87913"/>
+    </marker>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #17324d; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #496274; }
+      .panel-title { font: 700 20px Arial, sans-serif; fill: #17324d; }
+      .label { font: 600 16px Arial, sans-serif; fill: #203b4d; }
+      .small { font: 400 14px Arial, sans-serif; fill: #365568; }
+      .tiny { font: 400 12px Arial, sans-serif; fill: #496274; }
+      .formula { font: 600 17px Georgia, serif; fill: #17324d; }
+      .box { stroke: #8aa7b7; stroke-width: 2; rx: 12; }
+      .arrow { stroke: #31566d; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .arrow-orange { stroke: #c87913; stroke-width: 3; fill: none; marker-end: url(#arrowOrange); }
+      .dashed { stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="820" fill="#fbfcfd"/>
+  <rect x="0" y="0" width="1600" height="86" fill="url(#header)"/>
+  <text x="52" y="43" class="title" fill="#ffffff">CCE forward: explicit Split-V reduction</text>
+  <text x="52" y="68" class="subtitle" fill="#d6edf3">A two-stage alternative to the lock reduction; disabled by default</text>
+  <rect x="1225" y="24" width="310" height="38" rx="19" fill="#f4b545"/>
+  <text x="1380" y="49" text-anchor="middle" class="label" fill="#17324d">CCE_SPLIT_V=1  →  opt in</text>
+
+  <!-- dispatch -->
+  <rect x="46" y="122" width="250" height="154" class="box" fill="#edf5f8"/>
+  <text x="70" y="153" class="panel-title">Dispatch and guards</text>
+  <text x="70" y="184" class="small">CCE_FORWARD_REDUCTION</text>
+  <text x="70" y="208" class="formula">auto · lock · split</text>
+  <text x="70" y="236" class="small">BF16 / FP16, CC12.x, B ≤ 512</text>
+  <text x="70" y="258" class="small">memory guard and S &gt; 1</text>
+  <path d="M296 198 H347" class="arrow-orange"/>
+
+  <!-- inputs -->
+  <rect x="347" y="122" width="285" height="154" class="box" fill="#f2f7f9"/>
+  <text x="372" y="153" class="panel-title">Inputs (contiguous)</text>
+  <rect x="375" y="174" width="104" height="56" rx="7" fill="#477da2"/>
+  <text x="427" y="209" text-anchor="middle" font-size="22" font-family="Georgia" fill="#fff">E</text>
+  <text x="427" y="248" text-anchor="middle" class="tiny">B × D</text>
+  <rect x="504" y="174" width="104" height="56" rx="7" fill="#e4a13a"/>
+  <text x="556" y="209" text-anchor="middle" font-size="22" font-family="Georgia" fill="#fff">C</text>
+  <text x="556" y="248" text-anchor="middle" class="tiny">V × D</text>
+  <text x="372" y="265" class="tiny">bias, valids, targets, softcap, shift</text>
+  <path d="M632 198 H696" class="arrow"/>
+
+  <!-- stage one -->
+  <rect x="696" y="108" width="430" height="222" class="box" fill="url(#stage)"/>
+  <text x="724" y="143" class="panel-title">Stage 1 · tiled vocab partitions</text>
+  <text x="724" y="168" class="small">S disjoint vocabulary ranges; no cross-program lock</text>
+  <!-- tile grid -->
+  <g transform="translate(732 188)">
+    <rect x="0" y="0" width="164" height="91" fill="#d2e2e9" stroke="#7898a8"/>
+    <rect x="0" y="0" width="41" height="91" fill="#4c85ab"/>
+    <rect x="41" y="0" width="41" height="91" fill="#6b9bb7"/>
+    <rect x="82" y="0" width="41" height="91" fill="#8cb5c5"/>
+    <rect x="123" y="0" width="41" height="91" fill="#aecbd4"/>
+    <path d="M41 0v91 M82 0v91 M123 0v91" stroke="#fff" stroke-width="2"/>
+    <text x="82" y="112" text-anchor="middle" class="tiny">V tiles → split s</text>
+    <text x="21" y="52" text-anchor="middle" font-size="13" fill="#fff">s₀</text>
+    <text x="62" y="52" text-anchor="middle" font-size="13" fill="#fff">s₁</text>
+    <text x="103" y="52" text-anchor="middle" font-size="13" fill="#17324d">s₂</text>
+    <text x="144" y="52" text-anchor="middle" font-size="13" fill="#17324d">s₃</text>
+  </g>
+  <rect x="930" y="190" width="168" height="88" rx="8" fill="#fff" stroke="#d29a3b"/>
+  <text x="1014" y="216" text-anchor="middle" class="label">For each tile</text>
+  <text x="1014" y="241" text-anchor="middle" class="formula">A = E · Cᵀ</text>
+  <text x="1014" y="262" text-anchor="middle" class="small">softcap + logaddexp</text>
+  <path d="M896 234 H925" class="arrow"/>
+  <text x="724" y="307" class="formula">ℓᵦₛ = log Σ exp(Aᵦᵥ)   ·   mᵦₛ = Σ exp(A−ℓ) A</text>
+  <path d="M1126 218 H1180" class="arrow"/>
+
+  <!-- workspace -->
+  <rect x="1180" y="108" width="364" height="222" class="box" fill="url(#workspace)"/>
+  <text x="1206" y="143" class="panel-title">FP32 partial workspace</text>
+  <text x="1206" y="168" class="small">Only O(B · S) state; no B × V logits</text>
+  <rect x="1214" y="190" width="176" height="86" rx="7" fill="#fff" stroke="#6f9caf"/>
+  <g fill="#4c85ab">
+    <rect x="1226" y="202" width="29" height="18"/>
+    <rect x="1260" y="202" width="29" height="18"/>
+    <rect x="1294" y="202" width="29" height="18"/>
+    <rect x="1328" y="202" width="29" height="18"/>
+    <rect x="1226" y="226" width="29" height="18"/>
+    <rect x="1260" y="226" width="29" height="18"/>
+    <rect x="1294" y="226" width="29" height="18"/>
+    <rect x="1328" y="226" width="29" height="18"/>
+    <rect x="1226" y="250" width="29" height="18"/>
+    <rect x="1260" y="250" width="29" height="18"/>
+    <rect x="1294" y="250" width="29" height="18"/>
+    <rect x="1328" y="250" width="29" height="18"/>
+  </g>
+  <text x="1302" y="296" text-anchor="middle" class="tiny">partial_lse[s, b] (+ partial_mean)</text>
+  <rect x="1414" y="190" width="105" height="86" rx="7" fill="#fff4dc" stroke="#d29a3b"/>
+  <text x="1466" y="217" text-anchor="middle" class="label">Guard</text>
+  <text x="1466" y="241" text-anchor="middle" class="formula">Fsplit</text>
+  <text x="1466" y="263" text-anchor="middle" class="small">≤ 2Flock</text>
+  <path d="M1360 350 V393" class="arrow-orange"/>
+
+  <!-- reduction -->
+  <rect x="696" y="393" width="848" height="170" class="box" fill="#eef6ee"/>
+  <text x="724" y="428" class="panel-title">Stage 2 · stable reduction (one program per token block)</text>
+  <text x="724" y="458" class="small">Read the S partials and merge in FP32; order changes, equations do not.</text>
+  <rect x="736" y="480" width="174" height="52" rx="7" fill="#7eaf83"/>
+  <text x="823" y="512" text-anchor="middle" class="formula" fill="#fff">logaddexp(ℓ₀, ℓ₁)</text>
+  <path d="M924 506 H989" class="arrow"/>
+  <rect x="990" y="480" width="188" height="52" rx="7" fill="#6c9e75"/>
+  <text x="1084" y="512" text-anchor="middle" class="formula" fill="#fff">stable weighted merge</text>
+  <path d="M1192 506 H1255" class="arrow"/>
+  <rect x="1256" y="480" width="250" height="52" rx="7" fill="#4c855e"/>
+  <text x="1381" y="512" text-anchor="middle" class="formula" fill="#fff">ℓᵦ, mᵦ, target logit</text>
+  <path d="M1362 330 V386" class="arrow"/>
+
+  <!-- outputs -->
+  <rect x="46" y="393" width="570" height="170" class="box" fill="#f4f6fb"/>
+  <text x="74" y="428" class="panel-title">CCE outputs</text>
+  <rect x="76" y="464" width="148" height="52" rx="7" fill="#477da2"/>
+  <text x="150" y="496" text-anchor="middle" class="formula" fill="#fff">LSE[B]</text>
+  <rect x="244" y="464" width="148" height="52" rx="7" fill="#6b9bb7"/>
+  <text x="318" y="496" text-anchor="middle" class="formula" fill="#fff">NLL[B]</text>
+  <rect x="412" y="464" width="148" height="52" rx="7" fill="#8cb5c5"/>
+  <text x="486" y="496" text-anchor="middle" class="formula" fill="#17324d">avg[V] / m[B]</text>
+  <path d="M696 478 H621" class="arrow"/>
+
+  <!-- fallback -->
+  <rect x="46" y="620" width="1498" height="144" class="box" fill="#fff7f1"/>
+  <text x="74" y="655" class="panel-title">Safety and fallback</text>
+  <text x="74" y="687" class="small">Flag absent → historical lock reduction (the default).</text>
+  <text x="74" y="712" class="small">Unsupported capability, MiLe moment, FP32, large B, failed free-VRAM guard, or automatic OOM → lock path.</text>
+  <text x="74" y="739" class="small">Explicit CCE_FORWARD_REDUCTION=split remains available for experiments; CC10.x requires CCE_SPLIT_V_ALLOW_UNVALIDATED=1 and is not hardware-validated here.</text>
+  <rect x="1175" y="655" width="330" height="72" rx="10" fill="#f7dfbb" stroke="#d29a3b"/>
+  <text x="1340" y="683" text-anchor="middle" class="label">Numerical contract</text>
+  <text x="1340" y="707" text-anchor="middle" class="small">FP32 partials · same CCE equations</text>
+</svg>
+

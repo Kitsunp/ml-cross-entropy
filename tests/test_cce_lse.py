@@ -2,10 +2,24 @@
 import pytest
 import torch
 
-from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+from cut_cross_entropy.cce_lse_forward import (
+    _split_v_env_enabled,
+    cce_lse_forward_kernel,
+)
 from cut_cross_entropy.utils import softcapping
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+
+
+def test_split_v_is_explicitly_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("CCE_SPLIT_V", raising=False)
+    assert not _split_v_env_enabled()
+
+    monkeypatch.setenv("CCE_SPLIT_V", "1")
+    assert _split_v_env_enabled()
+
+    monkeypatch.setenv("CCE_SPLIT_V", "off")
+    assert not _split_v_env_enabled()
 
 
 def _lse(
@@ -124,7 +138,11 @@ def test_split_reduction_matches_lock_with_all_optional_outputs(monkeypatch) -> 
 
 @skip_no_cuda
 def test_auto_split_selector_is_memory_bounded() -> None:
-    from cut_cross_entropy.cce_lse_forward_split import use_split_reduction
+    from cut_cross_entropy.cce_lse_forward_split import (
+        select_split_v_config,
+        split_v_workspace_bytes,
+        use_split_reduction,
+    )
 
     c = torch.empty((2048, 32), device="cuda", dtype=torch.bfloat16)
     small_e = torch.empty((512, 32), device="cuda", dtype=torch.bfloat16)
@@ -134,3 +152,26 @@ def test_auto_split_selector_is_memory_bounded() -> None:
     assert not use_split_reduction(large_e, c, 513, return_mean_logit=False)
     assert not use_split_reduction(small_e, c, 512, return_mean_logit=True)
     assert not use_split_reduction(small_e.float(), c.float(), 512, return_mean_logit=False)
+
+    config = select_split_v_config(
+        small_e,
+        c,
+        512,
+        return_mean_logit=False,
+        return_logit_avg=True,
+        has_targets=True,
+    )
+    assert config.splits >= 1
+    assert config.split_memory_bytes <= 2 * config.base_memory_bytes
+    assert config.split_memory_bytes == (
+        config.base_memory_bytes
+        - 4 * ((512 + 15) // 16)
+        + split_v_workspace_bytes(512, config.splits)
+    )
+    assert (config.block_b, config.block_v, config.block_d) in {
+        (32, 128, 32),
+        (64, 128, 32),
+        (128, 128, 32),
+        (128, 64, 32),
+    }
+

@@ -107,6 +107,8 @@ therefore no longer serialize on an unrelated lock during autotuning.
 
 ### Split-V staged reduction
 
+![Split-V CCE kernel data flow](../assets/split_v_kernel.svg)
+
 The new path partitions vocabulary tiles into $S$ disjoint sets. Stage 1 emits
 one partial pair $(\ell_{bs},m_{bs})$ per token and split. Stage 2 merges the $S$
 partials with the same stable equations above. No program waits on another
@@ -124,25 +126,77 @@ $$
 8BS\ \text{bytes when the MiLe moment is also requested},
 $$
 
-with $S\le16$. The split count targets roughly two programs per SM while never
-exceeding the number of vocabulary tiles.
+The split count targets roughly two programs per SM while never exceeding the
+number of vocabulary tiles or the architecture profile cap (64 on validated
+CC12.x; 32 for the explicitly opt-in, unvalidated CC10.x profile).
 
-The default `auto` selector uses split-V only when all of the following hold:
+Split-V is deliberately **not the base path**. The default `auto` mode keeps
+the historical lock reduction unless the caller sets the explicit opt-in flag
+`CCE_SPLIT_V=1`. With that flag, automatic split-V still requires all of the
+following:
 
 - input is FP16 or BF16;
 - the MiLe weighted-logit moment is not requested;
+- the device is on the validated CC12.x profile;
 - more than one useful vocabulary split exists; and
-- $B\le512$.
+- $B\le512$ and the free-VRAM guard accepts the temporary state.
 
-The selector requires the regime where repeated measurements showed at least
-about an 8% forward improvement; the 1–4% gains at larger $B$ do not justify an
-extra launch/workspace. Set `CCE_FORWARD_REDUCTION=lock` or
-`CCE_FORWARD_REDUCTION=split` to force either architecture. An invalid value is
-rejected instead of silently changing behavior.
+The selector requires the regime where repeated measurements showed a useful
+forward improvement; larger batches and unsupported features remain on the
+lock path. `CCE_FORWARD_REDUCTION=lock` forces the baseline, while
+`CCE_FORWARD_REDUCTION=split` forces the staged path for an experiment even if
+the opt-in flag is absent. For an unvalidated CC10.x device, an explicit split
+experiment additionally requires `CCE_SPLIT_V_ALLOW_UNVALIDATED=1`. An invalid
+reduction value is rejected instead of silently changing behavior.
 
-Because automatic split-V is capped at $B=512$ and does not request the MiLe
-moment, its partial workspace is at most $4\cdot512\cdot16=32$ KiB. Larger
-workspace figures below characterize the forced path, not default behavior.
+Because opt-in automatic split-V is capped at $B=512$ and does not request the
+MiLe moment, the validated CC12.x policy bounds its partial workspace by the
+selected shape/profile cap (at most $4\cdot512\cdot64=128$ KiB before allocator
+alignment). The guard compares this state with the complete live CCE forward
+footprint, not with the tiny lock array alone. If another process consumes VRAM
+after selection, automatic mode clears the bounded host cache and falls back to
+the lock path on an out-of-memory error; an explicitly forced split request is
+fail-fast.
+
+### Analytic tile/split selection
+
+The split-V launch is selected once in Python before the Triton launches. The
+selector scores only three static BF16/FP16 tiles, $(64,128,32)$,
+$(128,128,32)$, and $(128,64,32)$; FP32 keeps $(32,128,32)$. It does not compile,
+time, or synchronize discarded candidates. For a candidate tile
+$(T_B,T_V,T_D)$, it computes
+
+$$
+N_B=\left\lceil\frac{B}{T_B}\right\rceil,\qquad
+N_V=\left\lceil\frac{V}{T_V}\right\rceil,qquad
+S=\min\!\left(S_{\max},N_V,\operatorname{pow2ceil}\!\left(
+\left\lceil\frac{2M}{N_B}\right\rceil\right)\right),
+$$
+
+where $M$ is the number of SMs and $S_{\max}$ comes from the device profile.
+The score combines SM occupancy, edge-tile
+efficiency, estimated shared-memory headroom, and the launch/reduction
+overhead of $S$. The selected $S$ is rounded down to a power of two when a
+bound is active, so the kernel never exceeds the available vocabulary tiles.
+
+The memory guard compares the estimated live forward footprint of the split
+path with the lock path:
+
+$$
+\underbrace{\mathrm{inputs}+\mathrm{outputs}+4\lceil B/16\rceil
+    +4BS(1+\mathbf 1_{\mathrm{mean}})}_{\mathrm{split}}
+\le 2\,\underbrace{\left(\mathrm{inputs}+\mathrm{outputs}
+    +4\lceil B/16\rceil\right)}_{\mathrm{lock}}.
+$$
+
+Thus the added reduction state is bounded against the complete live CCE
+forward footprint, rather than against the tiny lock array alone. A bounded
+host-side cache reuses the decision for the same device/dtype/shape; it stores
+only metadata and can be refreshed with the optional free-memory guard switch.
+The reduction stage also uses a small analytic block policy (32/64/128/256 rows)
+so a tiny batch does not launch a masked 256-row CTA. This is a scheduling
+change only; the stable log-sum-exp equations and output precision are
+unchanged.
 
 ### Padding and optional outputs
 
@@ -453,8 +507,10 @@ from the focused results.
   Ampere, and AMD measurements should refine the selector.
 - Nsight Compute hardware counters were unavailable because the environment did
   not grant GPU performance-counter permission. No permission bypass was used.
-- The split-V kernel currently uses a curated fixed tile. A future architecture-
-  level autotuner could tune split count and tile jointly without benchmarking
-  both complete execution graphs at runtime.
+- The split-V path now uses a bounded analytic tile/split selector. A future
+  architecture-level profile can refine its coefficients or tile table from
+  offline measurements, but runtime selection still need not benchmark both
+  complete execution graphs or compile a brute-force candidate set.
 - The preset names containing `kahan` are API compatibility aliases. A future
   major release may introduce clearer names such as `cce_fp32_full_c`.
+

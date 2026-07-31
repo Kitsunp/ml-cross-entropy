@@ -10,6 +10,16 @@ from cut_cross_entropy.tl_autotune import CCE_LOCK_BLOCK_B, cce_forward_autotune
 from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
+def _split_v_env_enabled() -> bool:
+    """Return whether the optional split-V forward path was requested."""
+    return os.getenv("CCE_SPLIT_V", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _cce_lse_forward_kernel(
     E,
     C,
@@ -228,30 +238,74 @@ def cce_lse_forward_kernel(
     reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
     if reduction not in {"auto", "lock", "split"}:
         raise ValueError("CCE_FORWARD_REDUCTION must be 'auto', 'lock', or 'split'")
-    if reduction != "lock":
+    # Split-V is an opt-in optimization.  Keeping this flag off preserves the
+    # historical lock-reduction path even though ``auto`` remains the default
+    # value of CCE_FORWARD_REDUCTION.
+    split_v_enabled = _split_v_env_enabled()
+    split_requested = reduction == "split" or (
+        reduction == "auto" and split_v_enabled
+    )
+    split_config = None
+    if split_requested:
         from cut_cross_entropy.cce_lse_forward_split import (
             cce_lse_forward_split,
+            clear_split_v_config_cache,
+            select_split_v_config,
             use_split_reduction,
+        )
+        split_config = select_split_v_config(
+            e,
+            c,
+            B,
+            return_mean_logit,
+            return_logit_avg,
+            targets is not None,
+            allow_unvalidated=reduction == "split"
+            and os.getenv("CCE_SPLIT_V_ALLOW_UNVALIDATED", "0").lower()
+            in {"1", "true", "yes", "on"},
         )
 
     if B > 0 and (
         reduction == "split"
-        or (reduction == "auto" and use_split_reduction(e, c, B, return_mean_logit))
-    ):
-
-        return LSEReturn(
-            *cce_lse_forward_split(
+        or (
+            reduction == "auto"
+            and split_v_enabled
+            and split_config is not None
+            and use_split_reduction(
                 e,
                 c,
-                bias,
-                valids,
-                softcap,
-                targets,
-                shift,
-                return_logit_avg,
+                B,
                 return_mean_logit,
+                return_logit_avg,
+                targets is not None,
+                config=split_config,
             )
         )
+    ):
+
+        try:
+            return LSEReturn(
+                *cce_lse_forward_split(
+                    e,
+                    c,
+                    bias,
+                    valids,
+                    softcap,
+                    targets,
+                    shift,
+                    return_logit_avg,
+                    return_mean_logit,
+                    config=split_config,
+                )
+            )
+        except torch.cuda.OutOfMemoryError:
+            # A game or another process may consume VRAM after the cached
+            # policy decision.  Automatic mode must preserve CCE's baseline
+            # behavior; an explicit split request remains fail-fast.
+            if reduction != "auto":
+                raise
+            torch.cuda.empty_cache()
+            clear_split_v_config_cache()
 
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
@@ -311,3 +365,4 @@ def cce_lse_forward_kernel(
     )
 
     return LSEReturn(lse, logit_avg, neg_correct_logit, mean_logit)
+
