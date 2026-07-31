@@ -57,10 +57,13 @@ contract (and its fallback outside the mixed-precision guards) is:
 - accumulate $\nabla_E$ in FP32 and retain the configured $E$-gradient filter;
 - cast final gradients back to the parameter dtype at the API boundary.
 
-On eligible SM12 BF16 shapes, the preset's automatic mode may replace these
-temporary FP32 buffers with the bounded mixed-accumulation route described
-below; forcing both accumulation environment variables to `fp32` restores the
-contract above exactly.
+On eligible Blackwell CC10.x/CC12.x BF16 shapes, the preset's automatic mode
+may replace these temporary FP32 buffers with the bounded mixed-accumulation
+route described below; forcing both accumulation environment variables to
+`fp32` restores the contract above exactly. CC10.x dispatch support covers
+B100/B200 at the code level but still needs target-hardware validation. Hopper
+CC9.x devices (H100/H200/GH200) are not validated for this route and remain on
+FP32.
 
 It no longer runs compensated Kahan/2Sum arithmetic. That implementation only
 worked around an old Triton accumulator limitation and required a second
@@ -184,10 +187,12 @@ The historical default keeps both gradient accumulators in FP32. That is the
 right conservative choice for arbitrary shapes: the reductions combine many
 tokens and vocabulary rows, and the `(P-Y)` target cancellation, atomic updates,
 and long optimizer trajectories make FP16 range and mantissa loss visible. The
-SM12 path can nevertheless use FP16 buffers in a bounded regime. The dispatch
-requires BF16 contiguous inputs, both gradients, no external `dLSE`, no
-vocabulary-parallel reduction, and a sufficiently large work surface to amortize
-the low-precision reduction. Otherwise it remains FP32.
+supported Blackwell CC10.x/CC12.x path can nevertheless use FP16 buffers in a
+bounded regime. The dispatch requires BF16 contiguous inputs, both gradients,
+no external `dLSE`, no vocabulary-parallel reduction, and a sufficiently large
+work surface to amortize the low-precision reduction. Otherwise it remains
+FP32. CC10.x still needs target-hardware validation, while Hopper CC9.x
+(H100/H200/GH200) is explicitly outside the validated set.
 
 For MiLe, the backward multiplier is the detached normalized weight
 

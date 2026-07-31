@@ -134,11 +134,14 @@ def _fp16_accum_scale(grad_scale: float, max_weight: float = 1.0) -> float:
 
 _AUTO_FP16_OUTPUT_ELEMENTS = 8 * 1024 * 1024
 _AUTO_FP16_MIN_SURFACE_ELEMENTS = 1024 * 1024
+_AUTO_FP16_SUPPORTED_CC_MAJORS = frozenset({10, 12})
 
 
 @functools.lru_cache(maxsize=None)
 def _device_supports_auto_fp16_accumulation(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index)[0] >= 12
+    """Allow the supported Blackwell CC10.x/CC12.x device families."""
+    major, _ = torch.cuda.get_device_capability(device_index)
+    return major in _AUTO_FP16_SUPPORTED_CC_MAJORS
 
 
 def _mile_weight_bound(vocab: int, gamma: float | None) -> float:
@@ -172,7 +175,7 @@ def _auto_fp16_accumulation_dtypes(
     reduce_e_grad: bool,
     pg: torch.distributed.ProcessGroup | None,
 ) -> tuple[bool, bool]:
-    """Conservative SM12 dispatch for the benchmarked shape zone."""
+    """Conservative Blackwell CC10.x/CC12.x dispatch for the supported shape zone."""
     assert e.device.index is not None
     if not (
         accum_e_fp32

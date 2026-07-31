@@ -119,9 +119,14 @@ in one read of the accumulated classifier-gradient tile. This removes the
 second full-buffer read/write that would otherwise be needed to add μ-loss
 after the CCE cast. The mathematical gradient is unchanged.
 
-Automatic FP16 accumulation is deliberately guarded. It requires a supported
-SM12+ device, contiguous BF16 inputs, no external `dLSE`, no vocabulary-parallel
-reduction, and a sufficiently large work surface. The current shape gates are
+Automatic FP16 accumulation is deliberately guarded. The supported dispatch
+families are Blackwell compute capability CC10.x and CC12.x (for example,
+B100/B200 and RTX 50/PRO Blackwell). The CC10.x path is enabled at the code
+level but still requires validation on the target B100/B200 system. Hopper
+CC9.x devices such as H100, H200, and GH200 are not validated for this route
+and remain on FP32. It also requires contiguous BF16 inputs, no external
+`dLSE`, no vocabulary-parallel reduction, and a sufficiently large work
+surface. The current shape gates are
 
 ```text
 D >= 256 and (B_effective + V) * D >= 8,388,608

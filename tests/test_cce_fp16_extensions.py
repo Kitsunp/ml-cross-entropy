@@ -3,11 +3,34 @@ import torch
 import torch.nn.functional as F
 
 from cut_cross_entropy import linear_cross_entropy, meap_mask_inputs
-from cut_cross_entropy.cce_backward import _auto_fp16_accumulation_dtypes
+from cut_cross_entropy.cce_backward import (
+    _auto_fp16_accumulation_dtypes,
+    _device_supports_auto_fp16_accumulation,
+)
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.utils import TensorInfo
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+
+
+@pytest.mark.parametrize(
+    ("compute_capability_major", "expected"),
+    [(9, False), (10, True), (12, True), (13, False)],
+)
+def test_auto_fp16_only_selects_validated_blackwell_families(
+    monkeypatch: pytest.MonkeyPatch, compute_capability_major: int, expected: bool
+) -> None:
+    """CC10.x and CC12.x are enabled; Hopper/future families fall back."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device_index: (compute_capability_major, 0),
+    )
+    _device_supports_auto_fp16_accumulation.cache_clear()
+    try:
+        assert _device_supports_auto_fp16_accumulation(0) is expected
+    finally:
+        _device_supports_auto_fp16_accumulation.cache_clear()
 
 
 @skip_no_cuda
@@ -16,7 +39,7 @@ skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test re
 def test_auto_fp16_extensions_with_meap_padding(
     monkeypatch: pytest.MonkeyPatch, mile: bool, mu: bool
 ) -> None:
-    """Exercise the eligible SM12 route with the fused μ dC finalization."""
+    """Exercise the eligible Blackwell route with the fused μ dC finalization."""
     for name, value in {
         "CCE_DE_ACCUM_DTYPE": "auto",
         "CCE_DC_ACCUM_DTYPE": "auto",
