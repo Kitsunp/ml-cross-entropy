@@ -13,13 +13,20 @@ As language models grow ever larger, so do their vocabularies. This has shifted 
 **Requirements**
 
 1. Python 3.9+
-2. PyTorch 2.4+
-3. Triton 3.0+
+2. PyTorch 2.8+ on Triton-enabled platforms (PyTorch 2.4+ for the macOS fallback)
+3. Triton 3.4+ on supported platforms
 4. Ampere (or newer) GPU
 
 
 **Note:**  For operating systems that are not supported by Triton (e.g., MacOS), we include a highly optimized version of
 linear-cross-entropy using `torch.compile`. This implementation will be set to the default on MacOS.
+
+The current CCE kernel architecture, numerical basis, autotune cache design,
+and validation results are documented in
+[docs/cce-modernization.md](docs/cce-modernization.md).
+The conservative FP32 rationale and the bounded SM12 FP16 path for MiLe,
+μ-loss, and MEAP are described in its
+[mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
 
 ### Basic usage
 
@@ -113,9 +120,9 @@ There are several other implementations available depending on your needs.
 |------|-------------|
 | cce  | The CCE implementation as described in the paper. This is may be the fastest and uses the least amount of memory. Generally recommended to start here. |
 | torch_compile | A highly optimized `torch.compile` implementation. This is typically the fastest but uses the most amount of memory. Good as a reference and for systems that don't support Triton. |
-| cce_kahan | Uses Kahan summation (or fp32) to improve numerical precision. This comes at the cost of more memory usage (albeit only a temporary buffer in the backward pass). This is useful for long sequence lengths or if the model is particularly sensitive to numerical imprecision.
-| cce_kahan_full_c | Same as cce_kahan and removes gradient filtering on the classifier gradient. This is useful for pretraining but will be slower.
-| cce_kahan_full_c_full_e (cce_exact) | This additionally removes gradient filtering from the embedding gradient. This is useful as a reference point/sanity check. |
+| cce_kahan | Legacy upstream name; it is not a selectable preset in this checkout. The active `*_full_*` presets below provide the corresponding FP32-safe accumulation controls. |
+| cce_kahan_full_c | Legacy compatibility name for FP32-safe accumulation with classifier-gradient filtering disabled (embedding filtering remains enabled). The current Triton path uses FP32 lock/atomic reductions, not a separate classic Kahan/2Sum compensation tensor. On guarded SM12 BF16 shapes the automatic path may use bounded mixed FP16 buffers; set `CCE_DE_ACCUM_DTYPE=fp32` and `CCE_DC_ACCUM_DTYPE=fp32` to force FP32. |
+| cce_kahan_full_c_full_e (cce_exact) | Same compatibility family with both gradient filters disabled. It is retained as an audit/reference point rather than a claim that the reduction uses classic Kahan arithmetic. |
 
 
 ### MiLe Loss
@@ -125,7 +132,7 @@ There are several other implementations available depending on your needs.
 MiLe loss can be explicitly enabled on any CCE implementation with
 `mile_enabled=True`. The
 recommended pretraining configuration keeps the complete classifier gradient
-and Kahan/FP32 accumulation while retaining block filtering for the embedding
+and FP32-safe accumulation while retaining block filtering for the embedding
 gradient:
 
 ```python
@@ -173,7 +180,7 @@ loss = linear_cross_entropy(
 )
 ```
 
-This adds $\lambda\lVert\operatorname{mean}(C,\mathrm{dim}=0)\rVert_2^2$ to the
+This adds $\lambda\lVert\mathrm{mean}(C,\mathrm{dim}=0)\rVert_2^2$ to the
 mean-reduced loss. Its reduction and direct classifier-gradient update are
 implemented with Triton kernels, without materializing logits. The gradient is
 added once to `dC` and does not alter `dE` or the bias gradient. This is a

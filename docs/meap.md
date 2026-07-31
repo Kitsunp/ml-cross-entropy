@@ -24,7 +24,7 @@ The Triton launch uses one program per batch row.
   both members of a pair the same swap decision, so each round is an
   involution and their composition remains a bijection.
 - **Panel (c)** compares each unique permuted rank with $K$. The predicate
-  $\operatorname{permuted\_rank}<K$ therefore selects exactly $K$ distinct
+  $\mathrm{permuted\_rank}\lt K$ therefore selects exactly $K$ distinct
   positions without
   scores, sorting, top-k, collision handling, or retry loops. `tl.where` then
   chooses between the original ID and the mask-token ID. The output IDs are the
@@ -131,7 +131,7 @@ argsort, or top-k. Its selection is constructed as follows:
    $K$.
 
 The permuted ranks are unique and exactly $K$ positions satisfy
-$\operatorname{rank}<K$:
+$\mathrm{rank}\lt K$:
 there are no collisions, rejection duplicates, data-dependent retry loops,
 atomic updates, or approximate Bernoulli counts. Twelve fixed rounds make the
 selection work $O(T)$ with the same execution structure for dense and padded
@@ -180,7 +180,7 @@ The initial supported experiment keeps the mechanisms independent and explicit:
 
 MEAP changes the context before the Transformer. MiLe then reweights the clean
 next-token losses using detached predictive entropy. Mu loss adds
-$10^{-4}\lVert\operatorname{mean}(C,\mathrm{dim}=0)\rVert_2^2$. Neither MiLe
+$10^{-4}\lVert\mathrm{mean}(C,\mathrm{dim}=0)\rVert_2^2$. Neither MiLe
 nor mu loss changes how
 MEAP positions are sampled.
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1050" viewBox="0 0 2400 1050" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
-  <title id="title">Flujo del kernel Triton de MEAP</title>
-  <desc id="desc">Figura académica horizontal en español: elegibilidad y rangos densos, permutación swap-or-not, selección exacta y escritura, e integración previa al modelo causal.</desc>
+  <title id="title">MEAP Triton kernel data flow</title>
+  <desc id="desc">Academic horizontal figure: eligibility and dense ranks, swap-or-not permutation, exact selection and write, and integration before the causal model.</desc>
   <defs>
     <marker id="flecha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#555b63"/>
@@ -22,8 +22,8 @@
 
   <rect width="2400" height="1050" fill="#ffffff"/>
 
-  <!-- (a) Elegibilidad y rango denso -->
-  <text x="60" y="55" class="rotulo">B secuencias</text>
+  <!-- (a) Eligibility and dense rank -->
+  <text x="60" y="55" class="rotulo">Batch sequences</text>
   <rect x="60" y="75" width="470" height="78" fill="#aebbc8"/>
   <rect x="82" y="87" width="68" height="54" fill="#3f82b7"/>
   <rect x="160" y="87" width="68" height="54" fill="#3f82b7"/>
@@ -34,7 +34,7 @@
   <text x="194" y="121" text-anchor="middle" class="pequeno blanco">x₁</text>
   <text x="272" y="121" text-anchor="middle" class="pequeno blanco">x₂</text>
   <text x="464" y="121" text-anchor="middle" class="pequeno blanco">xₜ₋₁</text>
-  <text x="295" y="179" text-anchor="middle" class="rotulo">IDs de una fila b = program_id(0)</text>
+  <text x="295" y="179" text-anchor="middle" class="rotulo">Row IDs b = program_id(0)</text>
 
   <rect x="60" y="211" width="470" height="54" fill="#c8a5a0"/>
   <rect x="82" y="222" width="68" height="32" fill="#f1dfbb"/>
@@ -42,29 +42,29 @@
   <rect x="238" y="222" width="68" height="32" fill="#bd665c"/>
   <text x="340" y="245" class="rotulo">…</text>
   <rect x="420" y="222" width="88" height="32" fill="#f1dfbb"/>
-  <text x="295" y="293" text-anchor="middle" class="rotulo">máscara existente opcional</text>
+  <text x="295" y="293" text-anchor="middle" class="rotulo">optional existing mask</text>
 
   <path d="M 295 180 L 295 328" class="flujo"/>
   <path d="M 295 294 L 355 328" class="flujo"/>
   <rect x="42" y="330" width="515" height="470" class="kernel"/>
-  <text x="62" y="360" class="pequeno">un programa por fila · BLOCK_T = 2^⌈log₂T⌉</text>
+  <text x="62" y="360" class="pequeno">one program per row · BLOCK_T = 2^⌈log₂T⌉</text>
 
   <rect x="78" y="390" width="445" height="75" fill="#555b63"/>
-  <text x="300" y="420" text-anchor="middle" class="formula-blanca">eₜ = dentro_de_T ∧ permitidoₜ</text>
-  <text x="300" y="450" text-anchor="middle" class="pequeno blanco">padding=True prohíbe · eligible=True permite</text>
+  <text x="300" y="420" text-anchor="middle" class="formula-blanca">eₜ = inside_T ∧ allowedₜ</text>
+  <text x="300" y="450" text-anchor="middle" class="pequeno blanco">padding=True forbids · eligible=True allows</text>
 
   <path d="M 300 466 L 300 501" class="flujo"/>
   <rect x="78" y="503" width="445" height="72" fill="#eef4f7" stroke="#6f94ad" stroke-width="2"/>
-  <text x="300" y="532" text-anchor="middle" class="codigo">último = max(where(eₜ, t, −1))</text>
-  <text x="300" y="560" text-anchor="middle" class="pequeno">exclude_last limpia esa posición antes de contar</text>
+  <text x="300" y="532" text-anchor="middle" class="codigo">last = max(where(eₜ, t, −1))</text>
+  <text x="300" y="560" text-anchor="middle" class="pequeno">exclude_last removes that position before counting</text>
 
   <path d="M 300 576 L 300 612" class="flujo"/>
   <rect x="73" y="614" width="250" height="92" fill="#bd665c"/>
   <text x="198" y="649" text-anchor="middle" class="formula-blanca">N = Σₜ eₜ</text>
-  <text x="198" y="680" text-anchor="middle" class="pequeno blanco">conteo elegible</text>
+  <text x="198" y="680" text-anchor="middle" class="pequeno blanco">eligible count</text>
   <rect x="340" y="614" width="190" height="92" fill="#eda336"/>
   <text x="435" y="649" text-anchor="middle" class="formula-blanca">K = ⌊ρN⌋</text>
-  <text x="435" y="680" text-anchor="middle" class="pequeno blanco">acotado a [0,N]</text>
+  <text x="435" y="680" text-anchor="middle" class="pequeno blanco">clamped to [0,N]</text>
 
   <path d="M 198 707 L 198 742" class="flujo"/>
   <rect x="73" y="744" width="457" height="42" fill="#c7a6a1"/>
@@ -74,43 +74,43 @@
   <text x="320" y="773" class="rotulo">…</text>
   <rect x="390" y="752" width="70" height="26" fill="#bd665c"/>
   <text x="301" y="828" text-anchor="middle" class="rotulo">rₜ = cumsum(e) − 1 ∈ [0,N)</text>
-  <text x="301" y="853" text-anchor="middle" class="pequeno">los huecos no reciben rango</text>
+  <text x="301" y="853" text-anchor="middle" class="pequeno">holes receive no rank</text>
 
-  <text x="300" y="920" text-anchor="middle" class="pie">(a) Elegibilidad y rango denso</text>
-  <text x="300" y="952" text-anchor="middle" class="rotulo">reducciones por secuencia</text>
+  <text x="300" y="920" text-anchor="middle" class="pie">(a) Eligibility and dense rank</text>
+  <text x="300" y="952" text-anchor="middle" class="rotulo">per-row reductions</text>
 
-  <!-- (b) Permutación -->
+  <!-- (b) Permutation -->
   <rect x="642" y="75" width="470" height="70" fill="#c7a6a1"/>
   <rect x="664" y="87" width="58" height="46" fill="#bd665c"/>
   <rect x="734" y="87" width="58" height="46" fill="#bd665c"/>
   <rect x="804" y="87" width="58" height="46" fill="#bd665c"/>
   <text x="898" y="120" class="rotulo">…</text>
   <rect x="1004" y="87" width="86" height="46" fill="#bd665c"/>
-  <text x="877" y="177" text-anchor="middle" class="rotulo">rangos elegibles rₜ</text>
+  <text x="877" y="177" text-anchor="middle" class="rotulo">eligible ranks rₜ</text>
 
   <rect x="720" y="215" width="314" height="64" fill="#d69a70"/>
   <text x="877" y="244" text-anchor="middle" class="codigo blanco">tl.randint4x(seed, b)</text>
-  <text x="877" y="268" text-anchor="middle" class="pequeno blanco">dos claves para toda la fila</text>
+  <text x="877" y="268" text-anchor="middle" class="pequeno blanco">two keys for the row</text>
   <path d="M 877 178 L 877 214" class="flujo"/>
   <path d="M 877 280 L 877 328" class="flujo"/>
 
   <rect x="620" y="330" width="515" height="470" class="kernel"/>
-  <text x="640" y="360" class="pequeno">_swap_or_not_permute(rₜ, N, clave₀, clave₁)</text>
-  <text x="877" y="403" text-anchor="middle" class="rotulo">12 rondas estáticas</text>
+  <text x="640" y="360" class="pequeno">_swap_or_not_permute(rₜ, N, key₀, key₁)</text>
+  <text x="877" y="403" text-anchor="middle" class="rotulo">12 fixed rounds</text>
 
   <rect x="667" y="430" width="420" height="60" fill="#555b63"/>
-  <text x="877" y="468" text-anchor="middle" class="codigo blanco">p = clave mod N</text>
+  <text x="877" y="468" text-anchor="middle" class="codigo blanco">p = key mod N</text>
   <path d="M 877 491 L 877 520" class="flujo"/>
   <rect x="667" y="522" width="420" height="60" fill="#555b63"/>
-  <text x="877" y="560" text-anchor="middle" class="codigo blanco">pareja = (p − rₜ) mod N</text>
+  <text x="877" y="560" text-anchor="middle" class="codigo blanco">partner = (p − rₜ) mod N</text>
   <path d="M 877 583 L 877 612" class="flujo"/>
   <rect x="667" y="614" width="420" height="76" fill="#555b63"/>
-  <text x="877" y="643" text-anchor="middle" class="codigo blanco">id_par = min(rₜ, pareja)</text>
-  <text x="877" y="674" text-anchor="middle" class="codigo blanco">moneda = hash(id_par, clave) y 1</text>
+  <text x="877" y="643" text-anchor="middle" class="codigo blanco">pair_id = min(rₜ, partner)</text>
+  <text x="877" y="674" text-anchor="middle" class="codigo blanco">coin = hash(pair_id, key) &amp; 1</text>
   <path d="M 877 691 L 877 720" class="flujo"/>
   <rect x="667" y="722" width="420" height="60" fill="#4f82a6"/>
-  <text x="877" y="749" text-anchor="middle" class="pequeno blanco">ambos intercambian o ambos permanecen</text>
-  <text x="877" y="773" text-anchor="middle" class="mini blanco">cada ronda es una involución: no hay colisiones</text>
+  <text x="877" y="749" text-anchor="middle" class="pequeno blanco">both swap or both stay</text>
+  <text x="877" y="773" text-anchor="middle" class="mini blanco">each round is an involution: no collisions</text>
 
   <path d="M 1136 565 C 1170 565, 1170 398, 1102 398" class="flujo"/>
   <text x="1167" y="492" text-anchor="middle" class="pequeno">×12</text>
@@ -121,12 +121,12 @@
   <rect x="804" y="828" width="58" height="26" fill="#3f82b7"/>
   <text x="898" y="849" class="rotulo">…</text>
   <rect x="1004" y="828" width="86" height="26" fill="#3f82b7"/>
-  <text x="877" y="888" text-anchor="middle" class="rotulo">π(rₜ): permutación exacta de [0,N)</text>
+  <text x="877" y="888" text-anchor="middle" class="rotulo">π(rₜ): exact permutation of [0,N)</text>
 
-  <text x="877" y="920" text-anchor="middle" class="pie">(b) Permutación por intercambio condicionado</text>
-  <text x="877" y="952" text-anchor="middle" class="rotulo">sin puntajes, ordenamiento ni reintentos</text>
+  <text x="877" y="920" text-anchor="middle" class="pie">(b) Conditional swap permutation</text>
+  <text x="877" y="952" text-anchor="middle" class="rotulo">no scores, sorting, or retries</text>
 
-  <!-- (c) Selección y escritura -->
+  <!-- (c) Selection and write -->
   <rect x="1220" y="75" width="300" height="70" fill="#aebbc8"/>
   <rect x="1238" y="87" width="58" height="46" fill="#3f82b7"/>
   <rect x="1308" y="87" width="58" height="46" fill="#3f82b7"/>
@@ -140,7 +140,7 @@
   <path d="M 1622 146 L 1570 249" class="flujo"/>
   <rect x="1255" y="250" width="455" height="95" fill="#555b63"/>
   <text x="1482" y="289" text-anchor="middle" class="formula-blanca">sₜ = eₜ ∧ [π(rₜ) &lt; K]</text>
-  <text x="1482" y="322" text-anchor="middle" class="pequeno blanco">exactamente K rangos únicos satisfacen el umbral</text>
+  <text x="1482" y="322" text-anchor="middle" class="pequeno blanco">exactly K unique ranks meet the threshold</text>
 
   <path d="M 1482 346 L 1482 380" class="flujo"/>
   <rect x="1220" y="382" width="525" height="54" fill="#9cc8a7"/>
@@ -150,71 +150,71 @@
   <text x="1490" y="417" class="rotulo">…</text>
   <rect x="1580" y="392" width="64" height="34" fill="#aebbc8"/>
   <rect x="1656" y="392" width="64" height="34" fill="#4fa765"/>
-  <text x="1482" y="464" text-anchor="middle" class="rotulo">máscara seleccionada sₜ</text>
+  <text x="1482" y="464" text-anchor="middle" class="rotulo">selected mask sₜ</text>
 
   <rect x="1210" y="510" width="220" height="68" fill="#3f82b7"/>
-  <text x="1320" y="550" text-anchor="middle" class="pequeno blanco">ID original xₜ</text>
+  <text x="1320" y="550" text-anchor="middle" class="pequeno blanco">original ID xₜ</text>
   <rect x="1535" y="510" width="210" height="68" fill="#eda336"/>
-  <text x="1640" y="550" text-anchor="middle" class="pequeno blanco">ID [MASK]</text>
+  <text x="1640" y="550" text-anchor="middle" class="pequeno blanco">[MASK] ID</text>
   <path d="M 1320 579 L 1408 640" class="flujo"/>
   <path d="M 1482 465 L 1482 625" class="flujo"/>
   <path d="M 1640 579 L 1555 640" class="flujo"/>
 
   <rect x="1260" y="638" width="445" height="88" fill="#555b63"/>
   <text x="1482" y="678" text-anchor="middle" class="formula-blanca">x̃ₜ = where(sₜ, [MASK], xₜ)</text>
-  <text x="1482" y="708" text-anchor="middle" class="pequeno blanco">cálculo en registros</text>
+  <text x="1482" y="708" text-anchor="middle" class="pequeno blanco">computed in registers</text>
 
   <path d="M 1482 727 L 1482 761" class="flujo"/>
   <rect x="1218" y="763" width="300" height="70" fill="#3f82b7"/>
-  <text x="1368" y="805" text-anchor="middle" class="pequeno blanco">escribir IDs x̃ [B,T]</text>
+  <text x="1368" y="805" text-anchor="middle" class="pequeno blanco">write IDs x̃ [B,T]</text>
   <rect x="1540" y="763" width="205" height="70" fill="#eef4f7" stroke="#6f94ad" stroke-width="2" stroke-dasharray="7 6"/>
-  <text x="1642" y="791" text-anchor="middle" class="pequeno">opcional</text>
-  <text x="1642" y="818" text-anchor="middle" class="pequeno">escribir s [B,T]</text>
+  <text x="1642" y="791" text-anchor="middle" class="pequeno">optional</text>
+  <text x="1642" y="818" text-anchor="middle" class="pequeno">write s [B,T]</text>
   <path d="M 1510 727 L 1642 762" class="flujo"/>
 
-  <text x="1482" y="872" text-anchor="middle" class="pequeno">únicas escrituras globales · sin atómicos</text>
-  <text x="1482" y="920" text-anchor="middle" class="pie">(c) Selección y sustitución</text>
-  <text x="1482" y="952" text-anchor="middle" class="rotulo">cantidad fija sin ordenar ni seleccionar los K mayores</text>
+  <text x="1482" y="872" text-anchor="middle" class="pequeno">global writes only · no atomics</text>
+  <text x="1482" y="920" text-anchor="middle" class="pie">(c) Selection and substitution</text>
+  <text x="1482" y="952" text-anchor="middle" class="rotulo">fixed count without sorting or selecting the K largest</text>
 
-  <!-- (d) Integración en entrenamiento -->
+  <!-- (d) Training integration -->
   <rect x="1820" y="80" width="510" height="78" fill="#aebbc8"/>
   <rect x="1845" y="93" width="105" height="52" fill="#3f82b7"/>
   <rect x="1962" y="93" width="105" height="52" fill="#3f82b7"/>
   <text x="2105" y="126" class="rotulo">…</text>
   <rect x="2195" y="93" width="105" height="52" fill="#3f82b7"/>
-  <text x="2075" y="186" text-anchor="middle" class="rotulo">IDs enmascarados x̃</text>
+  <text x="2075" y="186" text-anchor="middle" class="rotulo">masked IDs x̃</text>
 
   <path d="M 2075 187 L 2075 245" class="flujo"/>
   <rect x="1870" y="247" width="410" height="88" fill="#8a6f9f"/>
-  <text x="2075" y="286" text-anchor="middle" class="formula-blanca">Transformer causal(x̃)</text>
-  <text x="2075" y="317" text-anchor="middle" class="pequeno blanco">máscaras causal y de padding originales</text>
+  <text x="2075" y="286" text-anchor="middle" class="formula-blanca">Causal Transformer(x̃)</text>
+  <text x="2075" y="317" text-anchor="middle" class="pequeno blanco">original causal and padding masks</text>
 
   <path d="M 2075 336 L 2075 374" class="flujo"/>
   <rect x="1870" y="376" width="410" height="76" fill="#f1dfbb"/>
   <rect x="1980" y="376" width="190" height="76" fill="#eda336"/>
   <text x="2075" y="422" text-anchor="middle" class="formula-blanca">H(x̃)</text>
-  <text x="2075" y="480" text-anchor="middle" class="rotulo">estados ocultos contextuales</text>
+  <text x="2075" y="480" text-anchor="middle" class="rotulo">contextual hidden states</text>
 
   <rect x="1810" y="530" width="205" height="70" fill="#c8a5a0"/>
-  <text x="1912" y="558" text-anchor="middle" class="pequeno blanco">etiquetas limpias</text>
+  <text x="1912" y="558" text-anchor="middle" class="pequeno blanco">clean labels</text>
   <text x="1912" y="585" text-anchor="middle" class="pequeno blanco">yₜ₊₁</text>
   <path d="M 1912 601 L 1995 656" class="flujo"/>
   <path d="M 2075 481 L 2075 641" class="flujo"/>
 
   <rect x="1880" y="654" width="390" height="90" fill="#3f82b7"/>
-  <text x="2075" y="691" text-anchor="middle" class="formula-blanca">CCE(H(x̃), C, y limpio)</text>
-  <text x="2075" y="723" text-anchor="middle" class="pequeno blanco">MiLe y μ-loss se activan de forma independiente</text>
+  <text x="2075" y="691" text-anchor="middle" class="formula-blanca">CCE(H(x̃), C, clean y)</text>
+  <text x="2075" y="723" text-anchor="middle" class="pequeno blanco">MiLe and μ-loss are independently enabled</text>
 
   <rect x="1810" y="785" width="520" height="82" class="kernel"/>
-  <text x="2070" y="816" text-anchor="middle" class="pequeno">MEAP es una operación entera previa: no tiene retropropagación</text>
-  <text x="2070" y="845" text-anchor="middle" class="pequeno">cambia el contexto; no cambia etiquetas, atención ni fórmula CCE</text>
+  <text x="2070" y="816" text-anchor="middle" class="pequeno">MEAP is a prior integer operation: no backward pass</text>
+  <text x="2070" y="845" text-anchor="middle" class="pequeno">changes context; labels, attention, and CCE formula are unchanged</text>
 
-  <text x="2070" y="920" text-anchor="middle" class="pie">(d) Integración con el modelo</text>
-  <text x="2070" y="952" text-anchor="middle" class="rotulo">objetivo limpio sobre contexto perturbado</text>
+  <text x="2070" y="920" text-anchor="middle" class="pie">(d) Model integration</text>
+  <text x="2070" y="952" text-anchor="middle" class="rotulo">clean objective over perturbed context</text>
 
   <!-- Resumen inferior -->
   <line x1="40" y1="985" x2="2360" y2="985" stroke="#b4b8bc" stroke-width="2"/>
-  <text x="70" y="1020" class="pequeno">Lanzamiento: grid=(B,), 4 grupos warp hasta BLOCK_T=512 y 8 después; T≤4096.</text>
-  <text x="845" y="1020" class="pequeno">Trabajo: O(B·T); temporales en registros O(BLOCK_T) por programa.</text>
-  <text x="1625" y="1020" class="pequeno">Memoria global: leer IDs/máscara; escribir x̃ y, solo si se solicita, s.</text>
+  <text x="70" y="1020" class="pequeno">Launch: grid=(B,), 4 warp groups through BLOCK_T=512 and 8 above; T≤4096.</text>
+  <text x="845" y="1020" class="pequeno">Work: O(B·T); register temporaries O(BLOCK_T) per program.</text>
+  <text x="1625" y="1020" class="pequeno">Global memory: read IDs/mask; write x̃ and, only if requested, s.</text>
 </svg>

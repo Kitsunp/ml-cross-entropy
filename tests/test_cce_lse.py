@@ -69,3 +69,68 @@ def test_lse(
     assert (
         cce_error <= (expected_error + error_tol)
     ).all(), f"{(cce_error - expected_error).relu().max()=}"
+
+
+@skip_no_cuda
+def test_logit_avg_excludes_padded_tile_rows_with_bias() -> None:
+    torch.cuda.manual_seed(0)
+    n, v, d = 17, 63, 32
+    e = torch.randn((n, d), device="cuda", dtype=torch.bfloat16) / (d**0.5)
+    c = torch.randn((v, d), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(v, device="cuda", dtype=torch.bfloat16)
+
+    result = cce_lse_forward_kernel(e, c, bias, return_logit_avg=True).logit_avg
+    expected = (e @ c.T + bias).float().mean(dim=0)
+
+    assert result is not None
+    torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+
+
+@skip_no_cuda
+def test_split_reduction_matches_lock_with_all_optional_outputs(monkeypatch) -> None:
+    torch.cuda.manual_seed(1)
+    n, v, d = 37, 257, 64
+    e = torch.randn((n, d), device="cuda", dtype=torch.bfloat16) / (d**0.5)
+    c = torch.randn((v, d), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(v, device="cuda", dtype=torch.bfloat16) * 0.02
+    targets = torch.randint(0, v, (n,), device="cuda")
+    valids = torch.arange(0, n - 1, 2, device="cuda", dtype=torch.int64)
+
+    outputs = {}
+    for reduction in ("lock", "split"):
+        monkeypatch.setenv("CCE_FORWARD_REDUCTION", reduction)
+        outputs[reduction] = cce_lse_forward_kernel(
+            e,
+            c,
+            bias,
+            valids,
+            softcap=20.0,
+            targets=targets,
+            shift=1,
+            return_logit_avg=True,
+            return_mean_logit=True,
+        )
+
+    lock = outputs["lock"]
+    split = outputs["split"]
+    torch.testing.assert_close(split.lse, lock.lse, atol=3e-4, rtol=3e-4)
+    assert lock.logit_avg is not None and split.logit_avg is not None
+    torch.testing.assert_close(split.logit_avg, lock.logit_avg, atol=3e-4, rtol=3e-4)
+    assert lock.neg_correct_logit is not None and split.neg_correct_logit is not None
+    torch.testing.assert_close(split.neg_correct_logit, lock.neg_correct_logit)
+    assert lock.mean_logit is not None and split.mean_logit is not None
+    torch.testing.assert_close(split.mean_logit, lock.mean_logit, atol=3e-4, rtol=3e-4)
+
+
+@skip_no_cuda
+def test_auto_split_selector_is_memory_bounded() -> None:
+    from cut_cross_entropy.cce_lse_forward_split import use_split_reduction
+
+    c = torch.empty((2048, 32), device="cuda", dtype=torch.bfloat16)
+    small_e = torch.empty((512, 32), device="cuda", dtype=torch.bfloat16)
+    large_e = torch.empty((513, 32), device="cuda", dtype=torch.bfloat16)
+
+    assert use_split_reduction(small_e, c, 512, return_mean_logit=False)
+    assert not use_split_reduction(large_e, c, 513, return_mean_logit=False)
+    assert not use_split_reduction(small_e, c, 512, return_mean_logit=True)
+    assert not use_split_reduction(small_e.float(), c.float(), 512, return_mean_logit=False)

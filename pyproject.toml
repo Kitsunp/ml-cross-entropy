@@ -6,8 +6,9 @@ description = "Code for cut cross entropy, a memory efficient implementation of 
 requires-python = ">= 3.9"
 
 dependencies = [
-    "torch>=2.4",
-    'triton>=3.0.0 ; platform_system != "Darwin"',
+    'torch>=2.8 ; platform_system != "Darwin"',
+    'torch>=2.4 ; platform_system == "Darwin"',
+    'triton>=3.4.0 ; platform_system != "Darwin"',
 ]
 
 [project.optional-dependencies]

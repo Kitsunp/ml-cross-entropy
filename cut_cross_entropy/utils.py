@@ -116,13 +116,6 @@ def is_torch_greater_or_equal_2_5() -> bool:
     return is_package_greater_or_equal("torch", "2.5")
 
 
-@functools.cache
-def is_triton_3_2() -> bool:
-    return packaging.version.parse(
-        packaging.version.parse(importlib.metadata.version("triton")).base_version
-    ) == packaging.version.parse("3.2")
-
-
 @dataclass(slots=True)
 class TensorInfo:
     dtype: torch.dtype

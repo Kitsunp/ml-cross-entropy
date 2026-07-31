@@ -1,16 +1,22 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
+import functools
+import math
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from cut_cross_entropy.mu_loss import add_mu_loss_gradient_kernel
-from cut_cross_entropy.tl_autotune import cce_backward_autotune
+from cut_cross_entropy.tl_autotune import (
+    CCE_LOCK_BLOCK_B,
+    CCE_LOCK_BLOCK_V,
+    cce_backward_autotune,
+)
 from cut_cross_entropy.tl_utils import (
     b_bin_fn,
-    is_triton_greater_or_equal_3_2_0,
     tl_and_reduce_fn,
     tl_lock_add,
-    tl_lock_kahan_sum,
     tl_softcapping,
     tl_softcapping_grad,
 )
@@ -19,10 +25,145 @@ from cut_cross_entropy.vocab_parallel.utils import vp_reduce_e_grad
 
 
 @triton.jit
+def _scaled_gradient_cast_kernel(
+    Input,
+    Output,
+    n_elements,
+    inverse_scale,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(Input + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Output + offsets, values * inverse_scale, mask=mask)
+
+
+def _finalize_scaled_gradient(
+    gradient: torch.Tensor,
+    output_dtype: torch.dtype,
+    scale: float,
+) -> torch.Tensor:
+    assert gradient.is_contiguous()
+    output = torch.empty_like(gradient, dtype=output_dtype)
+    _scaled_gradient_cast_kernel[(triton.cdiv(gradient.numel(), 256),)](
+        gradient,
+        output,
+        gradient.numel(),
+        1.0 / scale,
+        BLOCK=256,
+        num_warps=4,
+    )
+    return output
+
+
+def _fp16_accum_scale(grad_scale: float, max_weight: float = 1.0) -> float:
+    """Undo mean reduction with a conservative weighted-gradient bound."""
+    if not math.isfinite(grad_scale) or grad_scale == 0.0:
+        return 1.0
+    if not math.isfinite(max_weight) or max_weight <= 0.0:
+        return 1.0
+    available = min(1024.0, 1.0 / abs(grad_scale))
+    if max_weight > 1.0:
+        # MiLe multiplies (P-Y) before the mean-reduction scale. Keep the
+        # scaled target contribution below the finite FP16 range.
+        available = min(
+            available,
+            torch.finfo(torch.float16).max
+            / (abs(grad_scale) * max_weight),
+        )
+    if available < 2.0:
+        return 1.0
+    return float(2 ** math.floor(math.log2(available)))
+
+
+_AUTO_FP16_OUTPUT_ELEMENTS = 8 * 1024 * 1024
+_AUTO_FP16_MIN_SURFACE_ELEMENTS = 1024 * 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _device_supports_auto_fp16_accumulation(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index)[0] >= 12
+
+
+def _mile_weight_bound(vocab: int, gamma: float | None) -> float:
+    """Return a device-free upper bound for normalized MiLe weights."""
+    if gamma is None or gamma == 0.0:
+        return 1.0
+    if not math.isfinite(gamma) or gamma < 0.0:
+        return math.inf
+    if vocab <= 1:
+        return 1.0
+    try:
+        # Entropy <= log(V), while the normalization denominator is >= 1.
+        return float((1.0 + math.log(float(vocab))) ** gamma)
+    except OverflowError:
+        return math.inf
+
+
+def _auto_fp16_accumulation_dtypes(
+    e: torch.Tensor,
+    e_info: TensorInfo,
+    c: torch.Tensor,
+    c_info: TensorInfo,
+    effective_b: int,
+    *,
+    accum_e_fp32: bool,
+    accum_c_fp32: bool,
+    dlse: torch.Tensor | None,
+    mile_weight: torch.Tensor | None,
+    mu: torch.Tensor | None,
+    mile_gamma: float | None,
+    reduce_e_grad: bool,
+    pg: torch.distributed.ProcessGroup | None,
+) -> tuple[bool, bool]:
+    """Conservative SM12 dispatch for the benchmarked shape zone."""
+    assert e.device.index is not None
+    if not (
+        accum_e_fp32
+        and accum_c_fp32
+        and e_info.requires_grad
+        and c_info.requires_grad
+        and e.is_contiguous()
+        and c.is_contiguous()
+        and e_info.dtype == torch.bfloat16
+        and c_info.dtype == torch.bfloat16
+        and dlse is None
+        and not reduce_e_grad
+        and pg is None
+        and _device_supports_auto_fp16_accumulation(e.device.index)
+    ):
+        return False, False
+
+    if mile_weight is not None:
+        # Internal callers pass MiLe's exponent explicitly.  A direct kernel
+        # caller that omits it must remain on the conservative FP32 path rather
+        # than silently using an unbounded FP16 scale estimate.
+        if mile_gamma is None:
+            return False, False
+        if not math.isfinite(_mile_weight_bound(c.size(0), mile_gamma)):
+            return False, False
+
+    dim = e.size(1)
+    vocab = c.size(0)
+    eligible = (
+        (
+            dim >= 256
+            and (effective_b + vocab) * dim >= _AUTO_FP16_OUTPUT_ELEMENTS
+        )
+        or min(effective_b, vocab) * dim >= _AUTO_FP16_MIN_SURFACE_ELEMENTS
+    )
+    if not eligible:
+        return False, False
+
+    # μ-loss contributes an independent FP32 regularizer to dC after the CCE
+    # reduction. Keep that destination FP32 while still allowing FP16 dE.
+    return True, mu is None
+
+
+@triton.jit
 def _mm_backward(
     do,
     da_ptrs,
-    dac_ptrs,
     partial_mask_a,
     da_lock_ptr,
     n_locks,
@@ -33,15 +174,13 @@ def _mm_backward(
     D,
     BLOCK_D: tl.constexpr,
     EVEN_D: tl.constexpr,
-    USE_KAHAN: tl.constexpr,
+    USE_ATOMIC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     d_inds = tl.arange(0, BLOCK_D)[None, :].to(tl.int64)
 
     b_ptrs = b_ptrs + d_inds * stride_bd
     da_ptrs = da_ptrs + d_inds * stride_ad
-    if USE_KAHAN:
-        dac_ptrs = dac_ptrs + d_inds * stride_ad
 
     for d in range(0, tl.cdiv(D, BLOCK_D)):
         if EVEN_D:
@@ -58,23 +197,32 @@ def _mm_backward(
         else:
             mask = partial_mask_a & (d_inds < (D - d * BLOCK_D))
 
-        lock_offset = d // tl.cdiv(D, BLOCK_D * n_locks)
-        this_da_lock_ptr = da_lock_ptr + lock_offset
-
-        if USE_KAHAN:
-            tl_lock_kahan_sum(da_ptrs, dac_ptrs, da_i, mask, this_da_lock_ptr)
+        if USE_ATOMIC:
+            tl.atomic_add(da_ptrs, da_i, mask=mask, sem="relaxed", scope="gpu")
         else:
+            lock_offset = d // tl.cdiv(D, BLOCK_D * n_locks)
+            this_da_lock_ptr = da_lock_ptr + lock_offset
             tl_lock_add(da_ptrs, da_i, mask, this_da_lock_ptr)
 
         b_ptrs += BLOCK_D * stride_bd
         da_ptrs += BLOCK_D * stride_ad
-        if USE_KAHAN:
-            dac_ptrs += BLOCK_D * stride_ad
 
 
 @triton.jit
 def _block_is_filtered(check_val: tl.tensor, filter_eps: tl.tensor) -> tl.tensor:
     return tl.reduce(check_val < filter_eps, None, tl_and_reduce_fn)
+
+
+@triton.jit
+def _maybe_scale_gradient_tile(
+    value,
+    scale,
+    output_dtype: tl.constexpr,
+    APPLY_SCALE: tl.constexpr,
+):
+    if APPLY_SCALE:
+        return (value * scale).cast(output_dtype, fp_downcast_rounding="rtne")
+    return value
 
 
 def _cce_backward_kernel(
@@ -91,19 +239,15 @@ def _cce_backward_kernel(
     softcap,
     Targets,
     dE,
-    dEC,
     dELocks,
     dC,
-    dCC,
     dCLocks,
     dBias,
     B,
     D,
     V,
     BMax,
-    n_de_locks_0,
     n_de_locks_1,
-    n_dc_locks_0,
     n_dc_locks_1,
     stride_eb,
     stride_ed,
@@ -112,8 +256,15 @@ def _cce_backward_kernel(
     stride_biasv,
     stride_vb,
     filter_eps,
+    de_accum_scale,
+    dc_accum_scale,
     shift,
+    MODE,
     B_BIN,
+    LOCK_BLOCK_B: tl.constexpr,
+    LOCK_BLOCK_V: tl.constexpr,
+    USE_ATOMIC_E: tl.constexpr,
+    USE_ATOMIC_C: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -132,11 +283,11 @@ def _cce_backward_kernel(
     HAS_DLSE: tl.constexpr,
     HAS_MILE: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
-    KAHAN_E: tl.constexpr,
-    KAHAN_C: tl.constexpr,
     COMPUTE_DC: tl.constexpr,
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
+    SCALE_DE: tl.constexpr,
+    SCALE_DC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -282,14 +433,19 @@ def _cce_backward_kernel(
             should_skip_e = False
 
         if not should_skip_e:
-            lock_offset = (pid_b // tl.cdiv(B, BLOCK_B * n_de_locks_0)) * n_de_locks_1
+            if USE_ATOMIC_E:
+                de_locks = dELocks
+            else:
+                lock_offset = (pid_b * BLOCK_B // LOCK_BLOCK_B) * n_de_locks_1
+                de_locks = dELocks + lock_offset
 
             _mm_backward(
-                d_accum,
+                _maybe_scale_gradient_tile(
+                    d_accum, de_accum_scale, E.dtype.element_ty, SCALE_DE
+                ),
                 dE + (offs_b[:, None] * stride_eb),
-                dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
                 offs_b[:, None] < BMax,
-                dELocks + lock_offset,
+                de_locks,
                 n_de_locks_1,
                 C + offs_v[:, None] * stride_cv,
                 offs_v[:, None] < V,
@@ -298,7 +454,7 @@ def _cce_backward_kernel(
                 D,
                 MM_BACK_BLOCK_D,
                 MM_BACK_EVEN_D,
-                KAHAN_E,
+                USE_ATOMIC_E,
                 DOT_PRECISION,
             )
 
@@ -309,14 +465,21 @@ def _cce_backward_kernel(
             should_skip_c = False
 
         if not should_skip_c:
-            lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
+            if USE_ATOMIC_C:
+                dc_locks = dCLocks
+            else:
+                lock_offset = (pid_v * BLOCK_V // LOCK_BLOCK_V) * n_dc_locks_1
+                dc_locks = dCLocks + lock_offset
 
             _mm_backward(
-                tl.trans(d_accum),
+                tl.trans(
+                    _maybe_scale_gradient_tile(
+                        d_accum, dc_accum_scale, E.dtype.element_ty, SCALE_DC
+                    )
+                ),
                 dC + (offs_v[:, None] * stride_cv),
-                dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
                 offs_v[:, None] < V,
-                dCLocks + lock_offset,
+                dc_locks,
                 n_dc_locks_1,
                 E + (offs_b[:, None] * stride_eb),
                 offs_b[:, None] < BMax,
@@ -325,7 +488,7 @@ def _cce_backward_kernel(
                 D,
                 MM_BACK_BLOCK_D,
                 MM_BACK_EVEN_D,
-                KAHAN_C,
+                USE_ATOMIC_C,
                 DOT_PRECISION,
             )
 
@@ -335,7 +498,9 @@ def _cce_back_block_d(args) -> int:
     return 2 * block_d
 
 
-_cce_backward_kernel = triton.jit(_cce_backward_kernel)
+_cce_backward_kernel = triton.jit(
+    _cce_backward_kernel, do_not_specialize=["MODE", "B_BIN"]
+)
 _cce_backward_kernel = triton.heuristics(  # type: ignore
     {
         "EVEN_D": lambda args: (args["D"] % args["BLOCK_D"]) == 0,
@@ -353,12 +518,13 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "GROUP_B": lambda args: 8,
         "COMPUTE_DC": lambda args: args["dC"] is not None,
         "COMPUTE_DE": lambda args: args["dE"] is not None,
-        "KAHAN_E": lambda args: args["dEC"] is not None,
-        "KAHAN_C": lambda args: args["dCC"] is not None,
         "COMPUTE_DBIAS": lambda args: args["dBias"] is not None,
-        "DOT_PRECISION": lambda args: "tf32"
-        if torch.get_float32_matmul_precision() == "high"
-        else "ieee",
+        # MiLe forward computes its weighted-logit moment with IEEE products;
+        # reconstruct logits with the same precision so backward differentiates
+        # the loss that was actually evaluated.
+        "DOT_PRECISION": lambda args: "ieee"
+        if args["MiLeWeight"] is not None
+        else ("tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"),
     }
 )(_cce_backward_kernel)
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
@@ -387,27 +553,16 @@ def cce_backward_kernel(
     grad_scale: float = 1.0,
     accum_e_fp32: bool = False,
     accum_c_fp32: bool = False,
+    auto_mixed_grad_accum: bool = False,
     filter_e_grad: bool = True,
     filter_c_grad: bool = True,
     reduce_e_grad: bool = False,
     pg: torch.distributed.ProcessGroup | None = None,
+    mile_gamma: float | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
     assert lse.size(0) == e.size(0) or (valids is not None and lse.size(0) == valids.size(0))
-
-    if not is_triton_greater_or_equal_3_2_0():
-        assert e.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        ), "Backwards for triton<3.2 requires embeddings to be bf16 or fp16"
-        assert c.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        ), "Backwards for triton<3.2 requires classifier to be bf16 or fp16"
-        can_use_fp32_accum = False
-    else:
-        can_use_fp32_accum = True
 
     do = do.contiguous()
     lse = lse.contiguous()
@@ -419,14 +574,104 @@ def cce_backward_kernel(
         mu = mu.contiguous()
         mu_vocab_size = mu_vocab_size.contiguous()
 
-    de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
+    default_accum_dtype = "auto" if auto_mixed_grad_accum else "fp32"
+    de_accum_dtype = os.getenv("CCE_DE_ACCUM_DTYPE", default_accum_dtype)
+    dc_accum_dtype = os.getenv("CCE_DC_ACCUM_DTYPE", default_accum_dtype)
+    valid_accum_dtypes = {"auto", "fp32", "fp16", "bf16"}
+    if de_accum_dtype not in valid_accum_dtypes:
+        raise ValueError(
+            "CCE_DE_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'"
+        )
+    if dc_accum_dtype not in valid_accum_dtypes:
+        raise ValueError(
+            "CCE_DC_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'"
+        )
+    if (de_accum_dtype == "auto") != (dc_accum_dtype == "auto"):
+        raise ValueError(
+            "CCE_DE_ACCUM_DTYPE and CCE_DC_ACCUM_DTYPE must both be 'auto' "
+            "when automatic mixed accumulation is requested"
+        )
+    effective_b = valids.size(0) if valids is not None else e.size(0)
+    if de_accum_dtype == "auto":
+        use_fp16_e, use_fp16_c = _auto_fp16_accumulation_dtypes(
+            e,
+            e_info,
+            c,
+            c_info,
+            effective_b,
+            accum_e_fp32=accum_e_fp32,
+            accum_c_fp32=accum_c_fp32,
+            dlse=dlse,
+            mile_weight=mile_weight,
+            mu=mu,
+            mile_gamma=mile_gamma,
+            reduce_e_grad=reduce_e_grad,
+            pg=pg,
+        )
+        de_accum_dtype = "fp16" if use_fp16_e else "fp32"
+        dc_accum_dtype = "fp16" if use_fp16_c else "fp32"
+
+    # An explicit FP16 request must not swallow μ-loss's independent dC term.
+    if mu is not None and dc_accum_dtype != "fp32":
+        dc_accum_dtype = "fp32"
+
+    if accum_e_fp32:
+        de_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[de_accum_dtype]
+    else:
+        de_dtype = None
     de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
 
-    dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
+    if accum_c_fp32:
+        dc_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[dc_accum_dtype]
+    else:
+        dc_dtype = None
     dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
     accum_e_fp32 = accum_e_fp32 and de is not None
     accum_c_fp32 = accum_c_fp32 and dc is not None
+
+    backward_reduction = os.getenv("CCE_BACKWARD_REDUCTION", "auto")
+    if backward_reduction not in {"auto", "lock", "atomic"}:
+        raise ValueError("CCE_BACKWARD_REDUCTION must be 'auto', 'lock', or 'atomic'")
+    use_atomic_e = (
+        backward_reduction != "lock"
+        and de is not None
+        and (
+            de.dtype == torch.float32
+            or (accum_e_fp32 and de_accum_dtype != "fp32")
+        )
+    )
+    use_atomic_c = (
+        backward_reduction != "lock"
+        and dc is not None
+        and (
+            dc.dtype == torch.float32
+            or (accum_c_fp32 and dc_accum_dtype != "fp32")
+        )
+    )
+    fp16_scale_mode = os.getenv("CCE_FP16_ACCUM_SCALE", "auto")
+    if fp16_scale_mode not in {"auto", "off"}:
+        raise ValueError("CCE_FP16_ACCUM_SCALE must be 'auto' or 'off'")
+    mile_weight_bound = _mile_weight_bound(c.size(0), mile_gamma) if mile_weight is not None else 1.0
+    safe_scale = (
+        _fp16_accum_scale(grad_scale, mile_weight_bound)
+        if fp16_scale_mode == "auto" and dlse is None
+        else 1.0
+    )
+    de_accum_scale = safe_scale if de is not None and de.dtype == torch.float16 else 1.0
+    dc_accum_scale = (
+        safe_scale
+        if dc is not None and dc.dtype == torch.float16 and mu is None
+        else 1.0
+    )
 
     if bias is not None:
         assert bias_info is not None
@@ -443,22 +688,6 @@ def cce_backward_kernel(
     if dbias is not None:
         assert bias is not None
         assert dbias.stride() == bias.stride()
-
-    if accum_e_fp32 and not can_use_fp32_accum:
-        dec = torch.zeros_like(e) if de is not None else None
-    else:
-        dec = None
-
-    if accum_c_fp32 and not can_use_fp32_accum:
-        dcc = torch.zeros_like(c) if dc is not None else None
-    else:
-        dcc = None
-
-    if dec is not None:
-        assert dec.stride() == e.stride()
-
-    if dcc is not None:
-        assert dcc.stride() == e.stride()
 
     if valids is not None:
         assert valids.ndim == 1
@@ -485,19 +714,23 @@ def cce_backward_kernel(
         assert vocab_ordering.stride(0) == 1
 
     nd_locks = triton.cdiv(c.size(1), 64)
-    if de is not None:
-        de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
+    if de is not None and not use_atomic_e:
+        de_locks = e.new_zeros(
+            (triton.cdiv(B, CCE_LOCK_BLOCK_B), nd_locks), dtype=torch.int32
+        )
         de_lock_sizes = de_locks.size()
     else:
         de_locks = None
-        de_lock_sizes = (None, None)
+        de_lock_sizes = (None, 1)
 
-    if dc is not None:
-        dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
+    if dc is not None and not use_atomic_c:
+        dc_locks = c.new_zeros(
+            (triton.cdiv(c.size(0), CCE_LOCK_BLOCK_V), nd_locks), dtype=torch.int32
+        )
         dc_lock_sizes = dc_locks.size()
     else:
         dc_locks = None
-        dc_lock_sizes = (None, None)
+        dc_lock_sizes = (None, 1)
 
     _cce_backward_kernel[grid](
         e,
@@ -513,18 +746,16 @@ def cce_backward_kernel(
         softcap,
         targets,
         de,
-        dec,
         de_locks,
         dc,
-        dcc,
         dc_locks,
         dbias,
         B,
         e.size(1),
         c.size(0),
         e.size(0),
-        *de_lock_sizes,
-        *dc_lock_sizes,
+        de_lock_sizes[1],
+        dc_lock_sizes[1],
         e.stride(0),
         e.stride(1),
         c.stride(0),
@@ -532,8 +763,39 @@ def cce_backward_kernel(
         1 if bias is None else bias.stride(0),
         1 if valids is None else valids.stride(0),
         filter_eps,
+        de_accum_scale,
+        dc_accum_scale,
         shift=shift,
+        MODE=(
+            (
+                bias is not None
+                or valids is not None
+                or vocab_ordering is not None
+                or targets is not None
+                or shift != 0
+            )
+            | ((softcap is not None or dlse is not None) << 1)
+            | ((mile_weight is not None) << 2)
+            | ((de is not None) << 3)
+            | ((dc is not None) << 4)
+            | ((dbias is not None) << 5)
+            | (
+                (
+                    (filter_e_grad and de is not None)
+                    or (filter_c_grad and dc is not None)
+                )
+                << 6
+            )
+            | ((do.numel() == 1) << 7)
+            | ((use_atomic_e or use_atomic_c) << 8)
+        ),
         B_BIN=b_bin_fn(B),
+        LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
+        LOCK_BLOCK_V=CCE_LOCK_BLOCK_V,
+        USE_ATOMIC_E=use_atomic_e,
+        USE_ATOMIC_C=use_atomic_c,
+        SCALE_DE=de_accum_scale != 1.0,
+        SCALE_DC=dc_accum_scale != 1.0,
         FILTER_E_GRAD=filter_e_grad and de is not None,
         FILTER_C_GRAD=filter_c_grad and dc is not None,
     )
@@ -551,9 +813,15 @@ def cce_backward_kernel(
         dbias = dbias.to(dtype=bias_info.dtype)
 
     if dc is not None:
-        dc = dc.to(dtype=c_info.dtype)
+        if dc_accum_scale != 1.0:
+            dc = _finalize_scaled_gradient(dc, c_info.dtype, dc_accum_scale)
+        else:
+            dc = dc.to(dtype=c_info.dtype)
 
     if de is not None:
-        de = de.to(dtype=e_info.dtype)
+        if de_accum_scale != 1.0:
+            de = _finalize_scaled_gradient(de, e_info.dtype, de_accum_scale)
+        else:
+            de = de.to(dtype=e_info.dtype)
 
     return de, dc, dbias

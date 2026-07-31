@@ -17,10 +17,10 @@ subscript $v$ selects a vocabulary tile.
 - **Panel (a)** is still the ordinary blockwise CCE forward. Each temporary
   $z_{nv}$ tile lives in registers. While vocabulary tiles stream through the
   program, CCE reduces them into three FP32 values per valid token:
-  $\operatorname{LSE}_n$, $m_n=\mathbb E_{p_n}[z_n]$, and
-  $\operatorname{NLL}_n$.
+  $\mathrm{LSE}_n$, $m_n=\mathbb E_{p_n}[z_n]$, and
+  $\mathrm{NLL}_n$.
 - **Panel (b)** is the MiLe-specific post-processing.
-  $\operatorname{LSE}_n-m_n$ gives the predictive entropy, the entropy produces
+  $\mathrm{LSE}_n-m_n$ gives the predictive entropy, the entropy produces
   a raw weight $a_n$, and the global
   mean makes the final weights average to one. The two blue boxes are execution
   strategies for the same formula, not two different objectives.
@@ -28,9 +28,9 @@ subscript $v$ selects a vocabulary tile.
   cross-entropy gradient, loads one saved scalar $w_n$, and multiplies the whole
   token row by it before accumulating $\mathrm dE$ and $\mathrm dC$.
 
-The long $\operatorname{NLL}_n$ route in panel (b) is intentionally separate from weight
+The long $\mathrm{NLL}_n$ route in panel (b) is intentionally separate from weight
 normalization: NLL does not determine the weight. It meets the detached weight
-only at the final product $w_n\operatorname{NLL}_n$.
+only at the final product $w_n\mathrm{NLL}_n$.
 
 ## Objective
 
@@ -38,22 +38,22 @@ For valid token $i$, logits $z_i$, probabilities $p_i$, and target $y_i$:
 
 $$
 \begin{aligned}
-H_i &= \operatorname{logsumexp}(z_i)-\sum_j p_{ij}z_{ij}, \\
+H_i &= \mathrm{logsumexp}(z_i)-\sum_j p_{ij}z_{ij}, \\
 a_i &= (1+H_i)^\gamma, \\
-w_i &= \operatorname{stop\_gradient}\!\left(\frac{a_i}{\operatorname{mean}_{k\in\mathcal V}(a_k)}\right), \\
-\mathcal L_{\mathrm{MiLe}} &= \operatorname{mean}_{i\in\mathcal V}\!\left(-w_i\log p_{i,y_i}\right),
+w_i &= \mathrm{stop\_gradient}\!\left(\frac{a_i}{\mathrm{mean}_{k\in\mathcal V}(a_k)}\right), \\
+\mathcal L_{\mathrm{MiLe}} &= \mathrm{mean}_{i\in\mathcal V}\!\left(-w_i\log p_{i,y_i}\right),
 \end{aligned}
 $$
 
 where $\mathcal V$ is the set of valid tokens. The normalization preserves
-$\operatorname{mean}_{i\in\mathcal V}(w_i)=1$, so MiLe changes the allocation
+$\mathrm{mean}_{i\in\mathcal V}(w_i)=1$, so MiLe changes the allocation
 of gradient across tokens rather than deliberately increasing the average loss
 scale. The stop-gradient does **not** remove the effect of the weight:
 
 $$
 \frac{\partial \mathcal L_{\mathrm{MiLe}}}{\partial\theta}
-= \operatorname{mean}_{i\in\mathcal V}\!\left(
-w_i\frac{\partial\operatorname{CE}_i}{\partial\theta}
+= \mathrm{mean}_{i\in\mathcal V}\!\left(
+w_i\frac{\partial\mathrm{CE}_i}{\partial\theta}
 \right).
 $$
 
@@ -85,7 +85,7 @@ MiLe is integrated into the existing CCE pipeline and never materializes the
 The entropy identity in step 2 is exact for the logits processed by CCE:
 
 $$
-H(p_i)=\operatorname{logsumexp}(z_i)-\mathbb E_{p_i}[z_i].
+H(p_i)=\mathrm{logsumexp}(z_i)-\mathbb E_{p_i}[z_i].
 $$
 
 No probability or full-logit matrix is stored.

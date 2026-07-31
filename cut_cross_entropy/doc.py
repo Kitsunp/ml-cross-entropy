@@ -58,10 +58,10 @@ CCE_OPTS_DOC = [
         in gradient computation. The default value of "auto" will automatically choose a value
         based on the input dtype.""",
     """
-    :param accum_e_fp32: Whether or not to use fp32 accumulation for dE (use Kahan summation for Triton < 3.2 to work around a bug).
+    :param accum_e_fp32: Whether or not to accumulate dE in FP32.
         This is useful when working with models with a very large vocabulary or very long sequence lengths.""",
     """
-    :param accum_c_fp32: Whether or not to use fp32 accumulation for dC (use Kahan summation for Triton < 3.2 to work around a bug).
+    :param accum_c_fp32: Whether or not to accumulate dC in FP32.
         This is useful when working with models with a very large vocabulary or very long sequence lengths.""",
     """
     :param filter_e_grad: Whether or not to apply gradient filter to the embedding gradient (dE). If filter_eps is None, this

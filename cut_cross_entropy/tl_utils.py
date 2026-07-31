@@ -1,11 +1,7 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
-import functools
-
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice as tl_libdevice
-
-from cut_cross_entropy.utils import is_package_greater_or_equal
 
 
 @triton.jit
@@ -42,37 +38,6 @@ def tl_logaddexp(a, b) -> tl.tensor:
 
 
 @triton.jit
-def tl_2sum(a: tl.tensor, b: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
-    s = a + b
-
-    a_prime = s - b
-    b_prime = s - a_prime
-
-    delta_a = a - a_prime
-    delta_b = b - b_prime
-
-    t = delta_a + delta_b
-    return s, t
-
-
-@triton.jit
-def tl_lock_kahan_sum(ptrs, c_ptrs, v, mask, lock_ptr):
-    while tl.atomic_cas(lock_ptr, 0, 1) == 1:
-        pass
-
-    s = tl.load(ptrs, mask=mask, other=0.0, eviction_policy="evict_last")
-    c = tl.load(c_ptrs, mask=mask, other=0.0, eviction_policy="evict_last")
-
-    s, c = tl_2sum(s, c + v)
-
-    tl.store(ptrs, s, mask=mask, eviction_policy="evict_last")
-    tl.store(c_ptrs, c, mask=mask, eviction_policy="evict_last")
-
-    tl.debug_barrier()
-    tl.atomic_xchg(lock_ptr, 0)
-
-
-@triton.jit
 def tl_lock_add(ptrs, v, mask, lock_ptr):
     while tl.atomic_cas(lock_ptr, 0, 1) == 1:
         pass
@@ -86,14 +51,6 @@ def tl_lock_add(ptrs, v, mask, lock_ptr):
 
 
 def b_bin_fn(b: int) -> int:
-    if b >= 1024:
-        return 1024
-    elif b <= 128:
-        return 128
-    else:
-        return 512
-
-
-@functools.cache
-def is_triton_greater_or_equal_3_2_0() -> bool:
-    return is_package_greater_or_equal("triton", "3.2.0")
+    # Keep meaningful batch-size regimes in the autotune key without creating
+    # one compiled variant for every sequence length.
+    return min(32768, max(128, 1 << (b - 1).bit_length()))

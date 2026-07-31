@@ -20,7 +20,6 @@ from cut_cross_entropy.torch_compile import torch_compile_linear_cross_entropy
 from cut_cross_entropy.utils import (
     CCEWarning,
     is_torch_greater_or_equal_2_5,
-    is_triton_3_2,
     maybe_type_as,
     to_full_tensor,
 )
@@ -248,15 +247,6 @@ def linear_cross_entropy(
                 "CCE does not support MacOS. Please use torch_compile when running on MacOS instead."
             )
 
-        if is_triton_3_2():
-            warnings.warn(
-                "There is a known issue with CCE and Triton 3.2 (the version that ships with PyTorch 2.6)"
-                " that can result in incorrect gradients. If possible, please verify that you"
-                " are not impacted by this bug by trying a newer triton version (i.e. by installing PyTorch>2.6).",
-                CCEWarning,
-                stacklevel=2,
-            )
-
         cce_opts = CCEPresets.build_for_impl(
             impl,
             CCEPreset(
@@ -282,6 +272,7 @@ def linear_cross_entropy(
             vocab_parallel_options=vocab_parallel_options,
             return_lse=return_lse,
             return_loss_metrics=return_loss_metrics,
+            _auto_mixed_grad_accum=impl == "cce_kahan_full_c",
             mile_enabled=mile_enabled,
             mile_gamma=mile_gamma,
             mu_loss_enabled=mu_loss_enabled,
