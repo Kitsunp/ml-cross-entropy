@@ -145,7 +145,7 @@
   <text x="74" y="655" class="panel-title">Safety and fallback</text>
   <text x="74" y="687" class="small">Flag absent → historical lock reduction (the default).</text>
   <text x="74" y="712" class="small">Unsupported capability, MiLe moment, FP32, large B, failed free-VRAM guard, or automatic OOM → lock path.</text>
-  <text x="74" y="739" class="small">Explicit CCE_FORWARD_REDUCTION=split remains available for experiments; CC10.x requires CCE_SPLIT_V_ALLOW_UNVALIDATED=1 and is not hardware-validated here.</text>
+  <text x="74" y="739" class="small">Explicit CCE_FORWARD_REDUCTION=split remains available; CC10.x uses its profile only with CCE_SPLIT_V_ALLOW_UNVALIDATED=1 and is not hardware-validated here.</text>
   <rect x="1175" y="655" width="330" height="72" rx="10" fill="#f7dfbb" stroke="#d29a3b"/>
   <text x="1340" y="683" text-anchor="middle" class="label">Numerical contract</text>
   <text x="1340" y="707" text-anchor="middle" class="small">FP32 partials · same CCE equations</text>

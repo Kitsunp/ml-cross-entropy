@@ -145,9 +145,11 @@ The selector requires the regime where repeated measurements showed a useful
 forward improvement; larger batches and unsupported features remain on the
 lock path. `CCE_FORWARD_REDUCTION=lock` forces the baseline, while
 `CCE_FORWARD_REDUCTION=split` forces the staged path for an experiment even if
-the opt-in flag is absent. For an unvalidated CC10.x device, an explicit split
-experiment additionally requires `CCE_SPLIT_V_ALLOW_UNVALIDATED=1`. An invalid
-reduction value is rejected instead of silently changing behavior.
+the opt-in flag is absent. To select the unvalidated CC10.x compatibility
+profile, set `CCE_SPLIT_V_ALLOW_UNVALIDATED=1`; without it, an explicit split
+request uses a safe `S=1` sentinel and must not be treated as a validated
+performance path. An invalid reduction value is rejected instead of silently
+changing behavior.
 
 Because opt-in automatic split-V is capped at $B=512$ and does not request the
 MiLe moment, the validated CC12.x policy bounds its partial workspace by the
