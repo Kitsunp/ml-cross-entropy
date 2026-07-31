@@ -1,11 +1,12 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
+import os
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
 
-from cut_cross_entropy.tl_autotune import cce_forward_autotune
+from cut_cross_entropy.tl_autotune import CCE_LOCK_BLOCK_B, cce_forward_autotune
 from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
@@ -32,9 +33,10 @@ def _cce_lse_forward_kernel(
     stride_cd,
     stride_biasv,
     stride_vb,
-    num_locks,
+    MODE,
     # Meta-parameters
     B_BIN,
+    LOCK_BLOCK_B: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_VALIDS: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -59,7 +61,8 @@ def _cce_lse_forward_kernel(
     pid_b = (first_pid_b + ((pid % num_pid_in_group) % group_size_b)).to(tl.int64)
     pid_v = ((pid % num_pid_in_group) // group_size_b).to(tl.int64)
 
-    offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+    direct_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+    offs_b = direct_offs_b
     if HAS_VALIDS:
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
 
@@ -100,7 +103,8 @@ def _cce_lse_forward_kernel(
 
     logits = logits.cast(tl.float32)
     if HAS_LA:
-        this_avg_logit = tl.sum(logits, 0) / B
+        valid_rows = direct_offs_b[:, None] < B
+        this_avg_logit = tl.sum(tl.where(valid_rows, logits, 0.0), 0) / B
         tl.atomic_add(LA + offs_v, this_avg_logit, mask=offs_v < V)
 
     if HAS_TARGETS:
@@ -135,7 +139,7 @@ def _cce_lse_forward_kernel(
     lse_ptrs = LSE + offs_b
     mean_logit_ptrs = MeanLogit + offs_b if HAS_MEAN_LOGIT else None
 
-    this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
+    this_locks = Locks + (pid_b * BLOCK_B // LOCK_BLOCK_B)
     while tl.atomic_cas(this_locks, 0, 1) == 1:
         pass
 
@@ -160,7 +164,9 @@ def _cce_lse_forward_kernel(
     tl.atomic_xchg(this_locks, 0)
 
 
-_cce_lse_forward_kernel = triton.jit(_cce_lse_forward_kernel)
+_cce_lse_forward_kernel = triton.jit(
+    _cce_lse_forward_kernel, do_not_specialize=["MODE", "B_BIN"]
+)
 _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
     {
         "EVEN_D": lambda args: args["D"] % args["BLOCK_D"] == 0,
@@ -218,6 +224,35 @@ def cce_lse_forward_kernel(
         assert c.shape[0] == bias.shape[0]
 
     V, D = c.shape
+
+    reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
+    if reduction not in {"auto", "lock", "split"}:
+        raise ValueError("CCE_FORWARD_REDUCTION must be 'auto', 'lock', or 'split'")
+    if reduction != "lock":
+        from cut_cross_entropy.cce_lse_forward_split import (
+            cce_lse_forward_split,
+            use_split_reduction,
+        )
+
+    if B > 0 and (
+        reduction == "split"
+        or (reduction == "auto" and use_split_reduction(e, c, B, return_mean_logit))
+    ):
+
+        return LSEReturn(
+            *cce_lse_forward_split(
+                e,
+                c,
+                bias,
+                valids,
+                softcap,
+                targets,
+                shift,
+                return_logit_avg,
+                return_mean_logit,
+            )
+        )
+
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
     mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
@@ -225,7 +260,7 @@ def cce_lse_forward_kernel(
     assert lse.stride(0) == 1
 
     locks = e.new_full(
-        (triton.cdiv(B, 128),),
+        (triton.cdiv(B, CCE_LOCK_BLOCK_B),),
         0,
         dtype=torch.uint32,
     )
@@ -262,8 +297,17 @@ def cce_lse_forward_kernel(
         c.stride(1),  #
         1 if bias is None else bias.stride(0),
         1 if valids is None else valids.stride(0),
-        num_locks=locks.size(0),
+        # Normalize optional features into cost families. Individual constexpr
+        # branches still compile independently, but equivalent modes share one
+        # autotune result instead of fragmenting the timing cache.
+        MODE=(
+            (bias is not None or valids is not None or targets is not None or shift != 0)
+            | ((softcap is not None) << 1)
+            | (return_mean_logit << 2)
+            | (return_logit_avg << 3)
+        ),
         B_BIN=b_bin_fn(B),
+        LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
     )
 
     return LSEReturn(lse, logit_avg, neg_correct_logit, mean_logit)

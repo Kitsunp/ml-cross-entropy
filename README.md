@@ -13,13 +13,20 @@ As language models grow ever larger, so do their vocabularies. This has shifted 
 **Requirements**
 
 1. Python 3.9+
-2. PyTorch 2.4+
-3. Triton 3.0+
+2. PyTorch 2.8+ on Triton-enabled platforms (PyTorch 2.4+ for the macOS fallback)
+3. Triton 3.4+ on supported platforms
 4. Ampere (or newer) GPU
 
 
 **Note:**  For operating systems that are not supported by Triton (e.g., MacOS), we include a highly optimized version of
 linear-cross-entropy using `torch.compile`. This implementation will be set to the default on MacOS.
+
+The current CCE kernel architecture, numerical basis, autotune cache design,
+and validation results are documented in
+[docs/cce-modernization.md](docs/cce-modernization.md).
+The conservative FP32 rationale and the bounded SM12 FP16 path for MiLe,
+μ-loss, and MEAP are described in its
+[mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
 
 ### Basic usage
 

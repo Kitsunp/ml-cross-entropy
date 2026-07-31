@@ -228,7 +228,9 @@ def test_loss_partials(compute_de: bool, compute_dc: bool, compute_dbias: bool):
 
 
 @skip_no_cuda
-def test_loss_all_ignored():
+@pytest.mark.parametrize("forward_reduction", ["auto", "split"])
+def test_loss_all_ignored(monkeypatch, forward_reduction: str):
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", forward_reduction)
     torch.cuda.manual_seed(0)
     dtype = torch.bfloat16
 
@@ -540,3 +542,29 @@ def test_gradient_divergence():
     z_diff_avg = z_diff_sum / loss_diff_count if loss_diff_count > 0 else 0.0
     print(f"CE Diff Avg (abs): {ce_diff_avg:.8f}")
     print(f"Z Diff Avg (abs):  {z_diff_avg:.8f}")
+
+
+@skip_no_cuda
+def test_fp32_atomic_reduction_matches_lock(monkeypatch) -> None:
+    torch.cuda.manual_seed(17)
+    b, v, d = 31, 257, 64
+    base_e = torch.randn((b, d), device="cuda", dtype=torch.bfloat16) / (d**0.5)
+    base_c = torch.randn((v, d), device="cuda", dtype=torch.bfloat16)
+    targets = torch.randint(0, v, (b,), device="cuda")
+
+    outputs = {}
+    for mode in ("lock", "atomic", "auto"):
+        monkeypatch.setenv("CCE_BACKWARD_REDUCTION", mode)
+        e = base_e.detach().clone().requires_grad_()
+        c = base_c.detach().clone().requires_grad_()
+        loss = linear_cross_entropy(e, c, targets, impl="cce_kahan_full_c")
+        loss.backward()
+        assert e.grad is not None and c.grad is not None
+        outputs[mode] = (loss.detach(), e.grad.detach().float(), c.grad.detach().float())
+
+    lock_loss, lock_de, lock_dc = outputs["lock"]
+    for mode in ("atomic", "auto"):
+        loss, de, dc = outputs[mode]
+        torch.testing.assert_close(loss, lock_loss)
+        assert torch.linalg.vector_norm(de - lock_de) / torch.linalg.vector_norm(lock_de) < 1e-3
+        assert torch.linalg.vector_norm(dc - lock_dc) / torch.linalg.vector_norm(lock_dc) < 1e-3

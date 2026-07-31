@@ -42,6 +42,7 @@ class CCEParams:
     vocab_parallel_options: VocabParallelOptions | None
     return_lse: bool
     return_loss_metrics: bool
+    auto_mixed_grad_accum: bool
     mile_gamma: float | None
     mu_loss_lambda: float | None
 
@@ -296,6 +297,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             mu=mu,
             mu_vocab_size=mu_vocab_size,
             mu_loss_lambda=params.mu_loss_lambda,
+            mile_gamma=params.mile_gamma,
             valids=valids,
             softcap=params.softcap,
             filter_eps=params.filter_eps,
@@ -305,6 +307,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             grad_scale=grad_scale,
             accum_e_fp32=params.accum_e_fp32,
             accum_c_fp32=params.accum_c_fp32,
+            auto_mixed_grad_accum=params.auto_mixed_grad_accum,
             filter_e_grad=params.filter_e_grad,
             filter_c_grad=params.filter_c_grad,
             reduce_e_grad=reduce_e_grad,
@@ -348,6 +351,7 @@ def cce_linear_cross_entropy(
     shift: bool | int = 0,
     return_lse: bool = False,
     return_loss_metrics: bool = False,
+    _auto_mixed_grad_accum: bool = False,
     filter_eps: float | str | None = "auto",
     accum_e_fp32: bool = False,
     accum_c_fp32: bool = False,
@@ -409,6 +413,7 @@ def cce_linear_cross_entropy(
         vocab_parallel_options=vocab_parallel_options,
         return_lse=return_lse,
         return_loss_metrics=return_loss_metrics,
+        auto_mixed_grad_accum=_auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
     )

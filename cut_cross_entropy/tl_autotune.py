@@ -13,12 +13,14 @@ from triton.testing import (
     get_dram_gbps,
     get_max_simd_tflops,
     get_max_tensorcore_tflops,
-    nvsmi,
 )
 
-from cut_cross_entropy.tl_utils import is_triton_greater_or_equal_3_2_0
-
 _AUTOTUNE: bool = os.getenv("CCE_AUTOTUNE", "0") != "0"
+
+# Smallest B/V tiles in the autotune search space. Locks use this granularity
+# so different candidate tiles never serialize on an unrelated lock.
+CCE_LOCK_BLOCK_B = 16
+CCE_LOCK_BLOCK_V = 32
 
 
 @dataclass
@@ -84,16 +86,8 @@ class NoneSupportRestorer:
 @functools.wraps(triton.autotune)
 def _cce_autotune(*args, **kwargs) -> Callable[..., autotuner.Autotuner]:
     def decorator(fn):
-        reset_idx_or_name = []
-        restore_idx_or_name = []
-        arg_names = fn.arg_names
         reset_idx_or_name = kwargs.pop("reset_to_zero", [])
-        if not is_triton_greater_or_equal_3_2_0():
-            reset_idx_or_name = [arg_names.index(k) for k in restore_idx_or_name]
-
         restore_idx_or_name = kwargs.pop("restore_value", [])
-        if not is_triton_greater_or_equal_3_2_0():
-            restore_idx_or_name = [arg_names.index(k) for k in restore_idx_or_name]
 
         restorer = NoneSupportRestorer(reset_idx_or_name, restore_idx_or_name)
         if len(reset_idx_or_name) > 0:
@@ -108,15 +102,11 @@ def _cce_autotune(*args, **kwargs) -> Callable[..., autotuner.Autotuner]:
 
 
 @functools.lru_cache()
-def get_clock_rate_in_khz():
-    try:
-        return nvsmi(["clocks.max.sm"])[0] * 1e3
-    except FileNotFoundError:
-        import pynvml
-
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        return pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM) * 1e3
+def get_clock_rate_in_khz(device: int) -> int:
+    # Triton's driver properties already refer to the active logical CUDA
+    # device, including CUDA_VISIBLE_DEVICES remapping. Avoid nvidia-smi/NVML
+    # physical index 0 and keep the cache isolated per device.
+    return driver.active.utils.get_device_properties(device)["sm_clock_rate"]
 
 
 def get_tensorcore_tflops(device, num_ctas, num_warps, dtype):
@@ -128,7 +118,7 @@ def get_tensorcore_tflops(device, num_ctas, num_warps, dtype):
     tflops = (
         min(num_subcores, total_warps)
         / num_subcores
-        * get_max_tensorcore_tflops(dtype, get_clock_rate_in_khz(), device)
+        * get_max_tensorcore_tflops(dtype, get_clock_rate_in_khz(device), device)
     )
     return tflops
 
@@ -142,7 +132,7 @@ def get_simd_tflops(device, num_ctas, num_warps, dtype):
     tflops = (
         min(num_subcores, total_warps)
         / num_subcores
-        * get_max_simd_tflops(dtype, get_clock_rate_in_khz(), device)
+        * get_max_simd_tflops(dtype, get_clock_rate_in_khz(device), device)
     )
     return tflops
 
@@ -214,7 +204,8 @@ def early_config_prune(
     for k, v in configs_map.items():
         BLOCK_B, BLOCK_V, BLOCK_D, num_warps = k
         if capability[0] >= 8:
-            # compute cycles (only works for ampere GPUs)
+            # Approximate the recent NVIDIA tensor-core pipeline. Final
+            # selection is still measured; this only prunes stage duplicates.
             mmas = BLOCK_B * BLOCK_V * BLOCK_D / (16 * 8 * 16)
             mma_cycles = mmas / min(4, num_warps) * 8
 
@@ -285,8 +276,11 @@ def estimate_matmul_time(
     # time to load data
     num_sm = driver.active.utils.get_device_properties(device)["multiprocessor_count"]
     active_cta_ratio = min(1, num_ctas / num_sm)
-    active_cta_ratio_bw1 = min(1, num_ctas / 32)  # 32 active ctas are enough to saturate
-    active_cta_ratio_bw2 = max(min(1, (num_ctas - 32) / (108 - 32)), 0)  # 32-108, remaining 5%
+    bw_saturation_ctas = max(1, num_sm // 3)
+    active_cta_ratio_bw1 = min(1, num_ctas / bw_saturation_ctas)
+    active_cta_ratio_bw2 = max(
+        min(1, (num_ctas - bw_saturation_ctas) / max(1, num_sm - bw_saturation_ctas)), 0
+    )
     dram_bw = get_dram_gbps(device) * (
         active_cta_ratio_bw1 * 0.95 + active_cta_ratio_bw2 * 0.05
     )  # in GB/s
@@ -318,30 +312,14 @@ def estimate_matmul_time(
     return total_time_ms
 
 
-def get_configs_io_bound():
-    configs = []
-    for num_stages in [2, 3, 4, 5, 6]:
-        for block_m in [16, 32]:
-            for block_k in [32, 64]:
-                for block_n in [32, 64, 128, 256]:
-                    num_warps = 2 if block_n <= 64 else 4
-                    configs.append(
-                        Config(
-                            {
-                                "BLOCK_B": block_m,
-                                "BLOCK_V": block_n,
-                                "BLOCK_D": block_k,
-                            },
-                            num_stages=num_stages,
-                            num_warps=num_warps,
-                        )
-                    )
-    return configs
+def get_autotune_config() -> list[Config]:
+    """Curated tensor-core tile families for Triton 3.4+ GPUs.
 
-
-def get_autotune_config():
+    The previous Cartesian product contained 103 candidates, including many
+    redundant I/O-bound variants. The performance model only promoted a small
+    subset, so keep those shape families and vary scheduling where it matters.
+    """
     return [
-        # basic configs for compute-bound matmuls
         Config(
             {"BLOCK_B": 128, "BLOCK_V": 128, "BLOCK_D": 128},
             num_stages=2,
@@ -369,7 +347,7 @@ def get_autotune_config():
         ),
         Config(
             {"BLOCK_B": 128, "BLOCK_V": 128, "BLOCK_D": 32},
-            num_stages=4,
+            num_stages=3,
             num_warps=4,
         ),
         Config(
@@ -384,12 +362,12 @@ def get_autotune_config():
         ),
         Config(
             {"BLOCK_B": 128, "BLOCK_V": 64, "BLOCK_D": 32},
-            num_stages=4,
+            num_stages=3,
             num_warps=4,
         ),
         Config(
             {"BLOCK_B": 64, "BLOCK_V": 128, "BLOCK_D": 32},
-            num_stages=4,
+            num_stages=3,
             num_warps=4,
         ),
         Config(
@@ -397,60 +375,20 @@ def get_autotune_config():
             num_stages=4,
             num_warps=4,
         ),
-        Config({"BLOCK_B": 64, "BLOCK_V": 32, "BLOCK_D": 32}, num_stages=5, num_warps=2),
-        # good for int8
-        Config(
-            {"BLOCK_B": 128, "BLOCK_V": 256, "BLOCK_D": 128},
-            num_stages=3,
-            num_warps=8,
-        ),
-        Config(
-            {"BLOCK_B": 128, "BLOCK_V": 256, "BLOCK_D": 128},
-            num_stages=3,
-            num_warps=16,
-        ),
-        Config(
-            {"BLOCK_B": 256, "BLOCK_V": 128, "BLOCK_D": 128},
-            num_stages=3,
-            num_warps=8,
-        ),
-        Config(
-            {"BLOCK_B": 256, "BLOCK_V": 128, "BLOCK_D": 128},
-            num_stages=3,
-            num_warps=16,
-        ),
-        Config(
-            {"BLOCK_B": 256, "BLOCK_V": 64, "BLOCK_D": 128},
-            num_stages=4,
-            num_warps=4,
-        ),
-        Config(
-            {"BLOCK_B": 64, "BLOCK_V": 256, "BLOCK_D": 128},
-            num_stages=4,
-            num_warps=4,
-        ),
-        Config(
-            {"BLOCK_B": 128, "BLOCK_V": 128, "BLOCK_D": 128},
-            num_stages=4,
-            num_warps=4,
-        ),
         Config(
             {"BLOCK_B": 128, "BLOCK_V": 64, "BLOCK_D": 64},
-            num_stages=4,
+            num_stages=3,
             num_warps=4,
         ),
         Config(
             {"BLOCK_B": 64, "BLOCK_V": 128, "BLOCK_D": 64},
-            num_stages=4,
+            num_stages=3,
             num_warps=4,
         ),
-        Config(
-            {"BLOCK_B": 128, "BLOCK_V": 32, "BLOCK_D": 64},
-            num_stages=4,
-            num_warps=4,
-        ),
-        Config({"BLOCK_B": 64, "BLOCK_V": 32, "BLOCK_D": 64}, num_stages=5, num_warps=2),
-    ] + get_configs_io_bound()
+        Config({"BLOCK_B": 64, "BLOCK_V": 32, "BLOCK_D": 32}, num_stages=3, num_warps=2),
+        Config({"BLOCK_B": 32, "BLOCK_V": 128, "BLOCK_D": 32}, num_stages=3, num_warps=4),
+        Config({"BLOCK_B": 16, "BLOCK_V": 128, "BLOCK_D": 32}, num_stages=3, num_warps=4),
+    ]
 
 
 def _heuristics_from_config(
@@ -482,30 +420,62 @@ def _heuristics_from_config(
 
 
 ## NOTE
-# Both the forward and backward kernels use the config. This ensures that
-# both forward and backward use the same tensor core instructions to compute the logits.
-# These differing can cause the logits to differ between forward and backward, which
-# really hurts the gradient.
+# Forward and backward keep the same tile dimensions and dot precision so they
+# reconstruct logits consistently. Scheduling (warps/stages) may differ.
 def _cce_best_config() -> Config:
-    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=4)
+    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
 
 
 def _cce_best_config_fp32() -> Config:
     return Config(dict(BLOCK_B=32, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
 
 
+def _cce_backward_best_config() -> Config:
+    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=8, num_stages=3)
+
+
+def _cce_backward_best_config_fp32() -> Config:
+    # The backward epilogue needs more shared memory than forward. Three
+    # stages exceeds the 99 KiB limit on some consumer GPUs by ~1 KiB.
+    return Config(dict(BLOCK_B=32, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=2)
+
+
+def _cce_backward_heuristic_config() -> Config:
+    """Choose a BF16-safe tile when the device has a 99 KiB SMEM budget.
+
+    The BF16/FP16 fast tile is valid on larger parts, but Triton reports
+    106,496 bytes for its backward epilogue.  Ada/Blackwell consumer parts
+    expose 101,376 bytes, so selecting that tile unconditionally fails exactly
+    when the mixed-accumulation path is first exercised.  The smaller config
+    is also valid for BF16/FP16; it only changes scheduling, not arithmetic.
+    """
+    config = _cce_backward_best_config()
+    if not torch.cuda.is_available():
+        return config
+    try:
+        properties = driver.active.utils.get_device_properties(torch.cuda.current_device())
+        if properties["max_shared_mem"] < 106496:
+            return _cce_backward_best_config_fp32()
+    except (KeyError, RuntimeError):
+        # Keep import/fallback behavior unchanged if a CUDA driver is not
+        # initialized yet; Triton will select the normal config at launch.
+        pass
+    return config
+
+
 def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
     if _AUTOTUNE:
         return _cce_autotune(
             configs=get_autotune_config(),
-            key=["V", "D", "B_BIN"],
+            key=["V", "D", "B_BIN", "MODE"],
             prune_configs_by={
                 "early_config_prune": early_config_prune,
                 "perf_model": estimate_matmul_time,
-                "top_k": 10,
+                "top_k": 6,
             },
             restore_value=["LSE", "MeanLogit"],
             reset_to_zero=["LA"],
+            cache_results=True,
         )
     else:
         return _heuristics_from_config(_cce_best_config(), _cce_best_config_fp32(), "E")
@@ -523,7 +493,7 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
     if _AUTOTUNE:
         return _cce_autotune(
             configs=get_autotune_config(),
-            key=["V", "D", "B_BIN"],
+            key=["V", "D", "B_BIN", "MODE"],
             prune_configs_by={
                 "early_config_prune": functools.partial(
                     early_config_prune, shared_memory_factor=2.0
@@ -533,12 +503,15 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
                     total_ops_fn=_bw_total_ops_fn,
                     total_store_fn=_bw_total_store_fn,
                 ),
-                "top_k": 5,
+                "top_k": 4,
             },
-            reset_to_zero=["dE", "dC", "dEC", "dCC", "dBias"],
+            reset_to_zero=["dE", "dC", "dBias"],
+            cache_results=True,
         )
     else:
-        return _heuristics_from_config(_cce_best_config(), _cce_best_config_fp32(), "E")
+        return _heuristics_from_config(
+            _cce_backward_heuristic_config(), _cce_backward_best_config_fp32(), "E"
+        )
 
 
 def _indexed_dot_best_config() -> Config:
