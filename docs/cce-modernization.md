@@ -94,7 +94,7 @@ For MiLe's softmax-weighted logit moment, the corresponding stable merge is
 $$
 m_{\mathrm{new}}
 = e^{\ell_{\mathrm{old}}-\ell_{\mathrm{new}}}m_{\mathrm{old}}
-+ e^{\ell_{\mathrm{tile}}-\ell_{\mathrm{new}}}m_{\mathrm{tile}}.
+{}+ e^{\ell_{\mathrm{tile}}-\ell_{\mathrm{new}}}m_{\mathrm{tile}}.
 $$
 
 This path has minimal temporary memory and remains useful for MiLe, FP32, and
