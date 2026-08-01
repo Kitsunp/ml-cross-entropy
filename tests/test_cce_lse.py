@@ -137,13 +137,16 @@ def test_split_reduction_matches_lock_with_all_optional_outputs(monkeypatch) -> 
 
 
 @skip_no_cuda
-def test_auto_split_selector_is_memory_bounded() -> None:
+def test_auto_split_selector_is_memory_bounded(monkeypatch) -> None:
     from cut_cross_entropy.cce_lse_forward_split import (
         select_split_v_config,
         split_v_workspace_bytes,
         use_split_reduction,
     )
 
+    # Exercise the policy itself rather than depending on the test machine's
+    # capability. Automatic Split-V is intentionally restricted to CC12.x.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     c = torch.empty((2048, 32), device="cuda", dtype=torch.bfloat16)
     small_e = torch.empty((512, 32), device="cuda", dtype=torch.bfloat16)
     large_e = torch.empty((513, 32), device="cuda", dtype=torch.bfloat16)
@@ -174,4 +177,25 @@ def test_auto_split_selector_is_memory_bounded() -> None:
         (128, 128, 32),
         (128, 64, 32),
     }
+
+
+@skip_no_cuda
+def test_explicit_split_sentinel_falls_back_to_lock(monkeypatch) -> None:
+    import importlib
+
+    split_module = importlib.import_module("cut_cross_entropy.cce_lse_forward_split")
+    split_module.clear_split_v_config_cache()
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", "split")
+    monkeypatch.delenv("CCE_SPLIT_V_ALLOW_UNVALIDATED", raising=False)
+    monkeypatch.setattr(split_module, "_split_v_profile", lambda *_args, **_kwargs: None)
+
+    def fail_if_launched(*_args, **_kwargs):
+        pytest.fail("unsupported split-V sentinel must fall back to the lock path")
+
+    monkeypatch.setattr(split_module, "cce_lse_forward_split", fail_if_launched)
+    e = torch.randn((3, 16), device="cuda", dtype=torch.bfloat16)
+    c = torch.randn((7, 16), device="cuda", dtype=torch.bfloat16)
+
+    result = cce_lse_forward_kernel(e, c)
+    assert result.lse.shape == (3,)
 

@@ -266,7 +266,11 @@ def cce_lse_forward_kernel(
         )
 
     if B > 0 and (
-        reduction == "split"
+        (
+            reduction == "split"
+            and split_config is not None
+            and split_config.splits > 1
+        )
         or (
             reduction == "auto"
             and split_v_enabled

@@ -580,8 +580,8 @@ def select_split_v_config(
         _cache_split_v_config(key, selected)
         return selected
 
-    # A S=1 config is a safe sentinel. The caller uses it to select lock or,
-    # for an explicit split request, to run a correct but non-parallel split.
+    # A S=1 config is a safe sentinel. The CCE wrapper treats it as a lock
+    # fallback, so unsupported devices never launch a one-way staged reduction.
     block_b, block_v, block_d, warps, stages = _split_v_tile_candidates(e)[0]
     selected = SplitVConfig(
         block_b,
@@ -674,8 +674,8 @@ def cce_lse_forward_split(
     reduce_block_b = config.reduce_block_b
     reduce_num_warps = config.reduce_num_warps
 
-    if splits < 1:
-        raise ValueError("split-V requires at least one split")
+    if splits <= 1:
+        raise ValueError("split-V requires at least two vocabulary splits")
 
     # These tensors are linearized in the reduction kernels.  Failing loudly
     # here is safer than silently treating a future non-contiguous view as a
