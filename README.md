@@ -49,7 +49,9 @@ weighted-logit moment and with `B <= 512`. Use
 `CCE_FORWARD_REDUCTION=lock` to force the baseline or
 `CCE_FORWARD_REDUCTION=split` for an explicit benchmark/debug run. The latter
 can use the conservative CC10.x compatibility profile only with
-`CCE_SPLIT_V_ALLOW_UNVALIDATED=1`; B100/B200 execution remains unvalidated.
+`CCE_SPLIT_V_ALLOW_UNVALIDATED=1`; B100/B200 execution remains unvalidated. If the
+selector cannot produce at least two splits, the explicit request falls back to
+the lock path rather than launching a one-way staged reduction.
 
 The flow is shown in
 [the Split-V kernel diagram](assets/split_v_kernel.svg), and the full policy,
