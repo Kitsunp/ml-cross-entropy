@@ -74,6 +74,7 @@ def _operator_args(
     filter_e_grad=False,
     filter_c_grad=False,
     compute_dtype_is_bf16=None,
+    forward_used_autocast=False,
 ):
     if compute_dtype_is_bf16 is None:
         compute_dtype_is_bf16 = e.dtype == torch.bfloat16
@@ -100,6 +101,7 @@ def _operator_args(
         False,
         1e-4,
         compute_dtype_is_bf16,
+        forward_used_autocast,
     )
 
 
@@ -109,7 +111,8 @@ def _backward_operator_args(forward_args):
         torch.ones_like(outputs[0]),
         *forward_args[:4],
         *outputs[2:9],
-        *forward_args[4:-1],
+        forward_args[-1],
+        *forward_args[4:-2],
     )
 
 
@@ -182,6 +185,110 @@ def test_compiler_boundary_does_not_specialize_on_valid_label_count():
             targets[:, first_padding_position:] = -100
             compiled(e, c, targets).backward()
     torch.cuda.synchronize()
+    assert compile_count == 1
+
+
+@pytest.mark.parametrize(
+    ("mile_enabled", "mu_loss_enabled"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_compiler_boundary_fp32_autocast_matches_eager(
+    mile_enabled: bool,
+    mu_loss_enabled: bool,
+):
+    base_e, base_c, targets = _inputs()
+    base_e = base_e.float()
+    base_c = base_c.float()
+    eager_e = base_e.clone().requires_grad_(True)
+    eager_c = base_c.clone().requires_grad_(True)
+    compiled_e = base_e.clone().requires_grad_(True)
+    compiled_c = base_c.clone().requires_grad_(True)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        eager_loss, eager_metrics = _call(
+            eager_e, eager_c, targets, mile_enabled, mu_loss_enabled
+        )
+    eager_loss.backward()
+
+    def tail(e, c, labels):
+        loss, metrics = _call(e, c, labels, mile_enabled, mu_loss_enabled)
+        return loss + e.sum() * 0.0, metrics
+
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+        compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            compiled_loss, compiled_metrics = compiled(
+                compiled_e, compiled_c, targets
+            )
+        compiled_loss.backward()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=2e-4, atol=2e-4)
+    for name in eager_metrics:
+        torch.testing.assert_close(
+            compiled_metrics[name], eager_metrics[name], rtol=2e-4, atol=2e-4
+        )
+    for compiled_grad, eager_grad in (
+        (compiled_e.grad, eager_e.grad),
+        (compiled_c.grad, eager_c.grad),
+    ):
+        assert compiled_grad.dtype == torch.float32
+        assert torch.isfinite(compiled_grad).all()
+        relative_l2 = (
+            compiled_grad.float() - eager_grad.float()
+        ).norm() / eager_grad.float().norm()
+        assert relative_l2 < 3e-3
+
+
+@pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16])
+def test_compiler_boundary_fp32_autocast_does_not_specialize_on_valid_count(
+    autocast_dtype,
+):
+    """Reproduce FP32 RMSNorm outputs with changing padding under autocast.
+
+    Before the regression fix, the public dtype guard rejected these otherwise
+    supported inputs. Dynamo then traced CCE's data-dependent compaction and
+    specialized the Triton path for every valid-token count, reaching its
+    default recompile limit on the ninth distinct batch.
+    """
+    base_e, base_c, base_targets = _inputs()
+    base_e = base_e.float()
+    base_c = base_c.float()
+    compile_count = 0
+    saw_cce_boundary = False
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal compile_count, saw_cce_boundary
+        compile_count += 1
+        saw_cce_boundary |= any(
+            node.op == "call_function" and "cce_forward" in str(node.target)
+            for node in graph_module.graph.nodes
+        )
+        return graph_module.forward
+
+    def tail(e, c, labels):
+        loss, metrics = _call(e, c, labels, True, True)
+        return loss + metrics["mu_loss"] * 0.0 + e.sum() * 0.0
+
+    # Ten distinct counts cross the same default eight-recompile threshold that
+    # the server reached when its ninth valid-token count entered CCE.
+    first_padding_positions = (2, 3, 6, 9, 12, 15, 18, 21, 24, 31)
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+        compiled = torch.compile(tail, backend=counting_backend, fullgraph=True)
+        with torch.autocast("cuda", dtype=autocast_dtype):
+            for first_padding_position in first_padding_positions:
+                e = base_e.clone().requires_grad_(True)
+                c = base_c.clone().requires_grad_(True)
+                targets = base_targets.clone()
+                targets[:, first_padding_position:] = -100
+                loss = compiled(e, c, targets)
+                loss.backward()
+                assert torch.isfinite(loss)
+                assert e.grad.dtype == torch.float32
+                assert c.grad.dtype == torch.float32
+    torch.cuda.synchronize()
+
+    assert saw_cce_boundary
     assert compile_count == 1
 
 
@@ -284,6 +391,7 @@ def test_compiler_boundary_auto_eps_uses_autocast_dtype(input_dtype, autocast_dt
                 compiled_c,
                 targets,
                 compute_dtype_is_bf16=autocast_dtype == torch.bfloat16,
+                forward_used_autocast=True,
             ),
             test_utils=("test_schema", "test_faketensor"),
         )
