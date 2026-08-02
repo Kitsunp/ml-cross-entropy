@@ -101,7 +101,10 @@ meap_mask_inputs(
 - `seed` accepts either the original Python integer or a scalar int32/int64
   tensor on the same CUDA device as `input_ids`. Prefer the device scalar for a
   seed that changes each training step: it prevents `torch.compile` from
-  specializing the model graph on every Python integer value.
+  specializing the model graph on every Python integer value. The Triton path
+  folds both halves of an int64 device seed into its 32-bit Philox seed; packed
+  step, microstep, and rank fields therefore contribute even when they occupy
+  bits above bit 31. Device seeds already in the uint32 range remain unchanged.
 - `exclude_last=True` removes the last eligible input from sampling. This is
   appropriate when CCE uses `shift=1`, because that hidden state has no valid
   next-token target.

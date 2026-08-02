@@ -261,6 +261,8 @@ sorting, and top-k selection.
 For compiled training, pass a scalar int32/int64 CUDA tensor as `seed` when its
 value changes each step. This keeps the seed dynamic and avoids one Dynamo graph
 specialization per Python integer value; Python integer seeds remain supported.
+For int64 device seeds, the kernel folds the high and low halves into the
+32-bit Philox seed so packed step, microstep, and rank bits are not discarded.
 With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.

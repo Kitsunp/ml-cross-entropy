@@ -14,6 +14,17 @@ def _expected_count(eligible_count: torch.Tensor, ratio: float) -> torch.Tensor:
     return count
 
 
+def _fold_seed_to_uint32(seed: int) -> int:
+    low = seed & 0xFFFFFFFF
+    high = (seed >> 32) & 0xFFFFFFFF
+    high ^= high >> 16
+    high = (high * 0x7FEB352D) & 0xFFFFFFFF
+    high ^= high >> 15
+    high = (high * 0x846CA68B) & 0xFFFFFFFF
+    high ^= high >> 16
+    return low ^ high
+
+
 @pytest.mark.parametrize("implementation", ["torch"])
 def test_meap_fixed_count_padding_and_last_token(implementation: str) -> None:
     input_ids = torch.arange(24).view(3, 8)
@@ -196,6 +207,30 @@ def test_meap_device_scalar_seed_matches_python_integer(seed: int) -> None:
     )
     assert torch.equal(from_integer[0], from_tensor[0])
     assert torch.equal(from_integer[1], from_tensor[1])
+
+
+@skip_no_cuda
+def test_meap_device_scalar_seed_folds_high_bits() -> None:
+    input_ids = torch.arange(64 * 64, device="cuda").view(64, 64)
+    low_seed = 81
+    packed_seed = low_seed + (1 << 32)
+    folded_seed = _fold_seed_to_uint32(packed_seed)
+    assert folded_seed != low_seed
+
+    _, from_low = meap_mask_inputs(
+        input_ids, 999_999, seed=low_seed, return_mask=True
+    )
+    _, from_packed = meap_mask_inputs(
+        input_ids,
+        999_999,
+        seed=torch.tensor(packed_seed, device="cuda", dtype=torch.int64),
+        return_mask=True,
+    )
+    _, from_folded = meap_mask_inputs(
+        input_ids, 999_999, seed=folded_seed, return_mask=True
+    )
+    assert not torch.equal(from_packed, from_low)
+    assert torch.equal(from_packed, from_folded)
 
 
 @skip_no_cuda
