@@ -151,7 +151,8 @@ def _cce_backward_op(
         _unpack_optional(
             logit_avg,
             filter_eps is not None
-            and ((filter_e_grad and e_requires_grad) or (filter_c_grad and c_requires_grad)),
+            and (e_requires_grad or c_requires_grad or bias_requires_grad)
+            and (filter_e_grad or filter_c_grad),
         ),
         _unpack_optional(mile_weight, mile_enabled),
         _unpack_optional(mu, mu_loss_enabled),
@@ -231,7 +232,9 @@ def _cce_backward_fake(
         mu_loss_enabled,
         mu_loss_lambda,
     )
-    de = torch.empty_like(e) if e_requires_grad else _empty(e)
+    # The real path makes e contiguous before the kernel and reshapes that
+    # contiguous gradient back to the original shape.
+    de = e.new_empty(e.shape) if e_requires_grad else _empty(e)
     dc = torch.empty_like(c) if c_requires_grad else _empty(c)
     dbias = (
         torch.empty_like(bias)
@@ -269,6 +272,7 @@ def _cce_forward_op(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    compute_dtype_is_bf16: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -332,7 +336,10 @@ def _cce_forward_op(
         _pack_optional(mile_weight, loss),
         _pack_optional(mu, loss),
         _pack_optional(mu_vocab_size, loss),
-        saved_e.new_empty(()),
+        saved_e.new_empty(
+            (),
+            dtype=torch.bfloat16 if compute_dtype_is_bf16 else torch.float16,
+        ),
     )
 
 
@@ -359,6 +366,7 @@ def _cce_forward_fake(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    compute_dtype_is_bf16: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -372,8 +380,6 @@ def _cce_forward_fake(
 ]:
     del (
         targets,
-        bias,
-        bias_requires_grad,
         ignore_index,
         softcap,
         shift,
@@ -387,8 +393,15 @@ def _cce_forward_fake(
     lse = e.new_empty((valid_count,), dtype=torch.float32)
     # torch.nonzero, used by _build_flat_valids, returns int64 indices.
     valids = e.new_empty((valid_count,), dtype=torch.int64)
-    needs_logit_avg = filter_eps is not None and (
-        (filter_e_grad and e_requires_grad) or (filter_c_grad and c_requires_grad)
+    needs_grad = (
+        e_requires_grad
+        or c_requires_grad
+        or (bias is not None and bias_requires_grad)
+    )
+    needs_logit_avg = (
+        needs_grad
+        and filter_eps is not None
+        and (filter_e_grad or filter_c_grad)
     )
     # Each absent optional gets its own placeholder. Returning the same empty
     # tensor object more than once would declare output aliasing in FakeTensor,
@@ -427,7 +440,10 @@ def _cce_forward_fake(
         mile_weight,
         mu,
         mu_vocab_size,
-        e.new_empty(()),
+        e.new_empty(
+            (),
+            dtype=torch.bfloat16 if compute_dtype_is_bf16 else torch.float16,
+        ),
     )
 
 
@@ -454,6 +470,7 @@ def _setup_context(ctx, inputs, output) -> None:
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        _compute_dtype_is_bf16,
     ) = inputs
     (
         _loss,
@@ -558,6 +575,7 @@ def _backward(ctx, *grads):
         None,
         None,
         None,
+        None,
     )
 
 
@@ -583,6 +601,7 @@ def compiler_cce_linear_cross_entropy(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    compute_dtype_is_bf16: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the supported training subset as one compiler-visible custom op."""
     outputs = _cce_forward_op(
@@ -607,5 +626,6 @@ def compiler_cce_linear_cross_entropy(
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        compute_dtype_is_bf16,
     )
     return outputs[0], outputs[1] if return_loss_metrics else None

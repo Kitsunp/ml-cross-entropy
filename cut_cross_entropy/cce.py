@@ -47,6 +47,43 @@ class CCEParams:
     mu_loss_lambda: float | None
 
 
+@torch.compiler.assume_constant_result
+def _cuda_is_bf16_supported() -> bool:
+    """Evaluate the process/device capability without emitting an FX node."""
+    return torch.cuda.is_bf16_supported()
+
+
+def _validate_cce_inputs(
+    e: torch.Tensor,
+    c: torch.Tensor,
+    targets: torch.Tensor,
+    reduction: str,
+    return_loss_metrics: bool,
+    mile_enabled: bool,
+    mile_gamma: float,
+    mu_loss_enabled: bool,
+    mu_loss_lambda: float,
+) -> None:
+    """Keep eager and compiler-boundary input validation identical."""
+    assert e.size()[0:-1] == targets.size()
+    assert e.size(-1) == c.size(1)
+    if mile_enabled and (not math.isfinite(mile_gamma) or mile_gamma < 0):
+        raise ValueError(f"mile_gamma must be finite and non-negative, got {mile_gamma}.")
+    if mu_loss_enabled and (not math.isfinite(mu_loss_lambda) or mu_loss_lambda < 0):
+        raise ValueError(
+            f"mu_loss_lambda must be finite and non-negative, got {mu_loss_lambda}."
+        )
+    if mu_loss_enabled and reduction != "mean":
+        raise ValueError("mu_loss_enabled requires reduction='mean'.")
+    if return_loss_metrics and reduction != "mean":
+        raise ValueError("return_loss_metrics requires reduction='mean'.")
+    if not _cuda_is_bf16_supported():
+        raise RuntimeError(
+            "Cut Cross Entropy requires an ampere GPU or newer. "
+            "Consider using torch_compile_linear_cross_entropy for scenarios where one is not available."
+        )
+
+
 @torch.compile(fullgraph=True)
 def sort_logit_avg(logit_avg: torch.Tensor) -> torch.Tensor:
     return torch.argsort(logit_avg).to(torch.int32)
@@ -363,23 +400,17 @@ def cce_linear_cross_entropy(
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    assert e.size()[0:-1] == targets.size()
-    assert e.size(-1) == c.size(1)
-    if mile_enabled and (not math.isfinite(mile_gamma) or mile_gamma < 0):
-        raise ValueError(f"mile_gamma must be finite and non-negative, got {mile_gamma}.")
-    if mu_loss_enabled and (not math.isfinite(mu_loss_lambda) or mu_loss_lambda < 0):
-        raise ValueError(
-            f"mu_loss_lambda must be finite and non-negative, got {mu_loss_lambda}."
-        )
-    if mu_loss_enabled and reduction != "mean":
-        raise ValueError("mu_loss_enabled requires reduction='mean'.")
-    if return_loss_metrics and reduction != "mean":
-        raise ValueError("return_loss_metrics requires reduction='mean'.")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError(
-            "Cut Cross Entropy requires an ampere GPU or newer. "
-            "Consider using torch_compile_linear_cross_entropy for scenarios where one is not available."
-        )
+    _validate_cce_inputs(
+        e,
+        c,
+        targets,
+        reduction,
+        return_loss_metrics,
+        mile_enabled,
+        mile_gamma,
+        mu_loss_enabled,
+        mu_loss_lambda,
+    )
 
     batch_shape = targets.size()
 

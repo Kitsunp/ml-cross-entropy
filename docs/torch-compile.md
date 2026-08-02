@@ -26,6 +26,14 @@ and gradient filters are therefore not duplicated.
 The optimized boundary currently covers BF16/FP16 CUDA inputs with `mean`
 reduction, positive label shift, no returned LSE, and no vocabulary-parallel
 group. Other public configurations retain the existing eager/traced fallback.
+The public CCE shape, objective-parameter, reduction, and device-capability
+validations run before compiler dispatch. When CUDA autocast is active,
+`filter_eps="auto"` is resolved from the autocast compute dtype rather than the
+input storage dtype, matching eager CCE. The same dtype is passed explicitly to
+the fake witness used by AOTAutograd, so the compiled backward and runtime
+backward agree when FP16 inputs run under BF16 autocast or vice versa. If the
+resolved epsilon is `None`, both gradient-filter flags are disabled before
+dispatch, as they are in eager CCE.
 Callers that continue tensor work after CCE must enable
 `torch._dynamo.config.capture_dynamic_output_shape_ops = True`, because the
 number of saved valid-label rows is data dependent. The NeoLLM integration sets
@@ -53,6 +61,10 @@ graph. Losses, metrics, and gradients were compared against eager execution for
 all four combinations. `torch.library.opcheck` also passes schema, autograd
 registration, FakeTensor metadata, and dynamic AOT-dispatch validation. This
 caught and prevented aliasing between absent optional-output placeholders.
+Focused metadata cases also cover non-contiguous embeddings and partial
+gradient ownership: fake embedding gradients advertise the contiguous layout
+returned at runtime, and `logit_avg` is vocabulary-sized whenever any input or
+bias needs gradients and either gradient-filter flag is enabled.
 
 At the training-loss shape `B=64`, `S=512`, `D=512`, `V=64,402` with 27,310
 valid labels, paired alternating steady-state measurements produced:

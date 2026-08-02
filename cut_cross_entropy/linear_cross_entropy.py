@@ -36,7 +36,7 @@ TORCH_GREATER_OR_EQUAL_2_5 = is_torch_greater_or_equal_2_5()
 PLATFORM_SYSTEM = platform.system()
 
 if TYPE_CHECKING or PLATFORM_SYSTEM != "Darwin":
-    from cut_cross_entropy.cce import cce_linear_cross_entropy
+    from cut_cross_entropy.cce import _validate_cce_inputs, cce_linear_cross_entropy
     from cut_cross_entropy.cce_compile import compiler_cce_linear_cross_entropy
 
     LCE_IMPL_DEFAULT = LinearCrossEntropyImpl.CCE
@@ -276,6 +276,29 @@ def linear_cross_entropy(
         )
         if use_compiler_boundary:
             assert compiler_cce_linear_cross_entropy is not None
+            _validate_cce_inputs(
+                e,
+                c,
+                targets,
+                reduction,
+                return_loss_metrics,
+                mile_enabled,
+                mile_gamma,
+                mu_loss_enabled,
+                mu_loss_lambda,
+            )
+            compute_dtype = (
+                torch.get_autocast_dtype("cuda")
+                if torch.is_autocast_enabled()
+                else e.dtype
+            )
+            resolved_filter_eps = _handle_eps(cce_opts["filter_eps"], compute_dtype)
+            filter_e_grad = (
+                cce_opts["filter_e_grad"] and resolved_filter_eps is not None
+            )
+            filter_c_grad = (
+                cce_opts["filter_c_grad"] and resolved_filter_eps is not None
+            )
             loss, loss_metrics = compiler_cce_linear_cross_entropy(
                 e,
                 c,
@@ -285,16 +308,17 @@ def linear_cross_entropy(
                 softcap,
                 int(shift),
                 return_loss_metrics,
-                _handle_eps(cce_opts["filter_eps"], e.dtype),
+                resolved_filter_eps,
                 cce_opts["accum_e_fp32"],
                 cce_opts["accum_c_fp32"],
-                cce_opts["filter_e_grad"],
-                cce_opts["filter_c_grad"],
+                filter_e_grad,
+                filter_c_grad,
                 impl == "cce_kahan_full_c",
                 mile_enabled,
                 mile_gamma,
                 mu_loss_enabled,
                 mu_loss_lambda,
+                compute_dtype == torch.bfloat16,
             )
             lse = None
         else:
