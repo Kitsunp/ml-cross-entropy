@@ -19,6 +19,7 @@ from cut_cross_entropy.doc import (
 from cut_cross_entropy.torch_compile import torch_compile_linear_cross_entropy
 from cut_cross_entropy.utils import (
     CCEWarning,
+    _handle_eps,
     is_torch_greater_or_equal_2_5,
     maybe_type_as,
     to_full_tensor,
@@ -27,17 +28,24 @@ from cut_cross_entropy.vocab_parallel import VocabParallelOptions
 
 warnings.filterwarnings("once", category=CCEWarning, module="cut_cross_entropy")
 
+# Resolve package metadata once at import.  Calling importlib.metadata from a
+# compiled training step forces a graph break even though the result is process
+# invariant.
+TORCH_GREATER_OR_EQUAL_2_5 = is_torch_greater_or_equal_2_5()
+
 PLATFORM_SYSTEM = platform.system()
 
 if TYPE_CHECKING or PLATFORM_SYSTEM != "Darwin":
-    from cut_cross_entropy.cce import cce_linear_cross_entropy
+    from cut_cross_entropy.cce import _validate_cce_inputs, cce_linear_cross_entropy
+    from cut_cross_entropy.cce_compile import compiler_cce_linear_cross_entropy
 
     LCE_IMPL_DEFAULT = LinearCrossEntropyImpl.CCE
 else:
     cce_linear_cross_entropy = None
+    compiler_cce_linear_cross_entropy = None
     LCE_IMPL_DEFAULT = LinearCrossEntropyImpl.TORCH_COMPILE
 
-if TYPE_CHECKING or is_torch_greater_or_equal_2_5():
+if TYPE_CHECKING or TORCH_GREATER_OR_EQUAL_2_5:
     import torch.distributed.tensor
 
 
@@ -216,7 +224,7 @@ def linear_cross_entropy(
     """
     :param vocab_parallel_options: Used to enable vocab parallelism."""
 
-    if is_torch_greater_or_equal_2_5():
+    if TORCH_GREATER_OR_EQUAL_2_5:
         maybe_tensor_inputs = dict(e=e, targets=targets)
         for k, v in maybe_tensor_inputs.items():
             if isinstance(v, torch.distributed.tensor.DTensor):
@@ -258,26 +266,82 @@ def linear_cross_entropy(
             ),
         )
 
-        assert cce_linear_cross_entropy is not None
-        loss, lse, loss_metrics = cce_linear_cross_entropy(
-            e,
-            c,
-            targets,
-            bias,
-            ignore_index,
-            softcap,
-            reduction,
-            shift,
-            **cce_opts,
-            vocab_parallel_options=vocab_parallel_options,
-            return_lse=return_lse,
-            return_loss_metrics=return_loss_metrics,
-            _auto_mixed_grad_accum=impl == "cce_kahan_full_c",
-            mile_enabled=mile_enabled,
-            mile_gamma=mile_gamma,
-            mu_loss_enabled=mu_loss_enabled,
-            mu_loss_lambda=mu_loss_lambda,
+        use_compiler_boundary = (
+            torch.compiler.is_compiling()
+            and vocab_parallel_options is None
+            and reduction == "mean"
+            and not return_lse
+            and int(shift) > 0
+            and e.dtype in (torch.float16, torch.bfloat16)
         )
+        if use_compiler_boundary:
+            assert compiler_cce_linear_cross_entropy is not None
+            _validate_cce_inputs(
+                e,
+                c,
+                targets,
+                reduction,
+                return_loss_metrics,
+                mile_enabled,
+                mile_gamma,
+                mu_loss_enabled,
+                mu_loss_lambda,
+            )
+            compute_dtype = (
+                torch.get_autocast_dtype("cuda")
+                if torch.is_autocast_enabled()
+                else e.dtype
+            )
+            resolved_filter_eps = _handle_eps(cce_opts["filter_eps"], compute_dtype)
+            filter_e_grad = (
+                cce_opts["filter_e_grad"] and resolved_filter_eps is not None
+            )
+            filter_c_grad = (
+                cce_opts["filter_c_grad"] and resolved_filter_eps is not None
+            )
+            loss, loss_metrics = compiler_cce_linear_cross_entropy(
+                e,
+                c,
+                targets,
+                bias,
+                ignore_index,
+                softcap,
+                int(shift),
+                return_loss_metrics,
+                resolved_filter_eps,
+                cce_opts["accum_e_fp32"],
+                cce_opts["accum_c_fp32"],
+                filter_e_grad,
+                filter_c_grad,
+                impl == "cce_kahan_full_c",
+                mile_enabled,
+                mile_gamma,
+                mu_loss_enabled,
+                mu_loss_lambda,
+                compute_dtype == torch.bfloat16,
+            )
+            lse = None
+        else:
+            assert cce_linear_cross_entropy is not None
+            loss, lse, loss_metrics = cce_linear_cross_entropy(
+                e,
+                c,
+                targets,
+                bias,
+                ignore_index,
+                softcap,
+                reduction,
+                shift,
+                **cce_opts,
+                vocab_parallel_options=vocab_parallel_options,
+                return_lse=return_lse,
+                return_loss_metrics=return_loss_metrics,
+                _auto_mixed_grad_accum=impl == "cce_kahan_full_c",
+                mile_enabled=mile_enabled,
+                mile_gamma=mile_gamma,
+                mu_loss_enabled=mu_loss_enabled,
+                mu_loss_lambda=mu_loss_lambda,
+            )
     elif impl == "torch_compile":
         if return_loss_metrics:
             raise ValueError("return_loss_metrics is only supported by CCE implementations.")

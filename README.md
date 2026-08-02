@@ -24,6 +24,8 @@ linear-cross-entropy using `torch.compile`. This implementation will be set to t
 The current CCE kernel architecture, numerical basis, autotune cache design,
 and validation results are documented in
 [docs/cce-modernization.md](docs/cce-modernization.md).
+The compiler-safe boundary, supported `torch.compile` subset, and graph
+validation are documented in [docs/torch-compile.md](docs/torch-compile.md).
 The conservative FP32 rationale and the bounded Blackwell CC10.x/CC12.x FP16
 path for MiLe, μ-loss, and MEAP are described in its
 [mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
@@ -259,6 +261,8 @@ sorting, and top-k selection.
 For compiled training, pass a scalar int32/int64 CUDA tensor as `seed` when its
 value changes each step. This keeps the seed dynamic and avoids one Dynamo graph
 specialization per Python integer value; Python integer seeds remain supported.
+For int64 device seeds, the kernel folds the high and low halves into the
+32-bit Philox seed so packed step, microstep, and rank bits are not discarded.
 With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.

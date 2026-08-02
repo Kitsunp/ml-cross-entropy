@@ -15,6 +15,20 @@ import triton.language as tl
 
 
 @triton.jit
+def _fold_seed_to_uint32(seed):
+    """Fold every bit of an int64 seed into the uint32 Philox seed."""
+    seed_u64 = seed.to(tl.uint64)
+    low = seed_u64.to(tl.uint32)
+    high = (seed_u64 >> 32).to(tl.uint32)
+    high ^= high >> 16
+    high *= 0x7FEB352D
+    high ^= high >> 15
+    high *= 0x846CA68B
+    high ^= high >> 16
+    return low ^ high
+
+
+@triton.jit
 def _swap_or_not_permute(value, count, key0, key1):
     """Twelve keyed involution rounds forming a permutation over ``[0, count)``."""
     round_key = key0 ^ (key1 * 0x9E3779B1)
@@ -99,8 +113,13 @@ def _meap_mask_inputs_kernel(
 
     safe_count = tl.maximum(eligible_count, 1).to(tl.uint32)
     # A device scalar keeps a changing training seed out of Dynamo's Python
-    # integer guards. The legacy integer API remains a compile-time scalar.
-    seed_value = tl.load(seed).to(tl.uint32) if SEED_IS_TENSOR else seed
+    # integer guards. Fold before randint4x so packed int64 step/rank seeds do
+    # not silently alias when they differ only above bit 31. Seeds already in
+    # the legacy uint32 range remain bit-for-bit unchanged.
+    if SEED_IS_TENSOR:
+        seed_value = _fold_seed_to_uint32(tl.load(seed))
+    else:
+        seed_value = seed
     key0, key1, _, _ = tl.randint4x(seed_value, row)
     permuted_rank = _swap_or_not_permute(
         eligible_rank, safe_count, key0.to(tl.uint32), key1.to(tl.uint32)
