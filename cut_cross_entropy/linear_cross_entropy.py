@@ -266,13 +266,25 @@ def linear_cross_entropy(
             ),
         )
 
+        # Eligibility must follow the dtype used by the CUDA kernels, not only
+        # the input storage dtype.  RMSNorm can legitimately return FP32 while
+        # CUDA autocast makes CCE compute in FP16/BF16; rejecting that case
+        # exposes the data-dependent valid-index compaction and Triton launch
+        # code to Dynamo, specializing the graph once per valid-token count.
+        cuda_autocast_enabled = torch.is_autocast_enabled("cuda")
+        compute_dtype = (
+            torch.get_autocast_dtype("cuda")
+            if cuda_autocast_enabled
+            else e.dtype
+        )
         use_compiler_boundary = (
             torch.compiler.is_compiling()
             and vocab_parallel_options is None
             and reduction == "mean"
             and not return_lse
             and int(shift) > 0
-            and e.dtype in (torch.float16, torch.bfloat16)
+            and e.is_cuda
+            and compute_dtype in (torch.float16, torch.bfloat16)
         )
         if use_compiler_boundary:
             assert compiler_cce_linear_cross_entropy is not None
@@ -286,11 +298,6 @@ def linear_cross_entropy(
                 mile_gamma,
                 mu_loss_enabled,
                 mu_loss_lambda,
-            )
-            compute_dtype = (
-                torch.get_autocast_dtype("cuda")
-                if torch.is_autocast_enabled()
-                else e.dtype
             )
             resolved_filter_eps = _handle_eps(cce_opts["filter_eps"], compute_dtype)
             filter_e_grad = (
@@ -319,6 +326,7 @@ def linear_cross_entropy(
                 mu_loss_enabled,
                 mu_loss_lambda,
                 compute_dtype == torch.bfloat16,
+                cuda_autocast_enabled,
             )
             lse = None
         else:

@@ -23,9 +23,11 @@ forward and backward implementations used by eager execution. The Triton
 mathematics, saved tensors, MiLe weighting, μ-loss, MEAP metrics, bias handling,
 and gradient filters are therefore not duplicated.
 
-The optimized boundary currently covers BF16/FP16 CUDA inputs with `mean`
-reduction, positive label shift, no returned LSE, and no vocabulary-parallel
-group. Other public configurations retain the existing eager/traced fallback.
+The optimized boundary currently covers CUDA inputs whose effective compute
+dtype is BF16/FP16 with `mean` reduction, positive label shift, no returned
+LSE, and no vocabulary-parallel group. This includes FP32 storage inputs under
+CUDA BF16/FP16 autocast, as produced by operations such as RMSNorm. Other
+public configurations retain the existing eager/traced fallback.
 The public CCE shape, objective-parameter, reduction, and device-capability
 validations run before compiler dispatch. When CUDA autocast is active,
 `filter_eps="auto"` is resolved from the autocast compute dtype rather than the
@@ -34,6 +36,13 @@ the fake witness used by AOTAutograd, so the compiled backward and runtime
 backward agree when FP16 inputs run under BF16 autocast or vice versa. If the
 resolved epsilon is `None`, both gradient-filter flags are disabled before
 dispatch, as they are in eager CCE.
+
+The boundary also transports whether CUDA autocast was active and recreates
+that context inside both the opaque forward and reused backward. Inductor is
+not required to preserve the caller's ambient autocast state while invoking a
+custom operator. Relying on that ambient state can otherwise run the compiled
+forward in FP32 while its metadata witness and backward assume BF16/FP16,
+silently changing loss and gradients.
 Callers that continue tensor work after CCE must enable
 `torch._dynamo.config.capture_dynamic_output_shape_ops = True`, because the
 number of saved valid-label rows is data dependent. The NeoLLM integration sets
@@ -57,8 +66,11 @@ tensor work both before and after CCE:
 | CCE + MiLe + μ-loss | 2 / 1 | 1 / 0 |
 
 Changing the number of valid labels between calls did not compile another
-graph. Losses, metrics, and gradients were compared against eager execution for
-all four combinations. `torch.library.opcheck` also passes schema, autograd
+graph. The regression test uses FP32 storage under both BF16 and FP16 CUDA
+autocast and ten distinct valid-label counts, crossing Dynamo's default
+eight-recompile threshold without producing another caller graph. Losses,
+metrics, and FP32 gradients were compared against eager execution for all four
+CCE/MiLe/μ-loss combinations. `torch.library.opcheck` also passes schema, autograd
 registration, FakeTensor metadata, and dynamic AOT-dispatch validation. This
 caught and prevented aliasing between absent optional-output placeholders.
 Focused metadata cases also cover non-contiguous embeddings and partial
@@ -82,6 +94,13 @@ direction but also that the sub-millisecond magnitude is sensitive to normal
 run-to-run noise. Peak allocated memory was equal. These differences should not
 be generalized as universal kernel-speed gains; the material result is
 eliminating the graph split without adding steady-state cost.
+
+Allocator stability should be evaluated after one complete warm-up over the
+expected valid-label range. Compilation and Triton autotuning legitimately
+raise the initial peak. In a focused repeated-range diagnostic, reserved memory
+was identical across the two post-warm-up cycles; the regression criterion is
+no cumulative graph-pool or reservation growth, not identical instantaneous
+workspace usage inside every kernel.
 
 All performance numbers in this investigation were measured on the available
 RTX 5070 Ti. Correctness and dispatch do not depend on that model name. Other

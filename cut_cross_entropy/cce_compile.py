@@ -92,6 +92,7 @@ def _cce_backward_op(
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
     compute_dtype_witness: torch.Tensor,
+    forward_used_autocast: bool,
     e_requires_grad: bool,
     c_requires_grad: bool,
     bias_requires_grad: bool,
@@ -164,9 +165,12 @@ def _cce_backward_op(
     ctx.bias_info = (
         TensorInfo(original_bias.dtype, bias_requires_grad) if original_bias is not None else None
     )
-    # Inputs have already been restored to the compute dtype witnessed in the
-    # forward pass, so the reused custom_bwd wrapper must not autocast again.
-    ctx._fwd_used_autocast = False
+    # Recreate the custom_fwd/custom_bwd contract from the eager autograd
+    # function. The saved operands already have the witnessed compute dtype,
+    # while _fwd_used_autocast makes custom_bwd restore the same CUDA autocast
+    # context used by eager. Marking it false changes kernel-side dtype policy
+    # for FP32 storage inputs even though their saved tensors are FP16/BF16.
+    ctx._fwd_used_autocast = forward_used_autocast
     ctx._dtype = compute_dtype
     de, dc, dbias, _params_grad = LinearCrossEntropyFunction.backward(ctx, grad_loss, None, None)
     return (
@@ -190,6 +194,7 @@ def _cce_backward_fake(
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
     compute_dtype_witness: torch.Tensor,
+    forward_used_autocast: bool,
     e_requires_grad: bool,
     c_requires_grad: bool,
     bias_requires_grad: bool,
@@ -218,6 +223,7 @@ def _cce_backward_fake(
         mu,
         mu_vocab_size,
         compute_dtype_witness,
+        forward_used_autocast,
         ignore_index,
         softcap,
         shift,
@@ -273,6 +279,7 @@ def _cce_forward_op(
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
     compute_dtype_is_bf16: bool,
+    forward_used_autocast: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -311,9 +318,17 @@ def _cce_forward_op(
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
     )
     kernel_ctx = _FunctionContext()
-    loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
-        kernel_ctx, e, c, bias, params
-    )
+    compute_dtype = torch.bfloat16 if compute_dtype_is_bf16 else torch.float16
+    # Inductor may invoke the opaque custom op without the ambient autocast
+    # context that was active while Dynamo captured its caller. Recreate that
+    # context explicitly so this backend follows the eager forward's cast
+    # order, including evaluating mu-loss before e/c/bias are converted.
+    with torch.autocast(
+        "cuda", dtype=compute_dtype, enabled=forward_used_autocast
+    ):
+        loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
+            kernel_ctx, e, c, bias, params
+        )
     (
         saved_e,
         _saved_c,
@@ -338,7 +353,7 @@ def _cce_forward_op(
         _pack_optional(mu_vocab_size, loss),
         saved_e.new_empty(
             (),
-            dtype=torch.bfloat16 if compute_dtype_is_bf16 else torch.float16,
+            dtype=compute_dtype,
         ),
     )
 
@@ -367,6 +382,7 @@ def _cce_forward_fake(
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
     compute_dtype_is_bf16: bool,
+    forward_used_autocast: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -388,6 +404,7 @@ def _cce_forward_fake(
         auto_mixed_grad_accum,
         mile_gamma,
         mu_loss_lambda,
+        forward_used_autocast,
     )
     valid_count = torch.library.get_ctx().new_dynamic_size()
     lse = e.new_empty((valid_count,), dtype=torch.float32)
@@ -471,6 +488,7 @@ def _setup_context(ctx, inputs, output) -> None:
         mu_loss_enabled,
         mu_loss_lambda,
         _compute_dtype_is_bf16,
+        forward_used_autocast,
     ) = inputs
     (
         _loss,
@@ -506,6 +524,7 @@ def _setup_context(ctx, inputs, output) -> None:
     ctx.mile_gamma = mile_gamma
     ctx.mu_loss_enabled = mu_loss_enabled
     ctx.mu_loss_lambda = mu_loss_lambda
+    ctx.forward_used_autocast = forward_used_autocast
     ctx.mark_non_differentiable(
         metrics, lse, valids, logit_avg, mile_weight, mu, mu_vocab_size, witness
     )
@@ -535,6 +554,7 @@ def _backward(ctx, *grads):
         mu,
         mu_vocab_size,
         witness,
+        ctx.forward_used_autocast,
         ctx.e_requires_grad,
         ctx.c_requires_grad,
         ctx.bias_requires_grad,
@@ -558,6 +578,7 @@ def _backward(ctx, *grads):
         dc,
         None,
         dbias if ctx.has_bias else None,
+        None,
         None,
         None,
         None,
@@ -602,6 +623,7 @@ def compiler_cce_linear_cross_entropy(
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
     compute_dtype_is_bf16: bool,
+    forward_used_autocast: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the supported training subset as one compiler-visible custom op."""
     outputs = _cce_forward_op(
@@ -627,5 +649,6 @@ def compiler_cce_linear_cross_entropy(
         mu_loss_enabled,
         mu_loss_lambda,
         compute_dtype_is_bf16,
+        forward_used_autocast,
     )
     return outputs[0], outputs[1] if return_loss_metrics else None
