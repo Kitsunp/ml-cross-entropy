@@ -256,6 +256,9 @@ create the masked IDs outside activation-checkpointed regions. A readable
 kernel maps eligible positions through twelve keyed
 swap-or-not permutation rounds, avoiding rejection loops, random-score tensors,
 sorting, and top-k selection.
+For compiled training, pass a scalar int32/int64 CUDA tensor as `seed` when its
+value changes each step. This keeps the seed dynamic and avoids one Dynamo graph
+specialization per Python integer value; Python integer seeds remain supported.
 With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.

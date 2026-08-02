@@ -186,6 +186,19 @@ def test_meap_triton_seed_is_reproducible() -> None:
 
 
 @skip_no_cuda
+@pytest.mark.parametrize("seed", [0, 81, 0xFFFFFFFE])
+def test_meap_device_scalar_seed_matches_python_integer(seed: int) -> None:
+    input_ids = torch.arange(8 * 64, device="cuda").view(8, 64)
+    tensor_seed = torch.tensor(seed, device="cuda", dtype=torch.int64)
+    from_integer = meap_mask_inputs(input_ids, 999, seed=seed, return_mask=True)
+    from_tensor = meap_mask_inputs(
+        input_ids, 999, seed=tensor_seed, return_mask=True
+    )
+    assert torch.equal(from_integer[0], from_tensor[0])
+    assert torch.equal(from_integer[1], from_tensor[1])
+
+
+@skip_no_cuda
 @pytest.mark.parametrize("seed", [1, 2027, 0xFFFFFFFE])
 def test_meap_permutation_has_no_obvious_position_or_adjacency_bias(seed: int) -> None:
     batch_size, sequence_length = 4096, 64

@@ -58,6 +58,7 @@ def _meap_mask_inputs_kernel(
     EXCLUDE_LAST: tl.constexpr,
     RETURN_MASK: tl.constexpr,
     RETURN_METRICS: tl.constexpr,
+    SEED_IS_TENSOR: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -97,7 +98,10 @@ def _meap_mask_inputs_kernel(
     eligible_rank = tl.where(eligible, eligible_rank, 0).to(tl.uint32)
 
     safe_count = tl.maximum(eligible_count, 1).to(tl.uint32)
-    key0, key1, _, _ = tl.randint4x(seed, row)
+    # A device scalar keeps a changing training seed out of Dynamo's Python
+    # integer guards. The legacy integer API remains a compile-time scalar.
+    seed_value = tl.load(seed).to(tl.uint32) if SEED_IS_TENSOR else seed
+    key0, key1, _, _ = tl.randint4x(seed_value, row)
     permuted_rank = _swap_or_not_permute(
         eligible_rank, safe_count, key0.to(tl.uint32), key1.to(tl.uint32)
     )
@@ -123,7 +127,7 @@ def _validate_meap_inputs(
     mask_ratio: float,
     eligible_mask: torch.Tensor | None,
     padding_mask: torch.Tensor | None,
-    seed: int,
+    seed: int | torch.Tensor,
 ) -> None:
     if input_ids.ndim != 2:
         raise ValueError(f"input_ids must have shape (batch, sequence), got {input_ids.shape}.")
@@ -138,7 +142,12 @@ def _validate_meap_inputs(
         )
     if not math.isfinite(mask_ratio) or not 0.0 <= mask_ratio <= 1.0:
         raise ValueError(f"mask_ratio must be finite and in [0, 1], got {mask_ratio}.")
-    if not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFF:
+    if isinstance(seed, torch.Tensor):
+        if seed.ndim != 0 or seed.dtype not in (torch.int32, torch.int64):
+            raise TypeError("a tensor seed must be a scalar int32 or int64 tensor.")
+        if seed.device != input_ids.device:
+            raise ValueError("a tensor seed and input_ids must be on the same device.")
+    elif not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFF:
         raise ValueError("seed must be an integer in [0, 2**32 - 1].")
     if eligible_mask is not None and padding_mask is not None:
         raise ValueError("Pass either eligible_mask or padding_mask, not both.")
@@ -161,7 +170,7 @@ def _torch_meap_mask_inputs(
     mask_ratio: float,
     eligible_mask: torch.Tensor | None,
     padding_mask: torch.Tensor | None,
-    seed: int,
+    seed: int | torch.Tensor,
     exclude_last: bool,
     return_metrics: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -251,6 +260,7 @@ def _triton_meap_mask_inputs(
         EXCLUDE_LAST=exclude_last,
         RETURN_MASK=return_mask,
         RETURN_METRICS=return_metrics,
+        SEED_IS_TENSOR=isinstance(seed, torch.Tensor),
         BLOCK_T=block_t,
         num_warps=4 if block_t <= 512 else 8,
         num_stages=1,
@@ -266,7 +276,7 @@ def meap_mask_inputs(
     mask_ratio: float = 0.15,
     eligible_mask: torch.Tensor | None = None,
     padding_mask: torch.Tensor | None = None,
-    seed: int = 0,
+    seed: int | torch.Tensor = 0,
     exclude_last: bool = True,
     return_mask: bool = False,
     return_metrics: bool = False,
@@ -317,6 +327,11 @@ def meap_mask_inputs(
         return output
 
     if implementation == "torch":
+        if isinstance(seed, torch.Tensor):
+            raise TypeError(
+                "implementation='torch' requires a Python integer seed; "
+                "device-scalar seeds are supported by implementation='triton'."
+            )
         output, selected, metrics = _torch_meap_mask_inputs(
             input_ids,
             mask_token_id,
