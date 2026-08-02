@@ -98,6 +98,10 @@ meap_mask_inputs(
 - Each row receives $\max(1,\lfloor rN\rfloor)$ replacements, where $r$ is
   `mask_ratio`, when the ratio and eligible count are positive.
 - Sampling is without replacement and independent between rows.
+- `seed` accepts either the original Python integer or a scalar int32/int64
+  tensor on the same CUDA device as `input_ids`. Prefer the device scalar for a
+  seed that changes each training step: it prevents `torch.compile` from
+  specializing the model graph on every Python integer value.
 - `exclude_last=True` removes the last eligible input from sampling. This is
   appropriate when CCE uses `shift=1`, because that hidden state has no valid
   next-token target.
