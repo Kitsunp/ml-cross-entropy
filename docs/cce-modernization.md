@@ -158,11 +158,13 @@ Backward still uses tiled gradient accumulation, but its lock topology now
 matches the minimum candidate tiles (`B=16`, `V=32`). This removes false sharing
 between independent candidate tiles. The default BF16/FP16 scheduler is
 `128 x 128 x 32`, eight warps, and three stages on parts with enough shared
-memory. On consumer GPUs exposing a 99 KiB SMEM limit, the selector switches to
-the safe `32 x 128 x 32`, four-warp, two-stage schedule; this avoids Triton's
-106,496-byte allocation request without changing the reduction or loss
-formulation. Scheduling may differ, but the reconstructed-logit mathematics does
-not.
+memory. When the device reports less than 106,496 bytes of shared memory per
+block, the selector keeps the same `128 x 128 x 32` tile but uses four warps and
+three stages. Reducing the old fallback to `32 x 128 x 32` avoided the allocation
+error, but multiplied the number of backward programs and became increasingly
+expensive as batch, token, vocabulary, or hidden dimensions grew. The selector
+depends on the reported shared-memory capability, not on a GPU product name.
+Scheduling may differ, but the reconstructed-logit mathematics does not.
 
 For FP32 gradient destinations, including `cce_kahan_full_c`, the default path
 uses relaxed, GPU-scope `atomic_add` instead of a spinlock-protected
@@ -310,6 +312,28 @@ Unless noted otherwise, measurements used BF16, `D=128`, PyTorch matmul
 precision `high`, and one RTX 5070 Ti. The machine was also in interactive use,
 so small timing differences are treated as directional rather than universal.
 
+### Historical regression isolation
+
+A direct forward-plus-backward comparison separated kernel behavior from the
+model's compiler boundary. With `cce_kahan_full_c`, MiLe, μ-loss, and metrics
+enabled, the modern kernel before the shared-memory fallback correction was
+already faster than the pre-modernization implementation:
+
+| Scale case | Pre-modernization (ms) | Modern kernel (ms) | Change |
+|---|---:|---:|---:|
+| `B=64,S=512,D=512,V=64,402` | 125.85 | 92.76 | -26.29% |
+| vocabulary `V=128,000` | 243.84 | 181.39 | -25.61% |
+| hidden size `D=1,024` | 229.59 | 177.34 | -22.76% |
+| context `S=1,024` | 249.03 | 184.23 | -26.02% |
+
+The reported training-step regression therefore did not reproduce inside the
+kernel total. The compiler investigation found that tracing CCE internals made
+many specialized graphs, while disabling the wrapper split the model around the
+loss. The separate low-shared-memory heuristic also left additional backward
+performance unused, but was not enough to make the modern direct kernel slower
+than the historical one. See [torch-compile.md](torch-compile.md) for the graph
+and corrected-scheduler measurements.
+
 ### Split-V forward, no MiLe moment
 
 These are medians of three benchmark groups in the same process.
@@ -437,8 +461,9 @@ The following focused CUDA suites passed after the implementation changes:
   padding, bias, shift, and softcap;
 - 128/128 stratified backward cases across FP32 exact/atomic, BF16 lock, FP16
   lock, reductions, padding, bias, shift, softcap, and z-loss;
-- 50/50 complete μ-loss and MEAP tests after selecting a two-stage FP32
-  backward scheduler for GPUs with a 99 KiB shared-memory limit.
+- 50/50 complete μ-loss and MEAP tests after selecting the lower-warp FP32
+  backward scheduler for devices reporting less than 106,496 bytes of shared
+  memory per block.
 
 The repository contains roughly 3,190 parametrized tests. During interactive
 GPU use, the validation above was run serially and in bounded, stratified

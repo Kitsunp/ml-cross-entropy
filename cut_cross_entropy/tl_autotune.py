@@ -216,9 +216,11 @@ def early_config_prune(
             nearest = heapq.nsmallest(
                 2,
                 v,
-                key=lambda x: 10 + abs(x[1] - optimal_num_stages)
-                if (x[1] - optimal_num_stages) < 0
-                else x[1] - optimal_num_stages,
+                key=lambda x: (
+                    10 + abs(x[1] - optimal_num_stages)
+                    if (x[1] - optimal_num_stages) < 0
+                    else x[1] - optimal_num_stages
+                ),
             )
 
             for n in nearest:
@@ -410,9 +412,9 @@ def _heuristics_from_config(
         return triton.heuristics(
             {
                 k: (
-                    lambda args, _v=v, _fp32_v=fp32_v: _fp32_v
-                    if args[arg_name].dtype == torch.float32
-                    else _v
+                    lambda args, _v=v, _fp32_v=fp32_v: (
+                        _fp32_v if args[arg_name].dtype == torch.float32 else _v
+                    )
                 )
                 for (k, v), fp32_v in zip(keys_opts, fp32_opts, strict=True)
             }
@@ -440,14 +442,24 @@ def _cce_backward_best_config_fp32() -> Config:
     return Config(dict(BLOCK_B=32, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=2)
 
 
+def _cce_backward_low_smem_config() -> Config:
+    """Large tile for devices reporting a lower shared-memory ceiling.
+
+    The eight-warp schedule needs 106,496 bytes, but reducing scheduling to
+    four warps keeps the same 128x128 tensor-core tile within the lower budget.
+    This avoids the severe launch-count increase of the old 32x128 fallback.
+    """
+    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
+
+
 def _cce_backward_heuristic_config() -> Config:
-    """Choose a BF16-safe tile when the device has a 99 KiB SMEM budget.
+    """Choose a BF16-safe tile from the active device's SMEM capability.
 
     The BF16/FP16 fast tile is valid on larger parts, but Triton reports
-    106,496 bytes for its backward epilogue.  Ada/Blackwell consumer parts
-    expose 101,376 bytes, so selecting that tile unconditionally fails exactly
-    when the mixed-accumulation path is first exercised.  The smaller config
-    is also valid for BF16/FP16; it only changes scheduling, not arithmetic.
+    106,496 bytes for its eight-warp backward epilogue. Devices reporting a
+    lower per-block limit keep the same tensor-core tile with four warps. This
+    changes scheduling, not arithmetic, and avoids multiplying the number of
+    backward programs as batch, vocabulary, context, or hidden size grows.
     """
     config = _cce_backward_best_config()
     if not torch.cuda.is_available():
@@ -455,7 +467,7 @@ def _cce_backward_heuristic_config() -> Config:
     try:
         properties = driver.active.utils.get_device_properties(torch.cuda.current_device())
         if properties["max_shared_mem"] < 106496:
-            return _cce_backward_best_config_fp32()
+            return _cce_backward_low_smem_config()
     except (KeyError, RuntimeError):
         # Keep import/fallback behavior unchanged if a CUDA driver is not
         # initialized yet; Triton will select the normal config at launch.
