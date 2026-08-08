@@ -97,6 +97,38 @@ def test_reference_dispatch_preserves_grads_and_custom_knot_grid() -> None:
     )
 
 
+def test_supported_dispatch_routes_trainable_params_through_autograd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached raw forward must never be returned for a training call."""
+    import cut_cross_entropy.leviathan.dispatch as dispatch
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg)
+    params = _detached_params(generator)
+    ids = torch.randint(cfg.vocab_size, (2, 8))
+
+    def detached_raw_forward(*args, **kwargs):
+        del args
+        del kwargs
+        return torch.zeros(
+            *ids.shape,
+            cfg.hidden_size,
+            dtype=torch.bfloat16,
+        ), None
+
+    monkeypatch.setattr(dispatch.forward_impl, "leviathan_forward", detached_raw_forward)
+    output = leviathan_embedding(ids, params, cfg)
+
+    output.float().square().mean().backward()
+
+    assert output.requires_grad
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in params.values()
+    )
+
+
 def test_neollm_adapter_preserves_reference_fallback() -> None:
     cfg = _config(dtype=torch.float32)
     reference = LeviathanGenerator(cfg)
