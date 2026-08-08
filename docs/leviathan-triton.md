@@ -45,6 +45,16 @@ and no N-scaled dDelta workspace.  The authoritative harness enforces a 10 GB
 peak budget; use the same harness for a target-GPU comparison before enabling
 architecture-specific overrides.
 
+On SM120+ with at least four heads, the forward dot kernel automatically uses a
+two-dimensional (token_block, head) grid and four warps per program.  This
+exposes independent heads to the scheduler without adding a persistent buffer;
+LEV_SPLIT_HEAD=0 restores the serialized-head control and LEV_SPLIT_HEAD=1
+forces the split for an A/B run.  In the local D=2048,N=4096 profile, the
+forward kernel fell from about 0.925 ms to 0.776 ms with identical
+synchronization, materialization, and 0.142 GB peak figures.  The selector
+queries compute capability at runtime, so an RTX 5090 can select the same
+layout without hard-coding its SM count.
+
 The backward dot path also precomputes the seed-independent `dM * M` term
 in-place (`LEV_PREMUL_DMM=1`, the default) before the per-seed loop.  This
 preserves the dDelta liveness optimization: the CUDA profile reduced the
