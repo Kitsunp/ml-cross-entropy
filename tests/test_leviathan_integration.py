@@ -15,6 +15,7 @@ from cut_cross_entropy.leviathan import (
     LeviathanEmbedding,
     LeviathanGenerator,
     make_triton_leviathan_generator,
+    replace_leviathan_generator,
     leviathan_forward_ref,
     leviathan_embedding,
     leviathan_embedding_compiler_safe,
@@ -89,6 +90,10 @@ def test_reference_dispatch_preserves_grads_and_custom_knot_grid() -> None:
     )
     torch.testing.assert_close(compiler_output, expected, rtol=0.0, atol=0.0)
 
+    for parameter in params.values():
+        parameter.grad = None
+    assert "LeviathanFunctionWithGridBackward" in type(compiler_output.grad_fn).__name__
+    compiler_output.float().square().mean().backward()
     output.float().square().mean().backward()
     assert all(
         params[name].grad is not None and torch.isfinite(params[name].grad).all()
@@ -139,6 +144,35 @@ def test_neollm_adapter_preserves_reference_fallback() -> None:
     ids = torch.randint(cfg.vocab_size, (2, 8))
 
     torch.testing.assert_close(adapted(ids), reference(ids), rtol=0.0, atol=0.0)
+
+
+def test_neollm_replacement_preserves_grid_and_trainability() -> None:
+    cfg = _config(dtype=torch.float32)
+    reference = LeviathanGenerator(cfg)
+    with torch.no_grad():
+        reference.knot_grid.copy_(
+            torch.linspace(0.0, 1.0, cfg.generator_num_knots).pow(1.7)
+        )
+    reference.codebooks.requires_grad_(False)
+
+    class Container(torch.nn.Module):
+        def __init__(self, generator: LeviathanGenerator) -> None:
+            super().__init__()
+            self.token_generator = generator
+
+    container = Container(reference)
+    original_grid = reference.knot_grid.detach().clone()
+    replace_leviathan_generator(container, use_kernel=False)
+    replacement = container.token_generator
+
+    assert replacement.codebooks.requires_grad is False
+    assert replacement.knot_grid.dtype == original_grid.dtype
+    torch.testing.assert_close(replacement.knot_grid, original_grid)
+
+    ids = torch.randint(cfg.vocab_size, (2, 8))
+    torch.testing.assert_close(
+        replacement(ids), reference(ids), rtol=0.0, atol=0.0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
