@@ -265,8 +265,10 @@ def _lev_fused_dot(
     ROUND_ZH: tl.constexpr, SAVE_XH: tl.constexpr, SAVE_T: tl.constexpr,
     DOT_IEEE: tl.constexpr, FUSE_GATHER: tl.constexpr, SAVE_Z: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr,
+    SPLIT_HEAD: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    pid_head = tl.program_id(1)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = rows < N
 
@@ -304,7 +306,9 @@ def _lev_fused_dot(
             tl.store(z_ptr + rows[:, None] * D_SEED + dcols[None, :],
                      z_reg, mask=mask[:, None])
 
-    for m in tl.range(0, H_, loop_unroll_factor=1):
+    head_count = 1 if SPLIT_HEAD else H_
+    for mh in tl.range(0, head_count, loop_unroll_factor=1):
+        m = pid_head + mh
         # ---- phase A: zh = z @ W_seed^T (bf16 dot, fp32 acc), LN, sigmoid ----
         zh = tl.zeros([BLOCK_M, D_SEED], tl.float32)
         for kc in tl.range(0, D_SEED, BLOCK_K, loop_unroll_factor=1):
@@ -499,6 +503,20 @@ def _use_raw_launch() -> bool:
     return True
 
 
+def _auto_split_head(device, num_heads: int) -> bool:
+    """Expose independent heads to the scheduler on Blackwell SM120+."""
+    override = os.environ.get("LEV_SPLIT_HEAD")
+    if override is not None:
+        return override != "0"
+    if getattr(device, "type", None) != "cuda" or num_heads < 4:
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+        return (major, minor) >= (12, 0)
+    except (RuntimeError, TypeError, AttributeError):
+        return False
+
+
 def leviathan_forward(ids, params, cfg, save_intermediates=False,
                       variant="exact"):
     """Kernel forward: (embeds, saved).
@@ -598,15 +616,21 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
             # Keep the measured default conservative, while exposing the
             # launch knobs for architecture-specific probes.  The selector is
             # deterministic and does not autotune at runtime.
+            split_head = _auto_split_head(device, h) and not fuse_gather
+            default_warps = 4 if split_head else 8
             cd = triton.Config(
                 {
                     "BLOCK_M": int(os.environ.get("LEV_FWD_BM", "32")),
                     "VEC": int(os.environ.get("LEV_FWD_VEC", "8")),
                 },
-                num_warps=int(os.environ.get("LEV_FWD_WARPS", "8")),
+                num_warps=int(os.environ.get("LEV_FWD_WARPS",
+                                              str(default_warps))),
                 num_stages=int(os.environ.get("LEV_FWD_STAGES", "1")),
             )
-            grid_ad = (triton.cdiv(N, cd.kwargs["BLOCK_M"]),)
+            grid_ad = (
+                triton.cdiv(N, cd.kwargs["BLOCK_M"]),
+                h if split_head else 1,
+            )
             _lev_fused_dot[grid_ad](
                 ids, prep["codebooks"], prep["w_seed_t"], prep["norm_w"],
                 prep["norm_b"], prep["delta"], prep["knot_grid"],
@@ -618,6 +642,7 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
                 ROUND_ZH=ROUND_ZH, SAVE_XH=save_xh, SAVE_T=save_t,
                 DOT_IEEE=dot_ieee, FUSE_GATHER=fuse_gather,
                 SAVE_Z=save_xh, EPS=NORM_EPS, LOG_EPS=LOG_EPS,
+                SPLIT_HEAD=split_head,
                 num_warps=cd.num_warps, num_stages=cd.num_stages)
         else:
             _lev_fused_auto.fn[grid_a](
