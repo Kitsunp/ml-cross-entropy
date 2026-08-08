@@ -175,6 +175,26 @@ def test_neollm_replacement_preserves_grid_and_trainability() -> None:
     )
 
 
+def test_forward_split_selector_is_runtime_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cut_cross_entropy.leviathan.forward_impl as forward_impl
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+    monkeypatch.delenv("LEV_SPLIT_HEAD", raising=False)
+    assert forward_impl._auto_split_head(torch.device("cuda"), 8)
+    assert not forward_impl._auto_split_head(torch.device("cuda"), 2)
+
+    monkeypatch.setenv("LEV_SPLIT_HEAD", "0")
+    assert not forward_impl._auto_split_head(torch.device("cuda"), 8)
+    monkeypatch.setenv("LEV_SPLIT_HEAD", "1")
+    assert forward_impl._auto_split_head(torch.device("cpu"), 2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_kernel_is_finite_and_stays_under_vram_budget() -> None:
     cfg = _config(dtype=torch.bfloat16)
