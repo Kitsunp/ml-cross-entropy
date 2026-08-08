@@ -118,6 +118,39 @@ _PARAM_KEYS = (
 )
 
 
+def _run_forward(ids, params, cfg, variant):
+    try:
+        return _leviathan_forward(
+            ids,
+            params,
+            cfg,
+            save_intermediates=True,
+            variant=variant,
+        )
+    except (RuntimeError, TypeError, ValueError, AttributeError):
+        # Unsupported config / wrong dtype / no CUDA -> the differentiable
+        # reference forward.  The reference intentionally has no variant
+        # switch: it is the semantic fallback for every requested variant.
+        return leviathan_forward_ref(
+            ids,
+            params,
+            cfg,
+            save_intermediates=True,
+        )
+
+
+def _run_backward(ctx, grad_out, params, ids):
+    chunk = getattr(ctx.cfg, "backward_chunk", None) or 8192
+    return leviathan_backward_triton_or_torch(
+        grad_out,
+        params,
+        ctx.cfg,
+        ctx.saved_intermediates,
+        ids,
+        chunk,
+    )
+
+
 class LeviathanFunction(torch.autograd.Function):
     """Forward/backward LEV con autograd. Entrada discreta (ids) sin gradiente."""
 
@@ -132,6 +165,7 @@ class LeviathanFunction(torch.autograd.Function):
         head_spline_delta: torch.Tensor,
         head_out_weight: torch.Tensor,
         cfg: Any,
+        variant: str = "exact",
     ) -> torch.Tensor:
         params: Dict[str, torch.Tensor] = {
             "codebooks": codebooks,
@@ -141,14 +175,7 @@ class LeviathanFunction(torch.autograd.Function):
             "head_spline_delta": head_spline_delta,
             "head_out_weight": head_out_weight,
         }
-        try:
-            embeds, saved = _leviathan_forward(
-                ids, params, cfg, save_intermediates=True)
-        except (RuntimeError, TypeError, ValueError):
-            # unsupported config / wrong dtype / no CUDA -> reference forward
-            # (never wrong results: fallback is the oracle)
-            embeds, saved = leviathan_forward_ref(
-                ids, params, cfg, save_intermediates=True)
+        embeds, saved = _run_forward(ids, params, cfg, variant)
 
         ctx.cfg = cfg
         ctx.saved_intermediates = saved
@@ -182,12 +209,7 @@ class LeviathanFunction(torch.autograd.Function):
             "head_spline_delta": head_spline_delta,
             "head_out_weight": head_out_weight,
         }
-        # chunk the backward over tokens so the torch fallback never OOMs at
-        # large N (B/phi are recomputed per chunk; 8192 keeps the working set
-        # ~1-2 GB).  The Triton backward will not need this.
-        chunk = getattr(ctx.cfg, "backward_chunk", None) or 8192
-        grads = leviathan_backward_triton_or_torch(
-            grad_out, params, ctx.cfg, ctx.saved_intermediates, ids, chunk)
+        grads = _run_backward(ctx, grad_out, params, ids)
         return (
             None,  # ids: entrada discreta, sin gradiente
             grads["codebooks"],
@@ -197,6 +219,84 @@ class LeviathanFunction(torch.autograd.Function):
             grads["head_spline_delta"],
             grads["head_out_weight"],
             None,  # cfg
+            None,  # variant
+        )
+
+
+class LeviathanFunctionWithGrid(torch.autograd.Function):
+    """Autograd wrapper that keeps an explicit knot grid and chunked backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        ids: torch.Tensor,
+        codebooks: torch.Tensor,
+        head_proj_weight: torch.Tensor,
+        head_norm_weight: torch.Tensor,
+        head_norm_bias: torch.Tensor,
+        head_spline_delta: torch.Tensor,
+        head_out_weight: torch.Tensor,
+        knot_grid: torch.Tensor,
+        cfg: Any,
+        variant: str = "exact",
+    ) -> torch.Tensor:
+        params: Dict[str, torch.Tensor] = {
+            "codebooks": codebooks,
+            "head_proj_weight": head_proj_weight,
+            "head_norm_weight": head_norm_weight,
+            "head_norm_bias": head_norm_bias,
+            "head_spline_delta": head_spline_delta,
+            "head_out_weight": head_out_weight,
+            "knot_grid": knot_grid,
+        }
+        embeds, saved = _run_forward(ids, params, cfg, variant)
+        ctx.cfg = cfg
+        ctx.saved_intermediates = saved
+        ctx.save_for_backward(
+            ids,
+            codebooks,
+            head_proj_weight,
+            head_norm_weight,
+            head_norm_bias,
+            head_spline_delta,
+            head_out_weight,
+            knot_grid,
+        )
+        return embeds
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
+        (
+            ids,
+            codebooks,
+            head_proj_weight,
+            head_norm_weight,
+            head_norm_bias,
+            head_spline_delta,
+            head_out_weight,
+            knot_grid,
+        ) = ctx.saved_tensors
+        params: Dict[str, torch.Tensor] = {
+            "codebooks": codebooks,
+            "head_proj_weight": head_proj_weight,
+            "head_norm_weight": head_norm_weight,
+            "head_norm_bias": head_norm_bias,
+            "head_spline_delta": head_spline_delta,
+            "head_out_weight": head_out_weight,
+            "knot_grid": knot_grid,
+        }
+        grads = _run_backward(ctx, grad_out, params, ids)
+        return (
+            None,  # ids
+            grads["codebooks"],
+            grads["head_proj_weight"],
+            grads["head_norm_weight"],
+            grads["head_norm_bias"],
+            grads["head_spline_delta"],
+            grads["head_out_weight"],
+            None,  # knot_grid is a fixed buffer
+            None,  # cfg
+            None,  # variant
         )
 
 
@@ -204,22 +304,27 @@ def leviathan_apply(
     ids: torch.Tensor,
     params: Dict[str, torch.Tensor],
     cfg: Any,
+    *,
+    variant: str = "exact",
 ) -> torch.Tensor:
     """Conveniencia: apply() con dict de params.
 
-    ``knot_grid`` is a non-parameter buffer, so the legacy custom autograd
-    signature does not carry it as an input.  When a caller supplies an
-    explicit grid, use the differentiable dict reference directly; this keeps
-    both the grid and the original parameter tensors in the autograd graph.
-    The normal path retains the chunked custom backward used by the kernel
-    integration.
+    An explicit ``knot_grid`` is carried through a grid-aware custom autograd
+    wrapper so the reference fallback remains chunked and keeps the original
+    parameter tensors connected to autograd.  The normal path retains the
+    chunked custom backward used by the kernel integration.
     """
     if "knot_grid" in params:
-        embeds, _ = leviathan_forward_ref(
+        return LeviathanFunctionWithGrid.apply(
             ids,
-            params,
+            *[params[k] for k in _PARAM_KEYS],
+            params["knot_grid"],
             cfg,
-            save_intermediates=False,
+            variant,
         )
-        return embeds
-    return LeviathanFunction.apply(ids, *[params[k] for k in _PARAM_KEYS], cfg)
+    return LeviathanFunction.apply(
+        ids,
+        *[params[k] for k in _PARAM_KEYS],
+        cfg,
+        variant,
+    )

@@ -107,23 +107,23 @@ def leviathan_embedding(ids, params, cfg, save_intermediates=False,
     available (CUDA, or TRITON_INTERPRET=1 for CPU sanity checks).  In every
     other case this falls back to the leviathan_core reference module.
     """
-    if forward_impl is not None and supports(cfg, variant):
-        needs_backward = torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in params.values()
-        )
-        if needs_backward:
-            # The raw Triton forward writes torch.empty outputs from kernels,
-            # so it is intentionally not autograd-connected.  Training must
-            # go through the wrapper, which saves the checkpoints and wires
-            # the Triton/reference backward to the original parameter tensors.
-            from .autograd_fn import leviathan_apply
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in params.values()
+    )
+    if needs_backward:
+        # The raw Triton forward writes torch.empty outputs from kernels, so it
+        # is intentionally not autograd-connected.  Training—supported or
+        # fallback—must go through the wrapper, which preserves explicit grids
+        # and bounds the reference backward by token chunks.
+        from .autograd_fn import leviathan_apply
 
-            try:
-                return leviathan_apply(ids, params, cfg)
-            except (RuntimeError, TypeError, ValueError, AttributeError):
-                # Keep the public dispatcher total if the wrapper cannot be
-                # loaded or a runtime launch/configuration error escapes it.
-                pass
+        try:
+            return leviathan_apply(ids, params, cfg, variant=variant)
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            # Keep the public dispatcher total if the wrapper cannot be loaded
+            # or a runtime launch/configuration error escapes it.
+            pass
+    if forward_impl is not None and supports(cfg, variant):
         try:
             embeds, _ = forward_impl.leviathan_forward(
                 ids, params, cfg, save_intermediates=save_intermediates,

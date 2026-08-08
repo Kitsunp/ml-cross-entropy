@@ -31,7 +31,7 @@ def make_triton_leviathan_generator(reference_cls: type[nn.Module]) -> type[nn.M
                 not self.use_leviathan_triton
                 or not token_ids.is_cuda
                 or not _HAS_KERNEL_FORWARD
-                or not supports(self.config)
+                or not supports(self.config, dtype_override=self.codebooks.dtype)
             ):
                 return super().forward(token_ids)
 
@@ -83,8 +83,24 @@ def replace_leviathan_generator(
     triton_cls = make_triton_leviathan_generator(generator_cls)
     replacement = triton_cls(generator.config)
     first_parameter = next(generator.parameters())
+    original_requires_grad = {
+        name: parameter.requires_grad
+        for name, parameter in generator.named_parameters()
+    }
+    original_knot_grid = getattr(generator, "knot_grid", None)
+    if original_knot_grid is not None:
+        original_knot_grid = original_knot_grid.detach().clone()
     replacement.to(device=first_parameter.device, dtype=first_parameter.dtype)
+    if original_knot_grid is not None:
+        # ``knot_grid`` is a non-persistent buffer.  Restore it after the
+        # module cast so an FP32 grid is not rounded to BF16 by replacement.
+        replacement._buffers["knot_grid"] = original_knot_grid.to(
+            device=first_parameter.device
+        )
     replacement.load_state_dict(generator.state_dict(), strict=True)
+    for name, parameter in replacement.named_parameters():
+        if name in original_requires_grad:
+            parameter.requires_grad_(original_requires_grad[name])
     replacement.train(generator.training)
     replacement.use_leviathan_triton = bool(use_kernel)
     container.token_generator = replacement
