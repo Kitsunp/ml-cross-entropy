@@ -14,9 +14,13 @@ The integration has three entry points:
 
 On CUDA, supported BF16 configurations use the Triton forward/backward path.
 Unsupported shapes, CPU execution, disabled use, and Triton launch failures
-fall back to the reference `LeviathanGenerator` path.  The fallback is used in
-both training and inference; it preserves the original parameter names and
-state-dict layout.
+fall back to the differentiable dict-based reference path.  It keeps the
+original parameter tensors connected to autograd and honors an explicit
+`knot_grid`.  `LeviathanGenerator` creates its trainable tensors in
+`config.dtype`, so `.cuda()` alone is sufficient to select the BF16 kernel.
+When gradients are disabled—or all generator parameters are frozen—a separate
+CUDA boundary runs the forward with `save_intermediates=False` and avoids
+allocating the training checkpoints.
 
 The package does not set `torch._dynamo.config.capture_dynamic_output_shape_ops`
 or any other global Dynamo/`torch.compile` option.  The LEV custom-op boundary

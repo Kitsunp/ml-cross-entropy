@@ -205,5 +205,21 @@ def leviathan_apply(
     params: Dict[str, torch.Tensor],
     cfg: Any,
 ) -> torch.Tensor:
-    """Conveniencia: apply() con dict de params (mismas claves que el módulo)."""
+    """Conveniencia: apply() con dict de params.
+
+    ``knot_grid`` is a non-parameter buffer, so the legacy custom autograd
+    signature does not carry it as an input.  When a caller supplies an
+    explicit grid, use the differentiable dict reference directly; this keeps
+    both the grid and the original parameter tensors in the autograd graph.
+    The normal path retains the chunked custom backward used by the kernel
+    integration.
+    """
+    if "knot_grid" in params:
+        embeds, _ = leviathan_forward_ref(
+            ids,
+            params,
+            cfg,
+            save_intermediates=False,
+        )
+        return embeds
     return LeviathanFunction.apply(ids, *[params[k] for k in _PARAM_KEYS], cfg)

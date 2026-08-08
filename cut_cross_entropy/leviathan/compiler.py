@@ -59,8 +59,10 @@ def _saved_or_reference(
     ids: torch.Tensor,
     params: dict[str, torch.Tensor],
     cfg: LeviathanConfig,
+    *,
+    save_intermediates: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Run LEV and guarantee the lean tensors required by the custom op."""
+    """Run LEV and optionally return the lean tensors required for backward."""
     if _leviathan_forward is not None:
         try:
             with torch.no_grad():
@@ -68,8 +70,10 @@ def _saved_or_reference(
                     ids,
                     params,
                     cfg,
-                    save_intermediates=True,
+                    save_intermediates=save_intermediates,
                 )
+            if not save_intermediates:
+                return embeds, {}
             if saved is not None:
                 return embeds, saved
         except (RuntimeError, TypeError, ValueError, AttributeError):
@@ -82,8 +86,10 @@ def _saved_or_reference(
             ids,
             params,
             cfg,
-            save_intermediates=True,
+            save_intermediates=save_intermediates,
         )
+    if not save_intermediates:
+        return embeds, {}
     if saved is None:  # pragma: no cover - the reference always saves here
         raise RuntimeError("Leviathan reference forward returned no checkpoints")
     return embeds, saved
@@ -224,6 +230,97 @@ def _leviathan_forward_fake(
 
 
 @torch.library.custom_op(
+    "cut_cross_entropy::leviathan_inference",
+    mutates_args=(),
+    device_types="cuda",
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
+def _leviathan_inference_op(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> torch.Tensor:
+    """CUDA inference boundary with no backward checkpoints."""
+    params = {
+        "codebooks": codebooks.detach(),
+        "head_proj_weight": head_proj_weight.detach(),
+        "head_norm_weight": head_norm_weight.detach(),
+        "head_norm_bias": head_norm_bias.detach(),
+        "head_spline_delta": head_spline_delta.detach(),
+        "head_out_weight": head_out_weight.detach(),
+        "knot_grid": knot_grid.detach(),
+    }
+    cfg = _make_config(
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+        codebooks.dtype,
+    )
+    embeds, _ = _saved_or_reference(
+        ids.detach(),
+        params,
+        cfg,
+        save_intermediates=False,
+    )
+    return embeds
+
+
+@_leviathan_inference_op.register_fake
+def _leviathan_inference_fake(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> torch.Tensor:
+    del (
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        vocab_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+    )
+    return codebooks.new_empty((*ids.shape, hidden_size))
+
+
+@torch.library.custom_op(
     "cut_cross_entropy::leviathan_backward",
     mutates_args=(),
     device_types="cuda",
@@ -305,12 +402,18 @@ def _leviathan_backward_op(
         except (RuntimeError, TypeError, ValueError, AttributeError):
             grads = None
     if grads is None:
+        # Keep the compiler-boundary fallback bounded just like the regular
+        # autograd wrapper.  Without this limit, a Triton runtime failure on a
+        # long sequence would make _head_backward materialize its full-N
+        # basis/phi workset and could OOM while handling the failure.
+        chunk = getattr(cfg, "backward_chunk", None) or 8192
         grads = leviathan_backward(
             grad_out,
             params,
             cfg,
             saved=saved,
             ids=ids,
+            chunk=chunk,
         )
     return tuple(grads[key] for key in (
         "codebooks",
@@ -523,9 +626,18 @@ def leviathan_embedding_compiler_safe(
     if not ids.is_cuda or not params["codebooks"].is_cuda:
         from .autograd_fn import leviathan_apply
 
-        return leviathan_apply(ids, params, cfg)
+        fallback_params = dict(params)
+        fallback_params["knot_grid"] = knot_grid
+        return leviathan_apply(ids, fallback_params, cfg)
 
-    return _leviathan_forward_op(
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad
+        for name, tensor in params.items()
+        if name != "knot_grid"
+    )
+    op = _leviathan_forward_op if needs_backward else _leviathan_inference_op
+
+    result = op(
         ids,
         params["codebooks"],
         params["head_proj_weight"],
@@ -542,7 +654,8 @@ def leviathan_embedding_compiler_safe(
         int(cfg.generator_spline_degree),
         int(cfg.generator_k),
         int(getattr(cfg, "generator_krank", params["head_spline_delta"].shape[-1])),
-    ) [0]
+    )
+    return result[0] if needs_backward else result
 
 
 __all__ = ["leviathan_embedding_compiler_safe"]

@@ -68,29 +68,22 @@ def supports(cfg, variant: str = "exact") -> bool:
 
 
 def _reference_forward(ids, params, cfg):
-    """Oracle path: build the reference module from cfg and load the params."""
-    from .core import LeviathanConfig, LeviathanGenerator
+    """Differentiable oracle path using the supplied parameter tensors.
 
-    c = LeviathanConfig(
-        vocab_size=cfg.vocab_size,
-        hidden_size=cfg.hidden_size,
-        generator_d_seed=cfg.generator_d_seed,
-        generator_num_modes=cfg.generator_num_modes,
-        generator_num_knots=cfg.generator_num_knots,
-        generator_spline_degree=cfg.generator_spline_degree,
-        generator_k=cfg.generator_k,
-        generator_krank=cfg.generator_krank,
-        dtype=getattr(cfg, "dtype", torch.bfloat16),
+    Constructing a temporary module and loading a state dict here would copy
+    the inputs into fresh ``Parameter`` objects and disconnect their autograd
+    history.  The dict-based reference keeps the original tensors in the
+    computation graph and also honors an explicitly supplied knot grid.
+    """
+    from .backward_impl import leviathan_forward_ref
+
+    embeds, _ = leviathan_forward_ref(
+        ids,
+        params,
+        cfg,
+        save_intermediates=False,
     )
-    gen = LeviathanGenerator(c)
-    device = next(iter(params.values())).device
-    gen = gen.to(device=device, dtype=params["codebooks"].dtype)
-    state = {k: v for k, v in params.items() if k in gen.state_dict()}
-    gen.load_state_dict(state, strict=False)
-    if "knot_grid" in params:
-        gen.knot_grid = params["knot_grid"].to(device=device,
-                                               dtype=torch.float32)
-    return gen(ids)
+    return embeds
 
 
 def leviathan_embedding(ids, params, cfg, save_intermediates=False,

@@ -77,7 +77,9 @@ class LeviathanGenerator(nn.Module):
             )
 
         # Stage 1: shared codebooks C_1..C_k in R^{b x d_seed}
-        self.codebooks = nn.Parameter(torch.empty(self.k, b, self.d_seed))
+        self.codebooks = nn.Parameter(
+            torch.empty(self.k, b, self.d_seed, dtype=config.dtype)
+        )
 
         # Fixed knot grid over [0, 1] (kappa points), not learned.
         self.register_buffer(
@@ -86,21 +88,41 @@ class LeviathanGenerator(nn.Module):
 
         # Stage 2: per-head seed projections W_seed,l in R^{d_seed x d_seed}
         self.head_proj_weight = nn.Parameter(
-            torch.empty(self.num_modes, self.d_seed, self.d_seed)
+            torch.empty(
+                self.num_modes,
+                self.d_seed,
+                self.d_seed,
+                dtype=config.dtype,
+            )
         )
-        self.head_norm_weight = nn.Parameter(torch.ones(self.num_modes, self.d_seed))
-        self.head_norm_bias = nn.Parameter(torch.zeros(self.num_modes, self.d_seed))
+        self.head_norm_weight = nn.Parameter(
+            torch.ones(self.num_modes, self.d_seed, dtype=config.dtype)
+        )
+        self.head_norm_bias = nn.Parameter(
+            torch.zeros(self.num_modes, self.d_seed, dtype=config.dtype)
+        )
         self.head_norm_eps = 1e-5
 
         # Stage 3: spline coefficients S_l in R^{d_seed x kappa x r};
         # effective coefficient is (1 + head_spline_delta).
         self.head_spline_delta = nn.Parameter(
-            torch.empty(self.num_modes, self.d_seed, self.num_knots, self.krank)
+            torch.empty(
+                self.num_modes,
+                self.d_seed,
+                self.num_knots,
+                self.krank,
+                dtype=config.dtype,
+            )
         )
 
         # Stage 4: per-head output projections W_out,l in R^{r x D}
         self.head_out_weight = nn.Parameter(
-            torch.empty(self.num_modes, self.krank, self.hidden_size)
+            torch.empty(
+                self.num_modes,
+                self.krank,
+                self.hidden_size,
+                dtype=config.dtype,
+            )
         )
         self.reset_parameters()
 
