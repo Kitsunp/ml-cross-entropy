@@ -51,3 +51,11 @@ preserves the dDelta liveness optimization: the CUDA profile reduced the
 dominant dDelta kernel from about 3.50 ms to 2.75 ms without increasing peak
 memory.  Set `LEV_PREMUL_DMM=0` only for a diagnostic comparison; it does not
 change the reference fallback or the public API.
+
+The dDelta dot kernel also hoists the per-token-block `dM` and `M` loads out of
+the seed-dimension loop.  They are invariant in that loop, so this is the same
+real-valued expression and adds no workspace.  On the local SM120 audit it
+reduced backward/f+b medians by about 4–14% across the four article shapes,
+with identical peaks (0.115/0.142/0.333/0.435 GB).  The RTX 5090 path uses the
+same runtime capability/shared-memory selector; rerun the article harness on
+that GPU before changing its deterministic tile overrides.
