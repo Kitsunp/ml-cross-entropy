@@ -165,6 +165,14 @@ def _lev_bwd_ddelta_dot_kernel(
     for nb in tl.range(0, N, BLOCK_M, loop_unroll_factor=1):
         rows = nb + tl.arange(0, BLOCK_M)
         mask = rows < N
+        # dM and M are invariant across the seed dimensions in this tile.
+        # Hoist their loads so the compiler can overlap them with the basis
+        # construction and avoid repeating the traffic when BLOCK_D > 1.
+        dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK
+                     + rcols[None, :], mask=mask[:, None], other=0.0)
+        M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
+                    + rcols[None, :], mask=mask[:, None],
+                    other=0.0).to(tl.float32)
         # per-d of this tile: basis + phi + dphi, then acc += B^T @ dphi
         for di in tl.static_range(BLOCK_D):
             gcv = tl.load(gamma_ptr + m * D_SEED + dc + di)
@@ -184,11 +192,6 @@ def _lev_bwd_ddelta_dot_kernel(
             w3 = tl.where(gmask[None, :], w3, 0.0)
             denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
             bgn = w3 / denom                                  # [BM, KAPPA_P]
-            dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK
-                         + rcols[None, :], mask=mask[:, None], other=0.0)
-            M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
-                        + rcols[None, :], mask=mask[:, None],
-                        other=0.0).to(tl.float32)
             st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
                          + (dc + di) * (KAPPA * KRANK)
                          + (gcols_p % KAPPA)[:, None] * KRANK
