@@ -32,8 +32,17 @@ except ImportError:
 _MIN_D_CHUNK = 4
 
 
-def supports(cfg, variant: str = "exact") -> bool:
+def supports(
+    cfg,
+    variant: str = "exact",
+    *,
+    dtype_override: torch.dtype | None = None,
+) -> bool:
     """True if the Triton forward implements this config exactly.
+
+    ``dtype_override`` is for model integrations whose configuration object
+    does not carry the dtype of parameters after ``module.to(...)``.  It keeps
+    the check trace-friendly without cloning or mutating the config.
 
     Ranges (documented in README):
         k       2..4            (generator_k)
@@ -61,7 +70,11 @@ def supports(cfg, variant: str = "exact") -> bool:
               and 2 <= h <= 16
               and 64 <= D <= 2048 and D % 16 == 0
               and b ** k >= cfg.vocab_size
-              and getattr(cfg, "dtype", torch.bfloat16) == torch.bfloat16)
+              and (
+                  getattr(cfg, "dtype", torch.bfloat16)
+                  if dtype_override is None
+                  else dtype_override
+              ) == torch.bfloat16)
         return bool(ok)
     except (AttributeError, TypeError, ValueError):
         return False
