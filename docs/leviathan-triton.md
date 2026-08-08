@@ -44,3 +44,10 @@ Representative candidate-only results at D=2048,N=4096 were approximately
 and no N-scaled dDelta workspace.  The authoritative harness enforces a 10 GB
 peak budget; use the same harness for a target-GPU comparison before enabling
 architecture-specific overrides.
+
+The backward dot path also precomputes the seed-independent `dM * M` term
+in-place (`LEV_PREMUL_DMM=1`, the default) before the per-seed loop.  This
+preserves the dDelta liveness optimization: the CUDA profile reduced the
+dominant dDelta kernel from about 3.50 ms to 2.75 ms without increasing peak
+memory.  Set `LEV_PREMUL_DMM=0` only for a diagnostic comparison; it does not
+change the reference fallback or the public API.

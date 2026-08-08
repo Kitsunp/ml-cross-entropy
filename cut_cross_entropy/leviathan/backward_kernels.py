@@ -434,6 +434,12 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
         from . import backward_dot_kernels as bdk
 
         dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
+        premul_dmm = os.environ.get("LEV_PREMUL_DMM", "1") != "0"
+        if premul_dmm:
+            # dM*M is independent of the seed dimension.  Keep the product in
+            # the existing intermediate so the Triton kernels only load the
+            # premultiplied value and promote it to FP32 for division.
+            dM.mul_(M_c)
         # Measured defaults: on Blackwell SM120, BM=128/w4/s1 gives the
         # best dDelta throughput once there are enough token rows to fill the
         # larger tile. Short N<256 training blocks keep BM=32 so launch
@@ -477,7 +483,8 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
                 D_SEED=d, KAPPA=kappa, KAPPA_P=max(kappa, 16), KRANK=krank, H_=h,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
-                FUSE_CHAIN=True, USE_T=use_t, **ddelta_launch_kwargs)
+                FUSE_CHAIN=True, PREMUL_DMM=premul_dmm, USE_T=use_t,
+                **ddelta_launch_kwargs)
             grid_ln = (h, num_blocks)
             bdk._lev_bwd_ln_kernel[grid_ln](
                 xhat_c, rsqrt_c, dzh, N,
@@ -501,6 +508,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
                 D_SEED=d, KAPPA=kappa, KAPPA_P=max(kappa, 16), KRANK=krank, H_=h,
                 BLOCK_M=dot_chain_block_m, BLOCK_K=min(64, d),
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee, USE_T=use_t,
+                PREMUL_DMM=premul_dmm,
                 num_warps=4, num_stages=1)
             grid3 = (h, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
@@ -511,7 +519,8 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
                 D_SEED=d, KAPPA=kappa, KAPPA_P=max(kappa, 16), KRANK=krank, H_=h,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
-                FUSE_CHAIN=False, USE_T=use_t, **ddelta_launch_kwargs)
+                FUSE_CHAIN=False, PREMUL_DMM=premul_dmm, USE_T=use_t,
+                **ddelta_launch_kwargs)
             grid2 = (h, d // 32)
             _lev_bwd_stats_kernel[grid2](
                 dgamma_partial, dbeta_partial, dgamma, dbeta, num_blocks,

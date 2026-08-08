@@ -26,7 +26,7 @@ def _lev_bwd_chain_dot_kernel(
     KRANK: tl.constexpr, H_: tl.constexpr, BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
-    USE_T: tl.constexpr,
+    PREMUL_DMM: tl.constexpr, USE_T: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -85,7 +85,8 @@ def _lev_bwd_chain_dot_kernel(
             phi = tl.dot(bgn, st, input_precision="ieee")     # [BM, KRANK]
         else:
             phi = tl.dot(bgn, st, input_precision="tf32x3")
-        dphi = (dM * M * tl.where(phi >= 0, 1.0, -1.0)
+        dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
+                * tl.where(phi >= 0, 1.0, -1.0)
                 / (tl.abs(phi) + LOG_EPS))                    # [BM, KRANK]
         # dB via dot over r: [BM, KRANK] @ [KRANK, KAPPA]
         if DOT_IEEE:
@@ -138,7 +139,7 @@ def _lev_bwd_ddelta_dot_kernel(
     KRANK: tl.constexpr, H_: tl.constexpr, BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr, BLOCK_R: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
-    FUSE_CHAIN: tl.constexpr,
+    FUSE_CHAIN: tl.constexpr, PREMUL_DMM: tl.constexpr,
     USE_T: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -198,7 +199,8 @@ def _lev_bwd_ddelta_dot_kernel(
                 phi = tl.dot(bgn, st, input_precision="ieee")  # [BM, BLOCK_R]
             else:
                 phi = tl.dot(bgn, st, input_precision="tf32x3")
-            dphi = (dM * M * tl.where(phi >= 0, 1.0, -1.0)
+            dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
+                    * tl.where(phi >= 0, 1.0, -1.0)
                     / (tl.abs(phi) + LOG_EPS))
             if FUSE_CHAIN:
                 # The old chain kernel performed this same dB -> dt -> dy
