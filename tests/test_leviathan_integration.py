@@ -134,6 +134,26 @@ def test_supported_dispatch_routes_trainable_params_through_autograd(
     )
 
 
+def test_compiler_boundary_propagates_runtime_launch_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed Triton launch must not run reference work on the same stream."""
+    import cut_cross_entropy.leviathan.compiler as compiler
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg)
+    params = _detached_params(generator)
+    ids = torch.randint(cfg.vocab_size, (2, 8))
+
+    def failed_forward(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("synthetic Triton launch failure")
+
+    monkeypatch.setattr(compiler, "_leviathan_forward", failed_forward)
+    with pytest.raises(RuntimeError, match="synthetic Triton launch failure"):
+        compiler._saved_or_reference(ids, params, cfg)
+
+
 def test_neollm_adapter_preserves_reference_fallback() -> None:
     cfg = _config(dtype=torch.float32)
     reference = LeviathanGenerator(cfg)
