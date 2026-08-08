@@ -39,6 +39,26 @@ The automatic dispatch admits Blackwell CC10.x (including B100/B200) and
 CC12.x devices. The CC10.x route is enabled at the code level but still needs
 validation on the target system; Hopper CC9.x devices such as H100, H200, and
 GH200 are intentionally left on FP32 because they are not validated here.
+The split-V forward path chooses its tile, split count, and reduction block
+analytically with a two-times live-footprint guard; it does not benchmark a
+brute-force set of Triton graphs during compilation.
+
+Split-V is an opt-in CCE optimization, not the default execution path. The
+normal `auto` mode stays on the historical lock reduction unless
+`CCE_SPLIT_V=1` is set. With the flag enabled, the bounded automatic policy
+selects Split-V only for validated CC12.x BF16/FP16 cases without MiLe's
+weighted-logit moment and with `B <= 512`. Use
+`CCE_FORWARD_REDUCTION=lock` to force the baseline or
+`CCE_FORWARD_REDUCTION=split` for an explicit benchmark/debug run. The latter
+can use the conservative CC10.x compatibility profile only with
+`CCE_SPLIT_V_ALLOW_UNVALIDATED=1`; B100/B200 execution remains unvalidated. If the
+selector cannot produce at least two splits, the explicit request falls back to
+the lock path rather than launching a one-way staged reduction.
+
+The flow is shown in
+[the Split-V kernel diagram](assets/split_v_kernel.svg), and the full policy,
+memory bound, cache behavior, and fallback rules are in
+[docs/cce-modernization.md](docs/cce-modernization.md#split-v-staged-reduction).
 
 ### Basic usage
 
@@ -509,3 +529,4 @@ This sample code is released under the [LICENSE](LICENSE) terms.
 Our codebase is built using multiple opensource contributions, please see [Acknowledgements](ACKNOWLEDGEMENTS.md) for more details.
 
 Please check the paper for a complete list of references and datasets used in this work.
+
