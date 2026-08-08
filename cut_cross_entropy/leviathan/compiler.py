@@ -4,8 +4,10 @@ The raw Triton launch contains Python dispatch and tensor indexing that should
 not be traced by TorchDynamo.  This module mirrors the CCE compiler boundary:
 the CUDA custom op owns the launch, saves the lean LEV checkpoints, and calls a
 second opaque custom op for the backward.  If the Triton implementation is
-missing or rejects a runtime configuration, the backend executes the verified
-reference implementation instead.
+missing or the configuration is unsupported, the backend executes the verified
+reference implementation instead. Runtime launch failures are propagated rather
+than followed by reference work on the same CUDA stream; this is important when
+the caller is using CUDA Graph Trees.
 """
 
 from __future__ import annotations
@@ -76,9 +78,11 @@ def _saved_or_reference(
                 return embeds, {}
             if saved is not None:
                 return embeds, saved
-        except (RuntimeError, TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError):
             # The reference path is the semantic fallback for unsupported
-            # shapes, missing CUDA launch support, and Triton runtime errors.
+            # metadata/configurations. Do not catch CUDA launch failures here:
+            # executing the reference after a failed launch can invalidate the
+            # surrounding CUDA-graph/FlashAttention partition.
             pass
 
     with torch.no_grad():
@@ -399,13 +403,13 @@ def _leviathan_backward_op(
                 saved,
                 ids,
             )
-        except (RuntimeError, TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError):
             grads = None
     if grads is None:
         # Keep the compiler-boundary fallback bounded just like the regular
-        # autograd wrapper.  Without this limit, a Triton runtime failure on a
-        # long sequence would make _head_backward materialize its full-N
-        # basis/phi workset and could OOM while handling the failure.
+        # autograd wrapper. This path is used when the Triton backward is
+        # unavailable or rejects metadata; a long sequence must not make the
+        # reference _head_backward materialize its full-N basis/phi workset.
         chunk = getattr(cfg, "backward_chunk", None) or 8192
         grads = leviathan_backward(
             grad_out,
