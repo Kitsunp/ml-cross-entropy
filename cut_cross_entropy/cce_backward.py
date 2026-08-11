@@ -124,8 +124,7 @@ def _fp16_accum_scale(grad_scale: float, max_weight: float = 1.0) -> float:
         # scaled target contribution below the finite FP16 range.
         available = min(
             available,
-            torch.finfo(torch.float16).max
-            / (abs(grad_scale) * max_weight),
+            torch.finfo(torch.float16).max / (abs(grad_scale) * max_weight),
         )
     if available < 2.0:
         return 1.0
@@ -204,13 +203,9 @@ def _auto_fp16_accumulation_dtypes(
 
     dim = e.size(1)
     vocab = c.size(0)
-    eligible = (
-        (
-            dim >= 256
-            and (effective_b + vocab) * dim >= _AUTO_FP16_OUTPUT_ELEMENTS
-        )
-        or min(effective_b, vocab) * dim >= _AUTO_FP16_MIN_SURFACE_ELEMENTS
-    )
+    eligible = (dim >= 256 and (effective_b + vocab) * dim >= _AUTO_FP16_OUTPUT_ELEMENTS) or min(
+        effective_b, vocab
+    ) * dim >= _AUTO_FP16_MIN_SURFACE_ELEMENTS
     if not eligible:
         return False, False
 
@@ -219,6 +214,108 @@ def _auto_fp16_accumulation_dtypes(
     # FP16 CCE path as the no-μ case without mixing the regularizer into the
     # scaled accumulator. The opt-out keeps the historical FP32 destination.
     return True, mu is None or os.getenv("CCE_MU_FUSED_CAST", "1") != "0"
+
+
+@triton.jit
+def _cce_target_backward_kernel(
+    E,
+    C,
+    MiLeWeight,
+    dOut,
+    Valids,
+    Targets,
+    dE,
+    dC,
+    dBias,
+    grad_scale,
+    de_accum_scale,
+    dc_accum_scale,
+    B,
+    D,
+    V,
+    BMax,
+    stride_eb,
+    stride_ed,
+    stride_cv,
+    stride_cd,
+    stride_vb,
+    shift,
+    BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_VALIDS: tl.constexpr,
+    HAS_MILE: tl.constexpr,
+    ITEM_DO: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
+    COMPUTE_DE: tl.constexpr,
+    COMPUTE_DC: tl.constexpr,
+    COMPUTE_DBIAS: tl.constexpr,
+):
+    direct_rows = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    row_mask = direct_rows < B
+
+    if HAS_VALIDS:
+        rows = tl.load(Valids + direct_rows * stride_vb, mask=row_mask, other=BMax).to(tl.int64)
+    else:
+        rows = direct_rows.to(tl.int64)
+
+    target_rows = rows + shift if HAS_SHIFT else rows
+    targets = tl.load(
+        Targets + target_rows,
+        mask=row_mask & (target_rows < BMax),
+        other=V,
+    ).to(tl.int64)
+    valid_target = row_mask & (targets < V)
+
+    if ITEM_DO:
+        coefficient = -grad_scale * tl.load(dOut)
+    else:
+        coefficient = -grad_scale * tl.load(
+            dOut + target_rows,
+            mask=row_mask & (target_rows < BMax),
+            other=0.0,
+        )
+    if HAS_MILE:
+        coefficient *= tl.load(MiLeWeight + direct_rows, mask=row_mask, other=0.0)
+
+    tile_mask = valid_target[:, None] & (offs_d[None, :] < D)
+    if COMPUTE_DE:
+        c = tl.load(
+            C + targets[:, None] * stride_cv + offs_d[None, :] * stride_cd,
+            mask=tile_mask,
+            other=0.0,
+        )
+        de_ptrs = dE + rows[:, None] * stride_eb + offs_d[None, :] * stride_ed
+        old_de = tl.load(de_ptrs, mask=tile_mask, other=0.0)
+        tl.store(
+            de_ptrs,
+            old_de + coefficient[:, None] * de_accum_scale * c,
+            mask=tile_mask,
+        )
+
+    if COMPUTE_DC:
+        e = tl.load(
+            E + rows[:, None] * stride_eb + offs_d[None, :] * stride_ed,
+            mask=tile_mask,
+            other=0.0,
+        )
+        dc_ptrs = dC + targets[:, None] * stride_cv + offs_d[None, :] * stride_cd
+        tl.atomic_add(
+            dc_ptrs,
+            coefficient[:, None] * dc_accum_scale * e,
+            mask=tile_mask,
+            sem="relaxed",
+            scope="gpu",
+        )
+
+    if COMPUTE_DBIAS:
+        tl.atomic_add(
+            dBias + targets,
+            coefficient,
+            mask=valid_target & (tl.program_id(1) == 0),
+            sem="relaxed",
+            scope="gpu",
+        )
 
 
 @triton.jit
@@ -332,6 +429,7 @@ def _cce_backward_kernel(
     MM_BACK_BLOCK_D: tl.constexpr,
     GROUP_B: tl.constexpr,
     EVEN_D: tl.constexpr,
+    EVEN_V: tl.constexpr,
     MM_BACK_EVEN_D: tl.constexpr,
     ITEM_DO: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -349,6 +447,7 @@ def _cce_backward_kernel(
     COMPUTE_DBIAS: tl.constexpr,
     SCALE_DE: tl.constexpr,
     SCALE_DC: tl.constexpr,
+    SHARED_ACCUM_SCALE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -365,9 +464,11 @@ def _cce_backward_kernel(
     if HAS_VALIDS:
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
 
-    offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
+    direct_offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
+    v_mask = True if EVEN_V else direct_offs_v < V
+    offs_v = direct_offs_v
     if HAS_VOCAB_ORDERING:
-        offs_v = tl.load(VocabOrdering + offs_v, mask=offs_v < V, other=V).to(tl.int64)
+        offs_v = tl.load(VocabOrdering + direct_offs_v, mask=v_mask, other=0).to(tl.int64)
 
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
@@ -381,7 +482,7 @@ def _cce_backward_kernel(
 
         e = tl.load(e_ptrs, mask=e_mask, other=0.0)
 
-        c_mask = offs_v[None, :] < V
+        c_mask = v_mask[None, :] if not EVEN_V else True
         if not EVEN_D:
             c_mask = c_mask & (offs_d[:, None] < (D - d * BLOCK_D))
 
@@ -392,11 +493,16 @@ def _cce_backward_kernel(
         e_ptrs += BLOCK_D * stride_ed
         c_ptrs += BLOCK_D * stride_cd
 
-    tl.debug_barrier()
-
     accum = accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
     if HAS_BIAS:
-        bias = tl.load(Bias + offs_v * stride_biasv, mask=offs_v < V, other=0.0)
+        if EVEN_V:
+            bias = tl.load(Bias + offs_v * stride_biasv)
+        else:
+            bias = tl.load(
+                Bias + offs_v * stride_biasv,
+                mask=v_mask,
+                other=0.0,
+            )
         accum += bias[None, :]
 
     if HAS_SOFTCAP:
@@ -410,7 +516,8 @@ def _cce_backward_kernel(
 
     accum = accum.cast(tl.float32)
     probabilities = tl.exp(accum - lse[:, None])
-    probabilities = tl.where(offs_v[None, :] < V, probabilities, 0.0)
+    if not EVEN_V:
+        probabilities = tl.where(v_mask[None, :], probabilities, 0.0)
     d_accum = probabilities
 
     if HAS_TARGETS:
@@ -431,9 +538,7 @@ def _cce_backward_kernel(
         else:
             mile_offs_b = offs_b
         mile_row_mask = mile_offs_b < B
-        mile_weight = tl.load(
-            MiLeWeight + mile_offs_b, mask=mile_row_mask, other=0.0
-        )[:, None]
+        mile_weight = tl.load(MiLeWeight + mile_offs_b, mask=mile_row_mask, other=0.0)[:, None]
         d_accum = mile_weight * d_accum
 
     should_skip = False
@@ -483,9 +588,16 @@ def _cce_backward_kernel(
         d_accum = tl_softcapping_grad(d_accum, accum, softcap)
 
     if COMPUTE_DBIAS:
-        tl.atomic_add(dBias + offs_v * stride_biasv, tl.sum(d_accum, 0), mask=offs_v < V)
+        tl.atomic_add(
+            dBias + offs_v * stride_biasv,
+            tl.sum(d_accum, 0),
+            mask=None if EVEN_V else v_mask,
+        )
 
-    d_accum = d_accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+    if SHARED_ACCUM_SCALE:
+        d_accum = (d_accum * de_accum_scale).cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+    else:
+        d_accum = d_accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
 
     if COMPUTE_DE:
         if FILTER_E_GRAD:
@@ -501,15 +613,19 @@ def _cce_backward_kernel(
                 de_locks = dELocks + lock_offset
 
             _mm_backward(
-                _maybe_scale_gradient_tile(
-                    d_accum, de_accum_scale, E.dtype.element_ty, SCALE_DE
+                (
+                    d_accum
+                    if SHARED_ACCUM_SCALE
+                    else _maybe_scale_gradient_tile(
+                        d_accum, de_accum_scale, E.dtype.element_ty, SCALE_DE
+                    )
                 ),
                 dE + (offs_b[:, None] * stride_eb),
                 offs_b[:, None] < BMax,
                 de_locks,
                 n_de_locks_1,
                 C + offs_v[:, None] * stride_cv,
-                offs_v[:, None] < V,
+                True if EVEN_V else v_mask[:, None],
                 stride_ed,
                 stride_cd,
                 D,
@@ -534,12 +650,14 @@ def _cce_backward_kernel(
 
             _mm_backward(
                 tl.trans(
-                    _maybe_scale_gradient_tile(
+                    d_accum
+                    if SHARED_ACCUM_SCALE
+                    else _maybe_scale_gradient_tile(
                         d_accum, dc_accum_scale, E.dtype.element_ty, SCALE_DC
                     )
                 ),
                 dC + (offs_v[:, None] * stride_cv),
-                offs_v[:, None] < V,
+                True if EVEN_V else v_mask[:, None],
                 dc_locks,
                 n_dc_locks_1,
                 E + (offs_b[:, None] * stride_eb),
@@ -559,12 +677,11 @@ def _cce_back_block_d(args) -> int:
     return 2 * block_d
 
 
-_cce_backward_kernel = triton.jit(
-    _cce_backward_kernel, do_not_specialize=["MODE", "B_BIN"]
-)
+_cce_backward_kernel = triton.jit(_cce_backward_kernel, do_not_specialize=["MODE", "B_BIN"])
 _cce_backward_kernel = triton.heuristics(  # type: ignore
     {
         "EVEN_D": lambda args: (args["D"] % args["BLOCK_D"]) == 0,
+        "EVEN_V": lambda args: (args["V"] % args["BLOCK_V"]) == 0,
         "MM_BACK_BLOCK_D": lambda args: _cce_back_block_d(args),
         "MM_BACK_EVEN_D": lambda args: (args["D"] % _cce_back_block_d(args)) == 0,
         "HAS_VALIDS": lambda args: args["Valids"] is not None,
@@ -576,16 +693,18 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "HAS_MILE": lambda args: args["MiLeWeight"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "ITEM_DO": lambda args: args["dOut"].numel() == 1,
-        "GROUP_B": lambda args: 8,
+        "GROUP_B": lambda args: 16,
         "COMPUTE_DC": lambda args: args["dC"] is not None,
         "COMPUTE_DE": lambda args: args["dE"] is not None,
         "COMPUTE_DBIAS": lambda args: args["dBias"] is not None,
         # MiLe forward computes its weighted-logit moment with IEEE products;
         # reconstruct logits with the same precision so backward differentiates
         # the loss that was actually evaluated.
-        "DOT_PRECISION": lambda args: "ieee"
-        if args["MiLeWeight"] is not None
-        else ("tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"),
+        "DOT_PRECISION": lambda args: (
+            "ieee"
+            if args["MiLeWeight"] is not None
+            else ("tf32" if torch.get_float32_matmul_precision() == "high" else "ieee")
+        ),
     }
 )(_cce_backward_kernel)
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
@@ -640,13 +759,9 @@ def cce_backward_kernel(
     dc_accum_dtype = os.getenv("CCE_DC_ACCUM_DTYPE", default_accum_dtype)
     valid_accum_dtypes = {"auto", "fp32", "fp16", "bf16"}
     if de_accum_dtype not in valid_accum_dtypes:
-        raise ValueError(
-            "CCE_DE_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'"
-        )
+        raise ValueError("CCE_DE_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'")
     if dc_accum_dtype not in valid_accum_dtypes:
-        raise ValueError(
-            "CCE_DC_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'"
-        )
+        raise ValueError("CCE_DC_ACCUM_DTYPE must be 'auto', 'fp32', 'fp16', or 'bf16'")
     if (de_accum_dtype == "auto") != (dc_accum_dtype == "auto"):
         raise ValueError(
             "CCE_DE_ACCUM_DTYPE and CCE_DC_ACCUM_DTYPE must both be 'auto' "
@@ -715,23 +830,19 @@ def cce_backward_kernel(
     use_atomic_e = (
         backward_reduction != "lock"
         and de is not None
-        and (
-            de.dtype == torch.float32
-            or (accum_e_fp32 and de_accum_dtype != "fp32")
-        )
+        and (de.dtype == torch.float32 or (accum_e_fp32 and de_accum_dtype != "fp32"))
     )
     use_atomic_c = (
         backward_reduction != "lock"
         and dc is not None
-        and (
-            dc.dtype == torch.float32
-            or (accum_c_fp32 and dc_accum_dtype != "fp32")
-        )
+        and (dc.dtype == torch.float32 or (accum_c_fp32 and dc_accum_dtype != "fp32"))
     )
     fp16_scale_mode = os.getenv("CCE_FP16_ACCUM_SCALE", "auto")
     if fp16_scale_mode not in {"auto", "off"}:
         raise ValueError("CCE_FP16_ACCUM_SCALE must be 'auto' or 'off'")
-    mile_weight_bound = _mile_weight_bound(c.size(0), mile_gamma) if mile_weight is not None else 1.0
+    mile_weight_bound = (
+        _mile_weight_bound(c.size(0), mile_gamma) if mile_weight is not None else 1.0
+    )
     safe_scale = (
         _fp16_accum_scale(grad_scale, mile_weight_bound)
         if fp16_scale_mode == "auto" and dlse is None
@@ -740,9 +851,7 @@ def cce_backward_kernel(
     de_accum_scale = safe_scale if de is not None and de.dtype == torch.float16 else 1.0
     dc_accum_scale = (
         safe_scale
-        if dc is not None
-        and dc.dtype == torch.float16
-        and (mu is None or mu_fp16_fastpath)
+        if dc is not None and dc.dtype == torch.float16 and (mu is None or mu_fp16_fastpath)
         else 1.0
     )
 
@@ -778,19 +887,26 @@ def cce_backward_kernel(
         lse = lse.contiguous()
         assert do.stride(0) == lse.stride(0), f"{do.stride()=}, {lse.stride()=}"
 
-    def grid(META):
-        return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(c.size(0), META["BLOCK_V"]),)
-
     if vocab_ordering is not None:
         assert vocab_ordering.ndim == 1
         assert vocab_ordering.numel() == c.size(0)
         assert vocab_ordering.stride(0) == 1
 
+    # The one-hot target term is sparse in vocabulary.  Without softcapping,
+    # apply it as an indexed O(B*D) update after the dense probability kernel
+    # once the dense BxV work is large enough to repay the extra launch.  Tiny
+    # problems keep the already-supported fused path, where launch latency is
+    # more expensive than the target comparison.
+    separate_target = (
+        targets is not None
+        and softcap is None
+        and B * c.size(0) >= 1 << 24
+    )
+    kernel_targets = None if separate_target else targets
+
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None and not use_atomic_e:
-        de_locks = e.new_zeros(
-            (triton.cdiv(B, CCE_LOCK_BLOCK_B), nd_locks), dtype=torch.int32
-        )
+        de_locks = e.new_zeros((triton.cdiv(B, CCE_LOCK_BLOCK_B), nd_locks), dtype=torch.int32)
         de_lock_sizes = de_locks.size()
     else:
         de_locks = None
@@ -805,73 +921,137 @@ def cce_backward_kernel(
         dc_locks = None
         dc_lock_sizes = (None, 1)
 
-    _cce_backward_kernel[grid](
-        e,
+    def launch_vocab_slice(
+        c_slice: torch.Tensor,
+        bias_slice: torch.Tensor | None,
+        dc_slice: torch.Tensor | None,
+        dbias_slice: torch.Tensor | None,
+        ordering_slice: torch.Tensor | None,
+        slice_v: int,
+    ) -> None:
+        def grid(META):
+            return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(slice_v, META["BLOCK_V"]),)
+
+        _cce_backward_kernel[grid](
+            e,
+            c_slice,
+            bias_slice,
+            lse,
+            mile_weight,
+            do,
+            grad_scale,
+            dlse,
+            valids,
+            ordering_slice,
+            softcap,
+            kernel_targets,
+            de,
+            de_locks,
+            dc_slice,
+            dc_locks,
+            dbias_slice,
+            B,
+            e.size(1),
+            slice_v,
+            e.size(0),
+            de_lock_sizes[1],
+            dc_lock_sizes[1],
+            e.stride(0),
+            e.stride(1),
+            c_slice.stride(0),
+            c_slice.stride(1),
+            1 if bias_slice is None else bias_slice.stride(0),
+            1 if valids is None else valids.stride(0),
+            filter_eps,
+            de_accum_scale,
+            dc_accum_scale,
+            shift=shift,
+            MODE=(
+                (
+                    bias_slice is not None
+                    or valids is not None
+                    or ordering_slice is not None
+                    or kernel_targets is not None
+                    or shift != 0
+                )
+                | ((softcap is not None or dlse is not None) << 1)
+                | ((mile_weight is not None) << 2)
+                | ((de is not None) << 3)
+                | ((dc_slice is not None) << 4)
+                | ((dbias_slice is not None) << 5)
+                | (
+                    ((filter_e_grad and de is not None) or (filter_c_grad and dc_slice is not None))
+                    << 6
+                )
+                | ((do.numel() == 1) << 7)
+                | ((use_atomic_e or use_atomic_c) << 8)
+            ),
+            B_BIN=b_bin_fn(B),
+            LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
+            LOCK_BLOCK_V=CCE_LOCK_BLOCK_V,
+            USE_ATOMIC_E=use_atomic_e,
+            USE_ATOMIC_C=use_atomic_c,
+            SCALE_DE=de_accum_scale != 1.0,
+            SCALE_DC=dc_accum_scale != 1.0,
+            SHARED_ACCUM_SCALE=(
+                de is not None
+                and dc_slice is not None
+                and de_accum_scale != 1.0
+                and de_accum_scale == dc_accum_scale
+            ),
+            FILTER_E_GRAD=filter_e_grad and de is not None,
+            FILTER_C_GRAD=filter_c_grad and dc_slice is not None,
+        )
+
+    launch_vocab_slice(
         c,
         bias,
-        lse,
-        mile_weight,
-        do,
-        grad_scale,
-        dlse,
-        valids,
-        vocab_ordering,
-        softcap,
-        targets,
-        de,
-        de_locks,
         dc,
-        dc_locks,
         dbias,
-        B,
-        e.size(1),
+        vocab_ordering,
         c.size(0),
-        e.size(0),
-        de_lock_sizes[1],
-        dc_lock_sizes[1],
-        e.stride(0),
-        e.stride(1),
-        c.stride(0),
-        c.stride(1),
-        1 if bias is None else bias.stride(0),
-        1 if valids is None else valids.stride(0),
-        filter_eps,
-        de_accum_scale,
-        dc_accum_scale,
-        shift=shift,
-        MODE=(
-            (
-                bias is not None
-                or valids is not None
-                or vocab_ordering is not None
-                or targets is not None
-                or shift != 0
-            )
-            | ((softcap is not None or dlse is not None) << 1)
-            | ((mile_weight is not None) << 2)
-            | ((de is not None) << 3)
-            | ((dc is not None) << 4)
-            | ((dbias is not None) << 5)
-            | (
-                (
-                    (filter_e_grad and de is not None)
-                    or (filter_c_grad and dc is not None)
-                )
-                << 6
-            )
-            | ((do.numel() == 1) << 7)
-            | ((use_atomic_e or use_atomic_c) << 8)
-        ),
-        B_BIN=b_bin_fn(B),
-        LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
-        LOCK_BLOCK_V=CCE_LOCK_BLOCK_V,
-        USE_ATOMIC_E=use_atomic_e,
-        USE_ATOMIC_C=use_atomic_c,
-        SCALE_DE=de_accum_scale != 1.0,
-        SCALE_DC=dc_accum_scale != 1.0,
-        FILTER_E_GRAD=filter_e_grad and de is not None,
-        FILTER_C_GRAD=filter_c_grad and dc is not None,
     )
+
+    if separate_target:
+        assert targets is not None
+        target_block_b = 64
+        target_block_d = 64
+        _cce_target_backward_kernel[
+            (triton.cdiv(B, target_block_b), triton.cdiv(e.size(1), target_block_d))
+        ](
+            e,
+            c,
+            mile_weight,
+            do,
+            valids,
+            targets,
+            de,
+            dc,
+            dbias,
+            grad_scale,
+            de_accum_scale,
+            dc_accum_scale,
+            B,
+            e.size(1),
+            c.size(0),
+            e.size(0),
+            e.stride(0),
+            e.stride(1),
+            c.stride(0),
+            c.stride(1),
+            1 if valids is None else valids.stride(0),
+            shift,
+            BLOCK_B=target_block_b,
+            BLOCK_D=target_block_d,
+            HAS_VALIDS=valids is not None,
+            HAS_MILE=mile_weight is not None,
+            ITEM_DO=do.numel() == 1,
+            HAS_SHIFT=shift != 0,
+            COMPUTE_DE=de is not None,
+            COMPUTE_DC=dc is not None,
+            COMPUTE_DBIAS=dbias is not None,
+            num_warps=4,
+        )
 
     if reduce_e_grad and de is not None:
         de = vp_reduce_e_grad(de, pg)

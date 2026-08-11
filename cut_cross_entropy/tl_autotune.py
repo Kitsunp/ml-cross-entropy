@@ -449,7 +449,7 @@ def _cce_backward_low_smem_config() -> Config:
     four warps keeps the same 128x128 tensor-core tile within the lower budget.
     This avoids the severe launch-count increase of the old 32x128 fallback.
     """
-    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
+    return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=16), num_warps=4, num_stages=2)
 
 
 def _cce_backward_heuristic_config() -> Config:

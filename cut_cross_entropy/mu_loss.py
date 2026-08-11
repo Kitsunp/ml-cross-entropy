@@ -35,6 +35,62 @@ def _output_embedding_sum_kernel(
 
 
 @triton.jit
+def _output_embedding_partial_sum_kernel(
+    C,
+    PartialSums,
+    V,
+    D,
+    stride_cv,
+    stride_cd,
+    BLOCK_V: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    pid_d = tl.program_id(axis=0)
+    pid_split = tl.program_id(axis=1)
+    offs_d = (pid_d * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+    offs_v = tl.arange(0, BLOCK_V).to(tl.int64)
+    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    for block_v in range(pid_split, tl.cdiv(V, BLOCK_V), NUM_SPLITS):
+        rows = block_v * BLOCK_V + offs_v
+        values = tl.load(
+            C + rows[:, None] * stride_cv + offs_d[None, :] * stride_cd,
+            mask=(rows[:, None] < V) & (offs_d[None, :] < D),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(values, axis=0)
+
+    tl.store(
+        PartialSums + pid_split * D + offs_d,
+        accumulator,
+        mask=offs_d < D,
+    )
+
+
+@triton.jit
+def _reduce_embedding_partial_sums_kernel(
+    PartialSums,
+    EmbeddingSum,
+    D,
+    BLOCK_D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    offs_d = (tl.program_id(axis=0) * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+    offs_split = tl.arange(0, NUM_SPLITS)
+    partials = tl.load(
+        PartialSums + offs_split[:, None] * D + offs_d[None, :],
+        mask=offs_d[None, :] < D,
+        other=0.0,
+    )
+    tl.store(
+        EmbeddingSum + offs_d,
+        tl.sum(partials, axis=0),
+        mask=offs_d < D,
+    )
+
+
+@triton.jit
 def _mu_loss_finalize_kernel(
     EmbeddingSum,
     VocabSize,
@@ -91,16 +147,45 @@ def mu_loss_forward_kernel(
     assert c.is_cuda
     vocab_size, embedding_dim = c.shape
     embedding_sum = torch.empty(embedding_dim, device=c.device, dtype=torch.float32)
-    _output_embedding_sum_kernel[(triton.cdiv(embedding_dim, 32),)](
-        c,
-        embedding_sum,
-        vocab_size,
-        embedding_dim,
-        c.stride(0),
-        c.stride(1),
-        BLOCK_V=128,
-        BLOCK_D=32,
-    )
+    vocab_blocks = triton.cdiv(vocab_size, 128)
+    dimension_blocks = triton.cdiv(embedding_dim, 32)
+    sms = torch.cuda.get_device_properties(c.device).multi_processor_count
+    desired_splits = triton.next_power_of_2(max(1, triton.cdiv(2 * sms, dimension_blocks)))
+    available_splits = triton.next_power_of_2(vocab_blocks + 1) // 2
+    num_splits = min(available_splits, 32, desired_splits)
+    if num_splits == 1:
+        _output_embedding_sum_kernel[(triton.cdiv(embedding_dim, 32),)](
+            c,
+            embedding_sum,
+            vocab_size,
+            embedding_dim,
+            c.stride(0),
+            c.stride(1),
+            BLOCK_V=128,
+            BLOCK_D=32,
+        )
+    else:
+        partial_sums = torch.empty(
+            (num_splits, embedding_dim), device=c.device, dtype=torch.float32
+        )
+        _output_embedding_partial_sum_kernel[(triton.cdiv(embedding_dim, 32), num_splits)](
+            c,
+            partial_sums,
+            vocab_size,
+            embedding_dim,
+            c.stride(0),
+            c.stride(1),
+            BLOCK_V=128,
+            BLOCK_D=32,
+            NUM_SPLITS=num_splits,
+        )
+        _reduce_embedding_partial_sums_kernel[(triton.cdiv(embedding_dim, 32),)](
+            partial_sums,
+            embedding_sum,
+            embedding_dim,
+            BLOCK_D=32,
+            NUM_SPLITS=num_splits,
+        )
 
     global_vocab_size = torch.tensor(float(vocab_size), device=c.device, dtype=torch.float32)
     if vocab_parallel:

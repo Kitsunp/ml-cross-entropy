@@ -4,6 +4,12 @@ This document records the July 2026 modernization of the Cut Cross-Entropy
 (CCE) Triton implementation. It focuses on the `cce_kahan_full_c` preset, while
 also covering changes shared by the forward and backward kernels.
 
+The original engineering and measurements are preserved here. The subsequent
+August work is documented separately in
+[CCE Blackwell engineering update 2](cce-blackwell-update-2.md), including its
+sparse target flow, revised fixed geometry, compiler-boundary correction,
+repeated-step precision checks, and RTX 5070 Ti/5090 measurements.
+
 ## Goals and non-goals
 
 The work had five concrete goals:
@@ -156,11 +162,13 @@ bias values from padded rows could be included in the average.
 
 Backward still uses tiled gradient accumulation, but its lock topology now
 matches the minimum candidate tiles (`B=16`, `V=32`). This removes false sharing
-between independent candidate tiles. The default BF16/FP16 scheduler is
-`128 x 128 x 32`, eight warps, and three stages on parts with enough shared
-memory. When the device reports less than 106,496 bytes of shared memory per
-block, the selector keeps the same `128 x 128 x 32` tile but uses four warps and
-three stages. Reducing the old fallback to `32 x 128 x 32` avoided the allocation
+between independent candidate tiles. The default BF16/FP16 scheduler introduced
+in this update was `128 x 128 x 32`, eight warps, and three stages on parts with
+enough shared memory. At the conclusion of the first update, devices reporting
+less than 106,496 bytes per block retained that tile with four warps and three
+stages. The second update now uses `128 x 128 x 16`, four warps, and two stages
+for that low-shared-memory route; see the linked follow-up for its measurements.
+Reducing the older fallback to `32 x 128 x 32` avoided the allocation
 error, but multiplied the number of backward programs and became increasingly
 expensive as batch, token, vocabulary, or hidden dimensions grew. The selector
 depends on the reported shared-memory capability, not on a GPU product name.
@@ -439,8 +447,9 @@ changed with batch size, dimensionality, and accumulation mode: for example,
 `GROUP_B=8` won lock forward at `B=256,D=128`, `16` won at `B=1024,D=128`, and
 the ordinary low-precision backward favored other values. Improvements over 8
 were generally 0.5–6.5%, much smaller and less stable than split-V or atomic
-backward. Therefore `8` remains the reproducible fallback and the experimental
-override was not retained. Explicit `.cg/.ca` cache
+backward. Therefore `8` remained the reproducible fallback for the first
+update. The second update selected `GROUP_B=16` after the broader Blackwell
+geometry sweep recorded in the linked follow-up. Explicit `.cg/.ca` cache
 modifiers were not imposed without hardware-counter evidence, because bypassing
 L1 can improve streaming on one architecture and regress reuse on another.
 
