@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch._dynamo.backends.common import aot_autograd
+from torch._functorch.aot_autograd import make_boxed_func
 
 from cut_cross_entropy import linear_cross_entropy
 from cut_cross_entropy.cce_compile import _cce_backward_op, _cce_forward_op
@@ -136,11 +138,10 @@ def test_compiler_boundary_matches_eager(mile_enabled: bool, mu_loss_enabled: bo
         # accepting a graph that merely terminates at the custom operator.
         return loss + e.sum() * 0.0, metrics
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        explanation = torch._dynamo.explain(tail)(compiled_e, compiled_c, targets)
-        compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
-        compiled_loss, compiled_metrics = compiled(compiled_e, compiled_c, targets)
-        compiled_loss.backward()
+    explanation = torch._dynamo.explain(tail)(compiled_e, compiled_c, targets)
+    compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
+    compiled_loss, compiled_metrics = compiled(compiled_e, compiled_c, targets)
+    compiled_loss.backward()
     torch.cuda.synchronize()
 
     assert explanation.graph_count == 1
@@ -176,16 +177,53 @@ def test_compiler_boundary_does_not_specialize_on_valid_label_count():
         loss, _metrics = _call(e, c, labels, True, True)
         return loss + e.sum() * 0.0
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, backend=counting_backend, fullgraph=True)
-        for first_padding_position in (0, 8, 16, 24, 31):
-            e = base_e.clone().requires_grad_(True)
-            c = base_c.clone().requires_grad_(True)
-            targets = base_targets.clone()
-            targets[:, first_padding_position:] = -100
-            compiled(e, c, targets).backward()
+    compiled = torch.compile(tail, backend=counting_backend, fullgraph=True)
+    for first_padding_position in (0, 8, 16, 24, 31):
+        e = base_e.clone().requires_grad_(True)
+        c = base_c.clone().requires_grad_(True)
+        targets = base_targets.clone()
+        targets[:, first_padding_position:] = -100
+        compiled(e, c, targets).backward()
     torch.cuda.synchronize()
     assert compile_count == 1
+
+
+def test_compiler_boundary_keeps_forward_and_backward_inside_aot_graphs():
+    base_e, base_c, targets = _inputs()
+    captured: dict[str, list[str]] = {}
+
+    def capture(name):
+        def compiler(graph_module, _example_inputs):
+            captured[name] = [
+                str(node.target)
+                for node in graph_module.graph.nodes
+                if node.op == "call_function"
+            ]
+            return make_boxed_func(graph_module.forward)
+
+        return compiler
+
+    def tail(e, c, labels):
+        loss, _metrics = _call(e, c, labels, True, True)
+        return loss + e.sum() * 0.0
+
+    backend = aot_autograd(
+        fw_compiler=capture("forward"),
+        bw_compiler=capture("backward"),
+    )
+    compiled = torch.compile(tail, backend=backend, fullgraph=True)
+    e = base_e.clone().requires_grad_(True)
+    c = base_c.clone().requires_grad_(True)
+    compiled(e, c, targets).backward()
+    torch.cuda.synchronize()
+
+    assert any("cce_forward" in target for target in captured["forward"])
+    assert any("cce_backward" in target for target in captured["backward"])
+    assert not any(
+        "nonzero" in target or "zeros_like" in target
+        for targets in captured.values()
+        for target in targets
+    )
 
 
 @pytest.mark.parametrize(
@@ -214,13 +252,10 @@ def test_compiler_boundary_fp32_autocast_matches_eager(
         loss, metrics = _call(e, c, labels, mile_enabled, mu_loss_enabled)
         return loss + e.sum() * 0.0, metrics
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            compiled_loss, compiled_metrics = compiled(
-                compiled_e, compiled_c, targets
-            )
-        compiled_loss.backward()
+    compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        compiled_loss, compiled_metrics = compiled(compiled_e, compiled_c, targets)
+    compiled_loss.backward()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(compiled_loss, eager_loss, rtol=2e-4, atol=2e-4)
@@ -273,19 +308,18 @@ def test_compiler_boundary_fp32_autocast_does_not_specialize_on_valid_count(
     # Ten distinct counts cross the same default eight-recompile threshold that
     # the server reached when its ninth valid-token count entered CCE.
     first_padding_positions = (2, 3, 6, 9, 12, 15, 18, 21, 24, 31)
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, backend=counting_backend, fullgraph=True)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            for first_padding_position in first_padding_positions:
-                e = base_e.clone().requires_grad_(True)
-                c = base_c.clone().requires_grad_(True)
-                targets = base_targets.clone()
-                targets[:, first_padding_position:] = -100
-                loss = compiled(e, c, targets)
-                loss.backward()
-                assert torch.isfinite(loss)
-                assert e.grad.dtype == torch.float32
-                assert c.grad.dtype == torch.float32
+    compiled = torch.compile(tail, backend=counting_backend, fullgraph=True)
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        for first_padding_position in first_padding_positions:
+            e = base_e.clone().requires_grad_(True)
+            c = base_c.clone().requires_grad_(True)
+            targets = base_targets.clone()
+            targets[:, first_padding_position:] = -100
+            loss = compiled(e, c, targets)
+            loss.backward()
+            assert torch.isfinite(loss)
+            assert e.grad.dtype == torch.float32
+            assert c.grad.dtype == torch.float32
     torch.cuda.synchronize()
 
     assert saw_cce_boundary
@@ -328,10 +362,9 @@ def test_compiler_boundary_supports_bias_without_metrics():
         )
         return loss + e.sum() * 0.0
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
-        compiled_loss = compiled(compiled_e, compiled_c, targets, compiled_bias)
-        compiled_loss.backward()
+    compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
+    compiled_loss = compiled(compiled_e, compiled_c, targets, compiled_bias)
+    compiled_loss.backward()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(compiled_loss, eager_loss, rtol=2e-4, atol=2e-4)
@@ -375,10 +408,9 @@ def test_compiler_boundary_auto_eps_uses_autocast_dtype(input_dtype, autocast_dt
             return_loss_metrics=False,
         )
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, backend=inspect_backend, fullgraph=True)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            compiled_loss = compiled(compiled_e, compiled_c, targets)
+    compiled = torch.compile(tail, backend=inspect_backend, fullgraph=True)
+    with torch.autocast("cuda", dtype=autocast_dtype):
+        compiled_loss = compiled(compiled_e, compiled_c, targets)
     torch.cuda.synchronize()
 
     assert torch.isfinite(compiled_loss)
@@ -420,10 +452,9 @@ def test_compiler_boundary_disables_filters_when_eps_is_none():
             reduction="mean",
         )
 
-    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled = torch.compile(tail, backend=inspect_backend, fullgraph=True)
-        loss = compiled(e, c, targets)
-        loss.backward()
+    compiled = torch.compile(tail, backend=inspect_backend, fullgraph=True)
+    loss = compiled(e, c, targets)
+    loss.backward()
     torch.cuda.synchronize()
 
     assert captured_filter_config == [(None, False, False)]
