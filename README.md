@@ -454,6 +454,21 @@ Use `scripts/train.sh` to train a full model.
 
 The benchmark script can be run via `python -m benchmark`.
 
+For the direct CCE latency and memory harness used by the second Blackwell
+engineering update, run:
+
+```bash
+python -m benchmark.cce_profile --root . --batch 64 --seq 512 --hidden 512 --vocab 64402
+```
+
+An optional `--memory-limit-gib 9.5` cap applies only to the benchmark process
+and is used for 10 GiB test budgets; it does not affect the library or training.
+The engineering flow, environment versions, complete RTX 5070 Ti/5090 tables,
+numerical checks, and batch-sweep commands are in
+[CCE Blackwell engineering update 2](docs/cce-blackwell-update-2.md). The
+[original modernization record](docs/cce-modernization.md) remains available
+separately.
+
 Expected output with A100 SMX4, PyTorch 2.4.1, and CUDA 12.4.
 
 ```

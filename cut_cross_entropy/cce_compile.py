@@ -102,7 +102,6 @@ def _cce_backward_op(
     bias: torch.Tensor | None,
     lse: torch.Tensor,
     valids: torch.Tensor,
-    logit_avg: torch.Tensor,
     mile_weight: torch.Tensor,
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
@@ -175,12 +174,6 @@ def _cce_backward_op(
         lse,
         targets,
         valids,
-        _unpack_optional(
-            logit_avg,
-            filter_eps is not None
-            and (e_requires_grad or c_requires_grad or bias_requires_grad)
-            and (filter_e_grad or filter_c_grad),
-        ),
         _unpack_optional(mile_weight, mile_enabled),
         _unpack_optional(mu, mu_loss_enabled),
         _unpack_optional(mu_vocab_size, mu_loss_enabled),
@@ -215,7 +208,6 @@ def _cce_backward_fake(
     bias: torch.Tensor | None,
     lse: torch.Tensor,
     valids: torch.Tensor,
-    logit_avg: torch.Tensor,
     mile_weight: torch.Tensor,
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
@@ -244,7 +236,6 @@ def _cce_backward_fake(
         targets,
         lse,
         valids,
-        logit_avg,
         mile_weight,
         mu,
         mu_vocab_size,
@@ -315,7 +306,6 @@ def _cce_forward_op(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
 ]:
     valid_capacity = _maximum_valid_rows(targets, shift)
     e, targets, valids, batch_shape = _prepare_forward_inputs(e, targets, ignore_index, shift)
@@ -363,7 +353,6 @@ def _cce_forward_op(
         lse,
         _saved_targets,
         saved_valids,
-        logit_avg,
         mile_weight,
         mu,
         mu_vocab_size,
@@ -378,7 +367,6 @@ def _cce_forward_op(
         _pack_optional(loss_metrics, loss),
         lse,
         saved_valids,
-        _pack_optional(logit_avg, loss),
         _pack_optional(mile_weight, loss),
         _pack_optional(mu, loss),
         _pack_optional(mu_vocab_size, loss),
@@ -423,7 +411,6 @@ def _cce_forward_fake(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
 ]:
     del (
         ignore_index,
@@ -431,6 +418,9 @@ def _cce_forward_fake(
         accum_e_fp32,
         accum_c_fp32,
         auto_mixed_grad_accum,
+        filter_eps,
+        filter_e_grad,
+        filter_c_grad,
         mile_gamma,
         mu_loss_lambda,
         forward_used_autocast,
@@ -439,24 +429,9 @@ def _cce_forward_fake(
     lse = e.new_empty((valid_capacity,), dtype=torch.float32)
     # torch.nonzero, used by _build_flat_valids, returns int64 indices.
     valids = e.new_empty((valid_capacity,), dtype=torch.int64)
-    needs_grad = (
-        e_requires_grad
-        or c_requires_grad
-        or (bias is not None and bias_requires_grad)
-    )
-    needs_logit_avg = (
-        needs_grad
-        and filter_eps is not None
-        and (filter_e_grad or filter_c_grad)
-    )
     # Each absent optional gets its own placeholder. Returning the same empty
     # tensor object more than once would declare output aliasing in FakeTensor,
     # which violates the functional custom-op contract.
-    logit_avg = (
-        e.new_empty((c.size(0),), dtype=torch.float32)
-        if needs_logit_avg
-        else _empty(e, dtype=torch.float32)
-    )
     mile_weight = (
         lse.new_empty((valid_capacity,))
         if mile_enabled
@@ -482,7 +457,6 @@ def _cce_forward_fake(
         metrics,
         lse,
         valids,
-        logit_avg,
         mile_weight,
         mu,
         mu_vocab_size,
@@ -524,7 +498,6 @@ def _setup_context(ctx, inputs, output) -> None:
         metrics,
         lse,
         valids,
-        logit_avg,
         mile_weight,
         mu,
         mu_vocab_size,
@@ -533,7 +506,7 @@ def _setup_context(ctx, inputs, output) -> None:
     tensors = [e, c, targets]
     if bias is not None:
         tensors.append(bias)
-    tensors.extend([lse, valids, logit_avg, mile_weight, mu, mu_vocab_size, witness])
+    tensors.extend([lse, valids, mile_weight, mu, mu_vocab_size, witness])
     ctx.save_for_backward(*tensors)
     ctx.has_bias = bias is not None
     ctx.e_requires_grad = e_requires_grad
@@ -555,7 +528,7 @@ def _setup_context(ctx, inputs, output) -> None:
     ctx.mu_loss_lambda = mu_loss_lambda
     ctx.forward_used_autocast = forward_used_autocast
     ctx.mark_non_differentiable(
-        metrics, lse, valids, logit_avg, mile_weight, mu, mu_vocab_size, witness
+        metrics, lse, valids, mile_weight, mu, mu_vocab_size, witness
     )
 
 
@@ -569,7 +542,7 @@ def _backward(ctx, *grads):
         offset += 1
     else:
         bias = None
-    lse, valids, logit_avg, mile_weight, mu, mu_vocab_size, witness = saved[offset:]
+    lse, valids, mile_weight, mu, mu_vocab_size, witness = saved[offset:]
     de, dc, dbias = _cce_backward_op(
         grad_loss,
         e,
@@ -578,7 +551,6 @@ def _backward(ctx, *grads):
         bias,
         lse,
         valids,
-        logit_avg,
         mile_weight,
         mu,
         mu_vocab_size,

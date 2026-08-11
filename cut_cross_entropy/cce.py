@@ -84,11 +84,6 @@ def _validate_cce_inputs(
         )
 
 
-@torch.compile(fullgraph=True)
-def sort_logit_avg(logit_avg: torch.Tensor) -> torch.Tensor:
-    return torch.argsort(logit_avg).to(torch.int32)
-
-
 class LinearCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
@@ -99,16 +94,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         bias: torch.Tensor | None,
         params: CCEParams,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        needs_grad = e.requires_grad or c.requires_grad
-        if bias is not None:
-            needs_grad = needs_grad or bias.requires_grad
-
-        return_logit_avg = (
-            needs_grad
-            and params.filter_eps is not None
-            and (params.filter_c_grad or params.filter_e_grad)
-        )
-
         e_info = TensorInfo(e.dtype, e.requires_grad)
         c_info = TensorInfo(c.dtype, c.requires_grad)
 
@@ -157,7 +142,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             bias=bias,
             valids=params.valids,
             softcap=params.softcap,
-            return_logit_avg=return_logit_avg,
+            return_logit_avg=False,
             shift=params.shift,
             targets=targets,
             return_mean_logit=params.mile_gamma is not None,
@@ -165,7 +150,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         lse = ret.lse
         assert ret.neg_correct_logit is not None
         neg_correct_logit = ret.neg_correct_logit
-        logit_avg = ret.logit_avg
         mean_logit = ret.mean_logit
 
         if params.vocab_parallel_options is not None:
@@ -207,7 +191,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             lse,
             params.targets,
             params.valids,
-            logit_avg,
             mile_weight,
             mu,
             mu_vocab_size,
@@ -275,16 +258,10 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             lse,
             targets,
             valids,
-            logit_avg,
             mile_weight,
             mu,
             mu_vocab_size,
         ) = ctx.saved_tensors
-
-        if logit_avg is not None:
-            vocab_ordering = sort_logit_avg(logit_avg)
-        else:
-            vocab_ordering = None
 
         params = cast(CCEParams, ctx.params)
         reduction = params.reduction
@@ -340,7 +317,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             filter_eps=params.filter_eps,
             targets=targets,
             shift=params.shift,
-            vocab_ordering=vocab_ordering,
+            vocab_ordering=None,
             grad_scale=grad_scale,
             accum_e_fp32=params.accum_e_fp32,
             accum_c_fp32=params.accum_c_fp32,
