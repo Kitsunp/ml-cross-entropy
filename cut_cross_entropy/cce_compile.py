@@ -41,6 +41,21 @@ def _unpack_optional(value: torch.Tensor, present: bool) -> torch.Tensor | None:
     return value if present else None
 
 
+def _maximum_valid_rows(targets: torch.Tensor, shift: int) -> int | torch.SymInt:
+    """Return the input-shape capacity of CCE's compact valid-token domain."""
+    return targets[..., shift:].numel()
+
+
+def _pad_valid_rows(value: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Expose a static compiler shape while preserving the compact prefix."""
+    padding = capacity - value.size(0)
+    if padding < 0:
+        raise RuntimeError(
+            f"CCE produced {value.size(0)} valid rows for a capacity of {capacity}."
+        )
+    return torch.nn.functional.pad(value, (0, padding)) if padding else value
+
+
 def _prepare_forward_inputs(
     e: torch.Tensor,
     targets: torch.Tensor,
@@ -64,7 +79,7 @@ def _prepare_forward_inputs(
 def _prepare_backward_inputs(
     e: torch.Tensor, targets: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Size]:
-    """Restore layouts without repeating the data-dependent valid-index scan."""
+    """Restore the flattened layouts used by the existing backward kernels."""
     batch_shape = targets.size()
     e = e.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
@@ -111,10 +126,21 @@ def _cce_backward_op(
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del ignore_index
     original_e = e
     original_c = c
     original_bias = bias
+    # The compiler-facing forward pads data-dependent saved rows to a static
+    # input-shape capacity. Rebuild the compact indices inside this opaque,
+    # CUDAGraph-unsafe operator and expose only the populated prefixes to the
+    # existing backward implementation. This keeps Dynamo/AOT shapes static
+    # without changing the CCE kernels or requiring a global compiler flag.
+    runtime_valids = _build_flat_valids(targets, ignore_index, shift)
+    assert runtime_valids is not None
+    valid_count = runtime_valids.size(0)
+    lse = lse[:valid_count]
+    valids = runtime_valids
+    if mile_enabled:
+        mile_weight = mile_weight[:valid_count]
     e, targets, batch_shape = _prepare_backward_inputs(e, targets)
     compute_dtype = compute_dtype_witness.dtype
     e = e.to(dtype=compute_dtype)
@@ -291,6 +317,7 @@ def _cce_forward_op(
     torch.Tensor,
     torch.Tensor,
 ]:
+    valid_capacity = _maximum_valid_rows(targets, shift)
     e, targets, valids, batch_shape = _prepare_forward_inputs(e, targets, ignore_index, shift)
     # Custom-op backend implementations run below Autograd.  Recreate only the
     # metadata used by the existing kernel driver; no input storage is mutated.
@@ -342,6 +369,10 @@ def _cce_forward_op(
         mu_vocab_size,
     ) = kernel_ctx.saved_tensors
     assert saved_valids is not None
+    lse = _pad_valid_rows(lse, valid_capacity)
+    saved_valids = _pad_valid_rows(saved_valids, valid_capacity)
+    if mile_weight is not None:
+        mile_weight = _pad_valid_rows(mile_weight, valid_capacity)
     return (
         loss,
         _pack_optional(loss_metrics, loss),
@@ -395,10 +426,8 @@ def _cce_forward_fake(
     torch.Tensor,
 ]:
     del (
-        targets,
         ignore_index,
         softcap,
-        shift,
         accum_e_fp32,
         accum_c_fp32,
         auto_mixed_grad_accum,
@@ -406,10 +435,10 @@ def _cce_forward_fake(
         mu_loss_lambda,
         forward_used_autocast,
     )
-    valid_count = torch.library.get_ctx().new_dynamic_size()
-    lse = e.new_empty((valid_count,), dtype=torch.float32)
+    valid_capacity = _maximum_valid_rows(targets, shift)
+    lse = e.new_empty((valid_capacity,), dtype=torch.float32)
     # torch.nonzero, used by _build_flat_valids, returns int64 indices.
-    valids = e.new_empty((valid_count,), dtype=torch.int64)
+    valids = e.new_empty((valid_capacity,), dtype=torch.int64)
     needs_grad = (
         e_requires_grad
         or c_requires_grad
@@ -429,7 +458,7 @@ def _cce_forward_fake(
         else _empty(e, dtype=torch.float32)
     )
     mile_weight = (
-        lse.new_empty((valid_count,))
+        lse.new_empty((valid_capacity,))
         if mile_enabled
         else _empty(e, dtype=torch.float32)
     )

@@ -43,10 +43,11 @@ not required to preserve the caller's ambient autocast state while invoking a
 custom operator. Relying on that ambient state can otherwise run the compiled
 forward in FP32 while its metadata witness and backward assume BF16/FP16,
 silently changing loss and gradients.
-Callers that continue tensor work after CCE must enable
-`torch._dynamo.config.capture_dynamic_output_shape_ops = True`, because the
-number of saved valid-label rows is data dependent. The NeoLLM integration sets
-that option when CCE is available.
+The compiler boundary exposes saved valid-label tensors at the static capacity
+implied by the input shape. Only their compact prefixes are populated; backward
+reconstructs the valid indices inside the opaque operator and slices those
+prefixes before launching the existing kernels. Callers therefore do not need
+to enable dynamic-output tracing or mutate global Dynamo configuration.
 
 The operations are tagged `cudagraph_unsafe`: their Triton drivers allocate
 dynamic temporary tensors whose ownership is not compatible with Inductor's
