@@ -26,6 +26,9 @@ and validation results are documented in
 [docs/cce-modernization.md](docs/cce-modernization.md).
 The compiler-safe boundary, supported `torch.compile` subset, and graph
 validation are documented in [docs/torch-compile.md](docs/torch-compile.md).
+The optional CuTe PolyNorm kernel, fused stateless dropout, TorchAO FP8
+boundary, and RTX 5090 measurements are documented in
+[docs/polynorm-cute.md](docs/polynorm-cute.md).
 The conservative FP32 rationale and the bounded Blackwell CC10.x/CC12.x FP16
 path for MiLe, μ-loss, and MEAP are described in its
 [mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
