@@ -126,8 +126,6 @@ def main() -> None:
     parameters = list(model.parameters())
     masters = [parameter.detach().float().clone() for parameter in parameters]
     first_parameter = next(model.parameters())
-    initial_parameter = first_parameter.detach().clone()
-    initial_master = masters[0].clone()
 
     callable_: nn.Module = model
     if args.compiled:
@@ -135,33 +133,38 @@ def main() -> None:
 
     autocast_enabled = args.mode in ("bf16", "fp8")
 
-    def step() -> tuple[torch.Tensor, bool]:
+    def step() -> torch.Tensor:
         for parameter in parameters:
             parameter.grad = None
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
             output = callable_(input_, args.dropout_p)
             loss = output.float().square().mean()
         loss.backward()
-        gradients_finite = all(
-            parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
-            for parameter in model.parameters()
-        )
         with torch.no_grad():
             for parameter, master in zip(parameters, masters, strict=True):
                 if parameter.grad is None:
                     continue
                 master.add_(parameter.grad.float(), alpha=-learning_rate)
                 parameter.copy_(master.to(parameter.dtype))
-        return loss.detach(), gradients_finite
+        return loss.detach()
+
+    def step_is_finite(loss: torch.Tensor) -> bool:
+        gradients_finite = all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+            for parameter in model.parameters()
+        )
+        return bool(torch.isfinite(loss)) and gradients_finite
 
     for _ in range(args.warmup):
         if args.compiled:
             torch.compiler.cudagraph_mark_step_begin()
-        loss, gradients_finite = step()
-        if not bool(torch.isfinite(loss)) or not gradients_finite:
+        loss = step()
+        if not step_is_finite(loss):
             raise RuntimeError("non-finite warmup training step")
     for parameter in parameters:
         parameter.grad = None
+    initial_parameter = first_parameter.detach().clone()
+    initial_master = masters[0].clone()
     torch.cuda.synchronize()
 
     baseline_allocated = torch.cuda.memory_allocated()
@@ -176,12 +179,12 @@ def main() -> None:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        loss, gradients_finite = step()
+        loss = step()
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end))
         losses.append(loss.item())
-        finite_steps.append(bool(torch.isfinite(loss)) and gradients_finite)
+        finite_steps.append(step_is_finite(loss))
 
     parameter_delta = (first_parameter.detach() - initial_parameter).float().norm().item()
     master_delta = (masters[0] - initial_master).norm().item()

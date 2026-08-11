@@ -30,6 +30,8 @@ BACKWARD_WARPS = 4
 SWIZZLE_B = 2
 SWIZZLE_M = 4
 SWIZZLE_S = 3
+DESCRIPTOR_ALIGNMENT = 32
+MAX_DROPOUT_P = ((1 << 32) - 1) / (1 << 32)
 
 
 if cute is not None and cutlass is not None and cuda is not None:
@@ -42,6 +44,7 @@ if cute is not None and cutlass is not None and cuda is not None:
         output: cute.Tensor,
         stats: cute.Tensor,
         num_warps: cutlass.Constexpr[int],
+        save_stats: cutlass.Constexpr[bool],
         dropout_p: cutlass.Constexpr[float],
         dropout_threshold: cutlass.Constexpr[int],
     ):
@@ -104,9 +107,10 @@ if cute is not None and cutlass is not None and cuda is not None:
                 norms[0] = cute.math.rsqrt(block_sum2 * inv_width + eps)
                 norms[1] = cute.math.rsqrt(block_sum4 * inv_width + eps)
                 norms[2] = cute.math.rsqrt(block_sum6 * inv_width + eps)
-                stats[row, 0] = norms[0]
-                stats[row, 1] = norms[1]
-                stats[row, 2] = norms[2]
+                if cutlass.const_expr(save_stats):
+                    stats[row, 0] = norms[0]
+                    stats[row, 1] = norms[1]
+                    stats[row, 2] = norms[2]
         cute.arch.sync_threads()
 
         inv1 = cutlass.Float32(norms[0])
@@ -508,6 +512,7 @@ if cute is not None and cutlass is not None and cuda is not None:
         stats: cute.Tensor,
         stream: cuda.CUstream,
         num_warps: cutlass.Constexpr[int],
+        save_stats: cutlass.Constexpr[bool],
         dropout_p: cutlass.Constexpr[float],
         dropout_threshold: cutlass.Constexpr[int],
     ):
@@ -519,6 +524,7 @@ if cute is not None and cutlass is not None and cuda is not None:
             output,
             stats,
             num_warps,
+            save_stats,
             dropout_p,
             dropout_threshold,
         ).launch(
@@ -581,6 +587,7 @@ class _KernelKey:
     device_index: int
     capability: tuple[int, int]
     shapes: tuple[tuple[int, ...], ...]
+    strides: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype, ...]
     dropout_p: float
 
@@ -610,6 +617,7 @@ def _key(
         device_index=device_index,
         capability=torch.cuda.get_device_capability(device_index),
         shapes=tuple(tuple(tensor.shape) for tensor in tensors),
+        strides=tuple(tuple(tensor.stride()) for tensor in tensors),
         dtypes=tuple(tensor.dtype for tensor in tensors),
         dropout_p=float(dropout_p),
     )
@@ -619,7 +627,11 @@ def _descriptors(tensors: tuple[torch.Tensor, ...]) -> list[Any]:
     if from_dlpack is None:
         raise RuntimeError("NVIDIA CuTe DSL is unavailable") from _IMPORT_ERROR
     return [
-        from_dlpack(tensor, assumed_align=32, enable_tvm_ffi=True)
+        from_dlpack(
+            tensor,
+            assumed_align=DESCRIPTOR_ALIGNMENT,
+            enable_tvm_ffi=True,
+        )
         for tensor in tensors
     ]
 
@@ -637,12 +649,13 @@ def _compile(
         compiled = _CACHE.get(key)
         if compiled is not None:
             return compiled
-        if operation == "forward":
+        if operation in ("forward", "inference"):
             compiled = cute.compile(
                 _launch_forward_on_stream,
                 *_descriptors(tensors),
                 make_fake_stream(),
                 num_warps=FORWARD_WARPS,
+                save_stats=operation == "forward",
                 dropout_p=dropout_p,
                 dropout_threshold=dropout_threshold,
                 options="--enable-tvm-ffi",
@@ -666,10 +679,23 @@ def _compile(
         return compiled
 
 
-def _stream() -> Any:
+def _stream(device: torch.device) -> Any:
     if cuda is None:
         raise RuntimeError("NVIDIA CuTe DSL is unavailable") from _IMPORT_ERROR
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+
+def _aligned_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_contiguous() and tensor.data_ptr() % DESCRIPTOR_ALIGNMENT == 0:
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+def backward_shared_memory_bytes(hidden: int, dtype: torch.dtype) -> int:
+    element_size = 2 if dtype == torch.bfloat16 else 4
+    row_storage = 2 * hidden * element_size
+    reduction_storage = (BACKWARD_WARPS * 4 + 4) * 4
+    return row_storage + reduction_storage + 64
 
 
 def _kernel_shape(tensor: torch.Tensor) -> tuple[int, int, int]:
@@ -689,9 +715,13 @@ def forward(
     dropout_p: float,
     save_stats: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del save_stats
+    x = _aligned_contiguous(x)
+    seeds = _aligned_contiguous(seeds)
+    weight = _aligned_contiguous(weight)
+    bias = _aligned_contiguous(bias)
     output = torch.empty_like(x)
-    stats = torch.empty((x.shape[0], 3), device=x.device, dtype=torch.float32)
+    stats_rows = x.shape[0] if save_stats else 1
+    stats = torch.empty((stats_rows, 3), device=x.device, dtype=torch.float32)
     shape = _kernel_shape(x)
     tensors = (
         x.view(shape),
@@ -701,8 +731,10 @@ def forward(
         output.view(shape),
         stats,
     )
-    compiled = _compile("forward", tensors, dropout_p)
-    compiled(*tensors, _stream())
+    operation = "forward" if save_stats else "inference"
+    with torch.cuda.device(x.device):
+        compiled = _compile(operation, tensors, dropout_p)
+        compiled(*tensors, _stream(x.device))
     return output, stats
 
 
@@ -715,7 +747,11 @@ def backward(
     *,
     dropout_p: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    grad_output = grad_output.contiguous()
+    grad_output = _aligned_contiguous(grad_output)
+    x = _aligned_contiguous(x)
+    seeds = _aligned_contiguous(seeds)
+    weight = _aligned_contiguous(weight)
+    stats = _aligned_contiguous(stats)
     partials = torch.empty((x.shape[0], 4), device=x.device, dtype=torch.float32)
     grad_x = torch.empty_like(x)
     grad_weight = torch.empty_like(weight)
@@ -732,13 +768,15 @@ def backward(
         grad_weight,
         grad_bias,
     )
-    compiled = _compile("backward", tensors, dropout_p)
-    compiled(*tensors, _stream())
+    with torch.cuda.device(x.device):
+        compiled = _compile("backward", tensors, dropout_p)
+        compiled(*tensors, _stream(x.device))
     return grad_x, grad_weight, grad_bias
 
 
 __all__ = [
     "backward",
+    "backward_shared_memory_bytes",
     "forward",
     "import_error",
     "is_available",

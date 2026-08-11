@@ -46,6 +46,11 @@ def _arguments() -> argparse.Namespace:
         "--multiply-column", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--dropout-p", type=float, default=0.0)
+    parser.add_argument(
+        "--inference",
+        action="store_true",
+        help="Measure forward-only execution under torch.no_grad().",
+    )
     parser.add_argument("--eps", type=float, default=1.0e-6)
     parser.add_argument("--proj-eps", type=float, default=1.0e-6)
     parser.add_argument("--exclusive-init", type=float, default=1.0e-4)
@@ -185,6 +190,7 @@ def main() -> None:
             return output.to(dtype) if args.output_dtype == "input" else output
 
     function: Callable[..., torch.Tensor] = eager_fn
+    selected_route = args.backend
     if args.backend == "torch_compile":
         compile_kwargs: dict[str, object] = {"fullgraph": True}
         if args.compile_mode != "default":
@@ -192,9 +198,28 @@ def main() -> None:
         function = torch.compile(eager_fn, **compile_kwargs)
     elif args.backend == "cute":
         from cut_cross_entropy.polynorm import _cute, polynorm
+        from cut_cross_entropy.polynorm import compiler as polynorm_compiler
 
         if not _cute.is_available():
             raise RuntimeError("nvidia-cutlass-dsl is required for --backend cute")
+        if not polynorm_compiler._cute_supported(
+            x,
+            weight,
+            bias,
+            args.eps,
+            exclusive_logits if args.exclusive else None,
+            args.dropout_p,
+            needs_backward=not args.inference,
+        ):
+            raise ValueError(
+                "the requested configuration is unsupported by the CuTe kernels; "
+                "use --backend torch or torch_compile for the reference path"
+            )
+        if (
+            args.compile_cute
+            and x.numel() < polynorm_compiler._COMPILED_CUTE_MIN_ELEMENTS
+        ):
+            selected_route = "inductor_reference"
 
         def cute_fn(
             input_: torch.Tensor,
@@ -238,6 +263,10 @@ def main() -> None:
     def run_step() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if args.backend == "torch_compile" or args.compile_cute:
             _mark_step()
+        if args.inference:
+            with torch.no_grad():
+                output = function(x, weight, bias, exclusive_logits, up, column)
+            return output, ()
         output = function(x, weight, bias, exclusive_logits, up, column)
         gradients = torch.autograd.grad(output, differentiated, grad_output)
         return output, gradients
@@ -268,13 +297,23 @@ def main() -> None:
         forward_done = torch.cuda.Event(enable_timing=True)
         backward_done = torch.cuda.Event(enable_timing=True)
         start.record()
-        output = function(x, weight, bias, exclusive_logits, up, column)
+        if args.inference:
+            with torch.no_grad():
+                output = function(x, weight, bias, exclusive_logits, up, column)
+        else:
+            output = function(x, weight, bias, exclusive_logits, up, column)
         forward_done.record()
-        gradients = torch.autograd.grad(output, differentiated, grad_output)
-        backward_done.record()
-        torch.cuda.synchronize()
+        if args.inference:
+            gradients = ()
+            forward_done.synchronize()
+            backward_elapsed = 0.0
+        else:
+            gradients = torch.autograd.grad(output, differentiated, grad_output)
+            backward_done.record()
+            backward_done.synchronize()
+            backward_elapsed = forward_done.elapsed_time(backward_done)
         forward_ms.append(start.elapsed_time(forward_done))
-        backward_ms.append(forward_done.elapsed_time(backward_done))
+        backward_ms.append(backward_elapsed)
         del output, gradients, start, forward_done, backward_done
 
     total_ms = [forward + backward for forward, backward in zip(forward_ms, backward_ms, strict=True)]
@@ -288,6 +327,7 @@ def main() -> None:
             else None
         ),
         "compile_cute": args.compile_cute,
+        "selected_route": selected_route,
         "device": properties.name,
         "capability": list(torch.cuda.get_device_capability()),
         "torch": torch.__version__,
@@ -300,6 +340,7 @@ def main() -> None:
         "multiply_up": args.multiply_up,
         "multiply_column": args.multiply_column,
         "dropout_p": args.dropout_p,
+        "inference": args.inference,
         "forward_ms": _summary(forward_ms),
         "backward_ms": _summary(backward_ms),
         "total_ms": _summary(total_ms),

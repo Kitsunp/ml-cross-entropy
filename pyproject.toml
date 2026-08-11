@@ -27,6 +27,7 @@ polynorm = [
 
 all = [
     "cut-cross-entropy[transformers]",
+    "cut-cross-entropy[polynorm]",
     'deepspeed>=0.15.1 ; platform_system != "Darwin"',
     "accelerate>=0.34.2",
     "datasets>=3.1.0",

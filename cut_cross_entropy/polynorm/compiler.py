@@ -18,6 +18,17 @@ def _prefer_compiler_fusion(x: torch.Tensor) -> bool:
     )
 
 
+def _shared_memory_supported(x: torch.Tensor) -> bool:
+    required = _cute.backward_shared_memory_bytes(x.shape[-1], x.dtype)
+    properties = torch.cuda.get_device_properties(x.device)
+    limit = getattr(
+        properties,
+        "shared_memory_per_block_optin",
+        properties.shared_memory_per_block,
+    )
+    return bool(required <= limit)
+
+
 def _cute_supported(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -25,6 +36,7 @@ def _cute_supported(
     eps: float,
     exclusive_logits: torch.Tensor | None,
     dropout_p: float,
+    needs_backward: bool,
 ) -> bool:
     return bool(
         _cute.is_available()
@@ -33,16 +45,20 @@ def _cute_supported(
         and x.is_cuda
         and weight.is_cuda
         and bias.is_cuda
+        and weight.device == x.device
+        and bias.device == x.device
         and x.dtype in (torch.bfloat16, torch.float32)
         and weight.dtype == x.dtype
         and bias.dtype == x.dtype
         and x.ndim >= 2
+        and x.numel() > 0
         and x.shape[-1] > 0
         and x.shape[-1] % _cute.VECTOR_WIDTH == 0
         and x.is_contiguous()
         and weight.shape == (3,)
         and bias.shape == (1,)
-        and 0.0 <= dropout_p < 1.0
+        and 0.0 <= dropout_p <= _cute.MAX_DROPOUT_P
+        and (not needs_backward or _shared_memory_supported(x))
     )
 
 
@@ -196,8 +212,17 @@ def polynorm(
     dropout_p = float(dropout_p)
     if not 0.0 <= dropout_p < 1.0:
         raise ValueError("dropout_p must be in [0, 1)")
+    needs_backward = torch.is_grad_enabled() and (
+        x.requires_grad or weight.requires_grad or bias.requires_grad
+    )
     if _prefer_compiler_fusion(x) or not _cute_supported(
-        x, weight, bias, eps, exclusive_logits, dropout_p
+        x,
+        weight,
+        bias,
+        eps,
+        exclusive_logits,
+        dropout_p,
+        needs_backward,
     ):
         output = polynorm_reference(
             x,
@@ -225,9 +250,6 @@ def polynorm(
         )
         if dropout_p
         else torch.empty((4,), device=x.device, dtype=torch.int64)
-    )
-    needs_backward = torch.is_grad_enabled() and (
-        x.requires_grad or weight.requires_grad or bias.requires_grad
     )
     if needs_backward:
         output, _stats = _polynorm_forward_op(
