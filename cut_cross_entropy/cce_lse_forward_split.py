@@ -87,9 +87,10 @@ def _cce_lse_split_partials_kernel(
                 bias = tl.load(Bias + offs_v * stride_biasv, mask=offs_v < V, other=0.0)
                 accum += bias[None, :]
 
-            logits = tl.where(offs_v[None, :] < V, accum, -float("inf"))
+            logits = accum
             if HAS_SOFTCAP:
                 logits = tl_softcapping(logits, softcap)
+            logits = tl.where(offs_v[None, :] < V, logits, -float("inf"))
             logits = logits.cast(tl.float32)
 
             if HAS_LA:

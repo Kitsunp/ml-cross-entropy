@@ -145,6 +145,9 @@ def main() -> None:
         _step(e, c, targets)
     torch.cuda.synchronize()
 
+    e.grad = None
+    c.grad = None
+    torch.cuda.synchronize()
     baseline_allocated = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     forward_ms: list[float] = []

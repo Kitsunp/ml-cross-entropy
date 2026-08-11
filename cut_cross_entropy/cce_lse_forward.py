@@ -155,6 +155,7 @@ def _neg_correct_logit_kernel(
     HAS_VALIDS: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     direct_rows = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
     if HAS_VALIDS:
@@ -171,25 +172,27 @@ def _neg_correct_logit_kernel(
         mask=(direct_rows < B) & (target_rows < BMax),
         other=V,
     ).to(tl.int64)
+    valid_target = (direct_rows < B) & (targets >= 0) & (targets < V)
     offs_d = tl.arange(0, BLOCK_D)
-    accumulator = tl.zeros((BLOCK_B,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_B, BLOCK_B), dtype=tl.float32)
     for block_d in range(0, tl.cdiv(D, BLOCK_D)):
         cols = block_d * BLOCK_D + offs_d
-        mask = (direct_rows[:, None] < B) & (targets[:, None] < V) & (cols[None, :] < D)
         e = tl.load(
             E + rows[:, None] * stride_eb + cols[None, :] * stride_ed,
-            mask=mask,
+            mask=(direct_rows[:, None] < B) & (cols[None, :] < D),
             other=0.0,
-        ).to(tl.float32)
+        )
         c = tl.load(
-            C + targets[:, None] * stride_cv + cols[None, :] * stride_cd,
-            mask=mask,
+            C + cols[:, None] * stride_cd + targets[None, :] * stride_cv,
+            mask=(cols[:, None] < D) & valid_target[None, :],
             other=0.0,
-        ).to(tl.float32)
-        accumulator += tl.sum(e * c, axis=1)
-    logit = accumulator.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+        )
+        accumulator = tl.dot(e, c, accumulator, input_precision=DOT_PRECISION)
+    diagonal = tl.arange(0, BLOCK_B)[:, None] == tl.arange(0, BLOCK_B)[None, :]
+    logit = tl.sum(tl.where(diagonal, accumulator, 0.0), axis=1)
+    logit = logit.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
     if HAS_BIAS:
-        logit += tl.load(Bias + targets * stride_biasv, mask=targets < V, other=0.0)
+        logit += tl.load(Bias + targets * stride_biasv, mask=valid_target, other=0.0)
     if HAS_SOFTCAP:
         logit = tl_softcapping(logit, softcap)
     tl.store(Out + direct_rows, -logit.to(tl.float32), mask=direct_rows < B)
@@ -203,10 +206,11 @@ def _neg_correct_logit(
     targets: torch.Tensor,
     softcap: float | None,
     shift: int,
+    dot_precision: str,
 ) -> torch.Tensor:
     b = e.size(0) if valids is None else valids.numel()
     out = e.new_empty((b,), dtype=torch.float32)
-    _neg_correct_logit_kernel[(triton.cdiv(b, 128),)](
+    _neg_correct_logit_kernel[(triton.cdiv(b, 16),)](
         e,
         c,
         bias,
@@ -225,13 +229,15 @@ def _neg_correct_logit(
         c.stride(1),
         1 if bias is None else bias.stride(0),
         1 if valids is None else valids.stride(0),
-        BLOCK_B=128,
+        BLOCK_B=16,
         BLOCK_D=32,
         HAS_BIAS=bias is not None,
         HAS_VALIDS=valids is not None,
         HAS_SOFTCAP=softcap is not None,
         HAS_SHIFT=shift != 0,
+        DOT_PRECISION=dot_precision,
         num_warps=4,
+        num_stages=3,
     )
     return out
 
@@ -335,9 +341,11 @@ def _cce_lse_forward_kernel(
             )
         accum += bias[None, :]
 
-    logits = accum if EVEN_V else tl.where(offs_v[None, :] < V, accum, -float("inf"))
+    logits = accum
     if HAS_SOFTCAP:
         logits = tl_softcapping(logits, softcap)
+    if not EVEN_V:
+        logits = tl.where(offs_v[None, :] < V, logits, -float("inf"))
     logits = logits.cast(tl.float32)
     if HAS_LA:
         valid_rows = direct_offs_b[:, None] < B
@@ -416,7 +424,10 @@ def _cce_lse_forward_kernel(
     tl.atomic_xchg(this_locks, 0, sem="release", scope="gpu")
 
 
-_cce_lse_forward_kernel = triton.jit(_cce_lse_forward_kernel, do_not_specialize=["MODE", "B_BIN"])
+_cce_lse_forward_kernel = triton.jit(
+    _cce_lse_forward_kernel,
+    do_not_specialize=["MODE", "B_BIN"],
+)
 _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
     {
         "EVEN_D": lambda args: args["D"] % args["BLOCK_D"] == 0,
@@ -507,12 +518,10 @@ def cce_lse_forward_kernel(
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
     mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
-    # FP32 "high" reconstructs the dense logits with TF32 products. Keep the
-    # target store in that same tile so LSE and target use identical products;
-    # the indexed scalar dot is IEEE and would otherwise mix precisions.
-    use_indexed_target = targets is not None and not (
-        e.dtype == torch.float32 and torch.get_float32_matmul_precision() == "high"
-    )
+    # The fixed K=32 path reconstructs targets with a diagonal tl.dot using the
+    # same arithmetic as LSE. Autotuning may select a different K, so keep the
+    # target fused there rather than risk inconsistent rounding.
+    use_indexed_target = targets is not None and os.getenv("CCE_AUTOTUNE", "0") == "0"
     kernel_targets = None if use_indexed_target else targets
     kernel_shift = shift if kernel_targets is not None else 0
     kernel_neg_correct_logit = (
@@ -609,7 +618,18 @@ def cce_lse_forward_kernel(
 
     logit_avg = _linear_logit_avg(e, c, bias, valids) if use_linear_logit_avg else kernel_logit_avg
     neg_correct_logit = (
-        _neg_correct_logit(e, c, bias, valids, targets, softcap, shift)
+        _neg_correct_logit(
+            e,
+            c,
+            bias,
+            valids,
+            targets,
+            softcap,
+            shift,
+            "ieee"
+            if return_mean_logit
+            else ("tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"),
+        )
         if use_indexed_target
         else kernel_neg_correct_logit
     )
