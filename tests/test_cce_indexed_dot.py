@@ -4,7 +4,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+from cut_cross_entropy.cce_lse_forward import _neg_correct_logit, cce_lse_forward_kernel
 from cut_cross_entropy.indexed_dot import indexed_neg_dot_forward_kernel
 from cut_cross_entropy.utils import softcapping
 
@@ -89,3 +89,65 @@ def test_indexed_dot(
     assert (
         cce_error <= (expected_error + error_tol)
     ).all(), f"{(cce_error - expected_error).relu().max()=}"
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_indexed_dot_masks_out_of_range_targets(dtype: torch.dtype) -> None:
+    torch.cuda.manual_seed(20_260_811)
+    e = torch.randn((8, 64), device="cuda", dtype=dtype)
+    c = torch.randn((7, 64), device="cuda", dtype=dtype)
+    bias = torch.randn((7,), device="cuda", dtype=dtype)
+    targets = torch.tensor([-1, 0, 1, 6, 7, 2, 3, 4], device="cuda")
+
+    new_indexed = _neg_correct_logit(e, c, bias, None, targets, None, 0, "ieee")
+    legacy_indexed = indexed_neg_dot_forward_kernel(e, c, targets, bias=bias)
+    torch.cuda.synchronize()
+
+    invalid = (targets < 0) | (targets >= c.size(0))
+    torch.testing.assert_close(new_indexed[invalid], torch.zeros_like(new_indexed[invalid]))
+    torch.testing.assert_close(
+        legacy_indexed[invalid], torch.zeros_like(legacy_indexed[invalid])
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("softcap", [None, 20.0])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("packed_shift", [False, True])
+@pytest.mark.parametrize("forward_reduction", ["lock", "split"])
+def test_target_logit_uses_same_reduction_as_lse(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    softcap: float | None,
+    has_bias: bool,
+    packed_shift: bool,
+    forward_reduction: str,
+) -> None:
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", forward_reduction)
+    torch.cuda.manual_seed(20_260_811)
+    e = torch.randn((512, 512), device="cuda", dtype=dtype)
+    c = torch.randn((1, 512), device="cuda", dtype=dtype)
+    targets = torch.zeros((512,), device="cuda", dtype=torch.long)
+    bias = torch.randn((1,), device="cuda", dtype=dtype) if has_bias else None
+    if packed_shift:
+        valids = torch.arange(0, 511, 2, device="cuda", dtype=torch.int32)
+        shift = 1
+    else:
+        valids = None
+        shift = 0
+
+    result = cce_lse_forward_kernel(
+        e,
+        c,
+        bias=bias,
+        valids=valids,
+        softcap=softcap,
+        targets=targets,
+        shift=shift,
+    )
+    assert result.neg_correct_logit is not None
+    loss = result.lse + result.neg_correct_logit
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0.0, atol=0.0)

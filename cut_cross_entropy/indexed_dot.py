@@ -66,7 +66,8 @@ def _indexed_neg_dot_forward_kernel(
 
     c_ptrs = C + (inds[:, None] * stride_cv + offs_d[None, :] * stride_cd)
 
-    c_mask = inds[:, None] < V
+    valid_inds = (inds >= 0) & (inds < V)
+    c_mask = valid_inds[:, None]
     if not EVEN_D:
         c_mask = c_mask & (offs_d[None, :] < D)
 
@@ -78,7 +79,7 @@ def _indexed_neg_dot_forward_kernel(
     neg_dot = neg_dot.cast(dtype=E.dtype.element_ty, fp_downcast_rounding="rtne")
     if HAS_BIAS:
         # Need the and (pid_d == 0) because otherwise the bias will be added ceil(D / BLOCK_D) times!
-        bias = tl.load(Bias + inds * stride_biasv, mask=(inds < V) & (pid_d == 0), other=0.0)
+        bias = tl.load(Bias + inds * stride_biasv, mask=valid_inds & (pid_d == 0), other=0.0)
         neg_dot -= bias
 
     offs_b = (tl.arange(0, BLOCK_B) + pid_b * BLOCK_B).to(tl.int64)

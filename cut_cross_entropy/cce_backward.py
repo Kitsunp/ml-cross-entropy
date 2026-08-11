@@ -265,7 +265,7 @@ def _cce_target_backward_kernel(
         mask=row_mask & (target_rows < BMax),
         other=V,
     ).to(tl.int64)
-    valid_target = row_mask & (targets < V)
+    valid_target = row_mask & (targets >= 0) & (targets < V)
 
     if ITEM_DO:
         coefficient = -grad_scale * tl.load(dOut)

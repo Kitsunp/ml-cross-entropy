@@ -568,3 +568,30 @@ def test_fp32_atomic_reduction_matches_lock(monkeypatch) -> None:
         torch.testing.assert_close(loss, lock_loss)
         assert torch.linalg.vector_norm(de - lock_de) / torch.linalg.vector_norm(lock_de) < 1e-3
         assert torch.linalg.vector_norm(dc - lock_dc) / torch.linalg.vector_norm(lock_dc) < 1e-3
+
+
+@skip_no_cuda
+def test_sparse_target_backward_masks_out_of_range_targets() -> None:
+    torch.cuda.manual_seed(20_260_811)
+    batch, vocab, dim = 512, 32_768, 32
+    e = torch.randn((batch, dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    c = torch.randn((vocab, dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    bias = torch.randn((vocab,), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    targets = torch.randint(0, vocab, (batch,), device="cuda")
+    targets[0] = -1
+
+    loss = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        bias=bias,
+        reduction="mean",
+        impl="cce_kahan_full_c",
+    )
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(loss)
+    assert e.grad is not None and torch.isfinite(e.grad).all()
+    assert c.grad is not None and torch.isfinite(c.grad).all()
+    assert bias.grad is not None and torch.isfinite(bias.grad).all()
