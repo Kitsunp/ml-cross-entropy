@@ -50,6 +50,11 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
         ``mu_loss_lambda * ||mean(c, dim=0)||^2``. Supported by CCE implementations
         with ``reduction="mean"`` only.
     :param mu_loss_lambda: Non-negative coefficient for mu loss, used only when mu loss is enabled.
+    :param patch_training_enabled: Treat the final target dimension as a fixed patch of
+        target classes while keeping one embedding row per patch. Keep this flag enabled
+        across patch and token phases; represent inactive slots with ``ignore_index`` to
+        preserve shapes and the compiled graph. Supported by CCE implementations with
+        ``reduction="mean"``, ``shift=0``, no softcap, and no vocabulary parallelism.
 """
 
 CCE_OPTS_DOC = [

@@ -41,8 +41,12 @@ def _unpack_optional(value: torch.Tensor, present: bool) -> torch.Tensor | None:
     return value if present else None
 
 
-def _maximum_valid_rows(targets: torch.Tensor, shift: int) -> int | torch.SymInt:
+def _maximum_valid_rows(
+    targets: torch.Tensor, shift: int, patch_training_enabled: bool
+) -> int | torch.SymInt:
     """Return the input-shape capacity of CCE's compact valid-token domain."""
+    if patch_training_enabled:
+        return targets.numel() // targets.size(-1)
     return targets[..., shift:].numel()
 
 
@@ -61,10 +65,15 @@ def _prepare_forward_inputs(
     targets: torch.Tensor,
     ignore_index: int,
     shift: int,
+    patch_training_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
-    batch_shape = targets.size()
+    batch_shape = targets.size()[:-1] if patch_training_enabled else targets.size()
     e = e.contiguous().flatten(0, -2)
     targets = targets.contiguous()
+    if patch_training_enabled:
+        targets = targets.reshape(-1, targets.size(-1))
+        targets = torch.where(targets == ignore_index, -1, targets)
+        return e, targets, _empty(e, dtype=torch.int64), batch_shape
     valids = _build_flat_valids(targets, ignore_index, shift)
     # The compiler-safe path is deliberately restricted to shift > 0.  In
     # that regime _build_flat_valids always returns an index tensor, including
@@ -77,11 +86,18 @@ def _prepare_forward_inputs(
 
 
 def _prepare_backward_inputs(
-    e: torch.Tensor, targets: torch.Tensor
+    e: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int,
+    patch_training_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Size]:
     """Restore the flattened layouts used by the existing backward kernels."""
-    batch_shape = targets.size()
+    batch_shape = targets.size()[:-1] if patch_training_enabled else targets.size()
     e = e.contiguous().flatten(0, -2)
+    if patch_training_enabled:
+        targets = targets.contiguous().reshape(-1, targets.size(-1))
+        targets = torch.where(targets == ignore_index, -1, targets)
+        return e, targets, batch_shape
     targets = targets.contiguous().flatten()
     if targets.data_ptr() % 16:
         targets = torch.nn.functional.pad(targets, (0, 1))[:-1]
@@ -103,6 +119,7 @@ def _cce_backward_op(
     lse: torch.Tensor,
     valids: torch.Tensor,
     mile_weight: torch.Tensor,
+    patch_target_weight: torch.Tensor,
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
     compute_dtype_witness: torch.Tensor,
@@ -124,6 +141,7 @@ def _cce_backward_op(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     original_e = e
     original_c = c
@@ -133,14 +151,18 @@ def _cce_backward_op(
     # CUDAGraph-unsafe operator and expose only the populated prefixes to the
     # existing backward implementation. This keeps Dynamo/AOT shapes static
     # without changing the CCE kernels or requiring a global compiler flag.
-    runtime_valids = _build_flat_valids(targets, ignore_index, shift)
-    assert runtime_valids is not None
-    valid_count = runtime_valids.size(0)
-    lse = lse[:valid_count]
-    valids = runtime_valids
-    if mile_enabled:
-        mile_weight = mile_weight[:valid_count]
-    e, targets, batch_shape = _prepare_backward_inputs(e, targets)
+    if patch_training_enabled:
+        runtime_valids = None
+    else:
+        runtime_valids = _build_flat_valids(targets, ignore_index, shift)
+        assert runtime_valids is not None
+        valid_count = runtime_valids.size(0)
+        lse = lse[:valid_count]
+        if mile_enabled:
+            mile_weight = mile_weight[:valid_count]
+    e, targets, batch_shape = _prepare_backward_inputs(
+        e, targets, ignore_index, patch_training_enabled
+    )
     compute_dtype = compute_dtype_witness.dtype
     e = e.to(dtype=compute_dtype)
     c = c.to(dtype=compute_dtype)
@@ -149,7 +171,7 @@ def _cce_backward_op(
 
     params = CCEParams(
         targets=targets,
-        valids=valids,
+        valids=runtime_valids,
         softcap=softcap,
         reduction="mean",
         filter_eps=filter_eps,
@@ -165,6 +187,7 @@ def _cce_backward_op(
         auto_mixed_grad_accum=auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
+        patch_training_enabled=patch_training_enabled,
     )
     ctx = _FunctionContext()
     ctx.saved_tensors = (
@@ -173,8 +196,9 @@ def _cce_backward_op(
         bias,
         lse,
         targets,
-        valids,
-        _unpack_optional(mile_weight, mile_enabled),
+        runtime_valids,
+        _unpack_optional(mile_weight, mile_enabled or patch_training_enabled),
+        _unpack_optional(patch_target_weight, patch_training_enabled),
         _unpack_optional(mu, mu_loss_enabled),
         _unpack_optional(mu_vocab_size, mu_loss_enabled),
     )
@@ -209,6 +233,7 @@ def _cce_backward_fake(
     lse: torch.Tensor,
     valids: torch.Tensor,
     mile_weight: torch.Tensor,
+    patch_target_weight: torch.Tensor,
     mu: torch.Tensor,
     mu_vocab_size: torch.Tensor,
     compute_dtype_witness: torch.Tensor,
@@ -230,6 +255,7 @@ def _cce_backward_fake(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del (
         grad_loss,
@@ -237,6 +263,7 @@ def _cce_backward_fake(
         lse,
         valids,
         mile_weight,
+        patch_target_weight,
         mu,
         mu_vocab_size,
         compute_dtype_witness,
@@ -254,6 +281,7 @@ def _cce_backward_fake(
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        patch_training_enabled,
     )
     # The real path makes e contiguous before the kernel and reshapes that
     # contiguous gradient back to the original shape.
@@ -295,6 +323,7 @@ def _cce_forward_op(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
 ) -> tuple[
@@ -306,9 +335,12 @@ def _cce_forward_op(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
-    valid_capacity = _maximum_valid_rows(targets, shift)
-    e, targets, valids, batch_shape = _prepare_forward_inputs(e, targets, ignore_index, shift)
+    valid_capacity = _maximum_valid_rows(targets, shift, patch_training_enabled)
+    e, targets, valids, batch_shape = _prepare_forward_inputs(
+        e, targets, ignore_index, shift, patch_training_enabled
+    )
     # Custom-op backend implementations run below Autograd.  Recreate only the
     # metadata used by the existing kernel driver; no input storage is mutated.
     e = e.detach().requires_grad_(e_requires_grad)
@@ -317,7 +349,7 @@ def _cce_forward_op(
         bias = bias.detach().requires_grad_(bias_requires_grad)
     params = CCEParams(
         targets=targets,
-        valids=valids,
+        valids=None if patch_training_enabled else valids,
         softcap=softcap,
         reduction="mean",
         filter_eps=filter_eps,
@@ -333,6 +365,7 @@ def _cce_forward_op(
         auto_mixed_grad_accum=auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
+        patch_training_enabled=patch_training_enabled,
     )
     kernel_ctx = _FunctionContext()
     compute_dtype = torch.bfloat16 if compute_dtype_is_bf16 else torch.float16
@@ -354,20 +387,26 @@ def _cce_forward_op(
         _saved_targets,
         saved_valids,
         mile_weight,
+        patch_target_weight,
         mu,
         mu_vocab_size,
     ) = kernel_ctx.saved_tensors
-    assert saved_valids is not None
-    lse = _pad_valid_rows(lse, valid_capacity)
-    saved_valids = _pad_valid_rows(saved_valids, valid_capacity)
-    if mile_weight is not None:
-        mile_weight = _pad_valid_rows(mile_weight, valid_capacity)
+    if patch_training_enabled:
+        assert saved_valids is None
+        saved_valids = _empty(saved_e, dtype=torch.int64)
+    else:
+        assert saved_valids is not None
+        lse = _pad_valid_rows(lse, valid_capacity)
+        saved_valids = _pad_valid_rows(saved_valids, valid_capacity)
+        if mile_weight is not None:
+            mile_weight = _pad_valid_rows(mile_weight, valid_capacity)
     return (
         loss,
         _pack_optional(loss_metrics, loss),
         lse,
         saved_valids,
         _pack_optional(mile_weight, loss),
+        _pack_optional(patch_target_weight, loss),
         _pack_optional(mu, loss),
         _pack_optional(mu_vocab_size, loss),
         saved_e.new_empty(
@@ -400,9 +439,11 @@ def _cce_forward_fake(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -425,16 +466,25 @@ def _cce_forward_fake(
         mu_loss_lambda,
         forward_used_autocast,
     )
-    valid_capacity = _maximum_valid_rows(targets, shift)
+    valid_capacity = _maximum_valid_rows(targets, shift, patch_training_enabled)
     lse = e.new_empty((valid_capacity,), dtype=torch.float32)
     # torch.nonzero, used by _build_flat_valids, returns int64 indices.
-    valids = e.new_empty((valid_capacity,), dtype=torch.int64)
+    valids = (
+        _empty(e, dtype=torch.int64)
+        if patch_training_enabled
+        else e.new_empty((valid_capacity,), dtype=torch.int64)
+    )
     # Each absent optional gets its own placeholder. Returning the same empty
     # tensor object more than once would declare output aliasing in FakeTensor,
     # which violates the functional custom-op contract.
     mile_weight = (
         lse.new_empty((valid_capacity,))
-        if mile_enabled
+        if mile_enabled or patch_training_enabled
+        else _empty(e, dtype=torch.float32)
+    )
+    patch_target_weight = (
+        lse.new_empty((valid_capacity,))
+        if patch_training_enabled
         else _empty(e, dtype=torch.float32)
     )
     mu = (
@@ -458,6 +508,7 @@ def _cce_forward_fake(
         lse,
         valids,
         mile_weight,
+        patch_target_weight,
         mu,
         mu_vocab_size,
         e.new_empty(
@@ -490,6 +541,7 @@ def _setup_context(ctx, inputs, output) -> None:
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        patch_training_enabled,
         _compute_dtype_is_bf16,
         forward_used_autocast,
     ) = inputs
@@ -499,6 +551,7 @@ def _setup_context(ctx, inputs, output) -> None:
         lse,
         valids,
         mile_weight,
+        patch_target_weight,
         mu,
         mu_vocab_size,
         witness,
@@ -506,7 +559,7 @@ def _setup_context(ctx, inputs, output) -> None:
     tensors = [e, c, targets]
     if bias is not None:
         tensors.append(bias)
-    tensors.extend([lse, valids, mile_weight, mu, mu_vocab_size, witness])
+    tensors.extend([lse, valids, mile_weight, patch_target_weight, mu, mu_vocab_size, witness])
     ctx.save_for_backward(*tensors)
     ctx.has_bias = bias is not None
     ctx.e_requires_grad = e_requires_grad
@@ -526,9 +579,17 @@ def _setup_context(ctx, inputs, output) -> None:
     ctx.mile_gamma = mile_gamma
     ctx.mu_loss_enabled = mu_loss_enabled
     ctx.mu_loss_lambda = mu_loss_lambda
+    ctx.patch_training_enabled = patch_training_enabled
     ctx.forward_used_autocast = forward_used_autocast
     ctx.mark_non_differentiable(
-        metrics, lse, valids, mile_weight, mu, mu_vocab_size, witness
+        metrics,
+        lse,
+        valids,
+        mile_weight,
+        patch_target_weight,
+        mu,
+        mu_vocab_size,
+        witness,
     )
 
 
@@ -542,7 +603,7 @@ def _backward(ctx, *grads):
         offset += 1
     else:
         bias = None
-    lse, valids, mile_weight, mu, mu_vocab_size, witness = saved[offset:]
+    lse, valids, mile_weight, patch_target_weight, mu, mu_vocab_size, witness = saved[offset:]
     de, dc, dbias = _cce_backward_op(
         grad_loss,
         e,
@@ -552,6 +613,7 @@ def _backward(ctx, *grads):
         lse,
         valids,
         mile_weight,
+        patch_target_weight,
         mu,
         mu_vocab_size,
         witness,
@@ -573,12 +635,14 @@ def _backward(ctx, *grads):
         ctx.mile_gamma,
         ctx.mu_loss_enabled,
         ctx.mu_loss_lambda,
+        ctx.patch_training_enabled,
     )
     return (
         de,
         dc,
         None,
         dbias if ctx.has_bias else None,
+        None,
         None,
         None,
         None,
@@ -623,6 +687,7 @@ def compiler_cce_linear_cross_entropy(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -649,6 +714,7 @@ def compiler_cce_linear_cross_entropy(
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        patch_training_enabled,
         compute_dtype_is_bf16,
         forward_used_autocast,
     )

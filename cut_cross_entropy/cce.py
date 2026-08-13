@@ -9,6 +9,7 @@ import torch.amp
 from cut_cross_entropy.cce_backward import cce_backward_kernel
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
 from cut_cross_entropy.cce_mile import cce_mile_forward_kernel
+from cut_cross_entropy.cce_patch import patch_loss_forward
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.doc import CCE_OPTS_DOC, LINEAR_CROSS_ENTROPY_DOC, add_doc_start
 from cut_cross_entropy.mu_loss import mu_loss_forward_kernel
@@ -45,6 +46,7 @@ class CCEParams:
     auto_mixed_grad_accum: bool
     mile_gamma: float | None
     mu_loss_lambda: float | None
+    patch_training_enabled: bool
 
 
 @torch.compiler.assume_constant_result
@@ -63,9 +65,22 @@ def _validate_cce_inputs(
     mile_gamma: float,
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
+    patch_training_enabled: bool,
 ) -> None:
     """Keep eager and compiler-boundary input validation identical."""
-    assert e.size()[0:-1] == targets.size()
+    if patch_training_enabled:
+        if targets.ndim < 2 or targets.size(-1) < 1:
+            raise ValueError(
+                "Patch targets must have shape (..., patch_size) with patch_size >= 1."
+            )
+        if e.size()[0:-1] != targets.size()[0:-1]:
+            raise ValueError(
+                "With patch_training_enabled=True, e.shape[:-1] must equal targets.shape[:-1]."
+            )
+        if reduction != "mean":
+            raise ValueError("patch_training_enabled currently requires reduction='mean'.")
+    else:
+        assert e.size()[0:-1] == targets.size()
     assert e.size(-1) == c.size(1)
     if mile_enabled and (not math.isfinite(mile_gamma) or mile_gamma < 0):
         raise ValueError(f"mile_gamma must be finite and non-negative, got {mile_gamma}.")
@@ -148,41 +163,63 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             return_mean_logit=params.mile_gamma is not None,
         )
         lse = ret.lse
-        assert ret.neg_correct_logit is not None
-        neg_correct_logit = ret.neg_correct_logit
         mean_logit = ret.mean_logit
 
-        if params.vocab_parallel_options is not None:
-            vp_lse = lse
-            lse = vp_reduce_lse(lse, pg=params.vocab_parallel_options.group)
-
-            if mean_logit is not None:
-                mean_logit = vp_reduce_mean_logit(
-                    vp_lse,
-                    mean_logit,
-                    lse,
-                    pg=params.vocab_parallel_options.group,
-                )
-
-            neg_correct_logit = vp_reduce_correct_logit(
-                neg_correct_logit, pg=params.vocab_parallel_options.group, dtype=lse.dtype
-            )
-
-        nll = neg_correct_logit.add_(lse)
-
-        if params.mile_gamma is not None:
-            assert mean_logit is not None
-            mile_weight, token_loss, unweighted_nll_sum = cce_mile_forward_kernel(
+        if params.patch_training_enabled:
+            assert ret.neg_correct_logit is not None
+            neg_correct_logit = ret.neg_correct_logit
+            (
+                objective_loss,
+                patch_unweighted_ce,
+                mile_weight,
+                patch_target_weight,
+            ) = patch_loss_forward(
                 lse,
                 mean_logit,
-                nll,
+                neg_correct_logit,
+                targets,
+                c.size(0),
                 params.mile_gamma,
-                return_unweighted_nll_sum=params.return_loss_metrics,
             )
-        else:
-            token_loss = nll
-            mile_weight = None
+            nll = None
+            token_loss = None
             unweighted_nll_sum = None
+        else:
+            assert ret.neg_correct_logit is not None
+            neg_correct_logit = ret.neg_correct_logit
+
+            if params.vocab_parallel_options is not None:
+                vp_lse = lse
+                lse = vp_reduce_lse(lse, pg=params.vocab_parallel_options.group)
+
+                if mean_logit is not None:
+                    mean_logit = vp_reduce_mean_logit(
+                        vp_lse,
+                        mean_logit,
+                        lse,
+                        pg=params.vocab_parallel_options.group,
+                    )
+
+                neg_correct_logit = vp_reduce_correct_logit(
+                    neg_correct_logit, pg=params.vocab_parallel_options.group, dtype=lse.dtype
+                )
+
+            nll = neg_correct_logit.add_(lse)
+            patch_unweighted_ce = None
+            patch_target_weight = None
+            if params.mile_gamma is not None:
+                assert mean_logit is not None
+                mile_weight, token_loss, unweighted_nll_sum = cce_mile_forward_kernel(
+                    lse,
+                    mean_logit,
+                    nll,
+                    params.mile_gamma,
+                    return_unweighted_nll_sum=params.return_loss_metrics,
+                )
+            else:
+                token_loss = nll
+                mile_weight = None
+                unweighted_nll_sum = None
 
         ctx.save_for_backward(
             e,
@@ -192,6 +229,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             params.targets,
             params.valids,
             mile_weight,
+            patch_target_weight,
             mu,
             mu_vocab_size,
         )
@@ -206,22 +244,27 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             ret_lse = handle_reduction_none(params.batch_shape, params.valids, params.shift, lse)
 
         reduction = params.reduction
-        if reduction == "mean":
-            objective_loss = token_loss.mean()
-        elif reduction == "sum":
-            objective_loss = token_loss.sum()
-        elif reduction == "none":
-            objective_loss = handle_reduction_none(
-                params.batch_shape, params.valids, params.shift, token_loss
-            )
-        else:
-            raise ValueError(f"Unknown reduction {reduction}")
+        if not params.patch_training_enabled:
+            assert token_loss is not None
+            if reduction == "mean":
+                objective_loss = token_loss.mean()
+            elif reduction == "sum":
+                objective_loss = token_loss.sum()
+            elif reduction == "none":
+                objective_loss = handle_reduction_none(
+                    params.batch_shape, params.valids, params.shift, token_loss
+                )
+            else:
+                raise ValueError(f"Unknown reduction {reduction}")
 
         if params.return_loss_metrics:
             assert reduction == "mean"
-            if unweighted_nll_sum is None:
+            if patch_unweighted_ce is not None:
+                unweighted_ce = patch_unweighted_ce
+            elif unweighted_nll_sum is None:
                 unweighted_ce = objective_loss
             else:
+                assert nll is not None
                 unweighted_ce = unweighted_nll_sum / max(nll.numel(), 1)
             mu_loss_metric = (
                 mu_loss if mu_loss is not None else objective_loss.new_zeros(())
@@ -259,6 +302,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             targets,
             valids,
             mile_weight,
+            patch_target_weight,
             mu,
             mu_vocab_size,
         ) = ctx.saved_tensors
@@ -308,10 +352,11 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             bias_info=ctx.bias_info,
             lse=lse,
             mile_weight=mile_weight,
+            patch_target_weight=patch_target_weight,
             mu=mu,
             mu_vocab_size=mu_vocab_size,
             mu_loss_lambda=params.mu_loss_lambda,
-            mile_gamma=params.mile_gamma,
+            mile_gamma=None if params.patch_training_enabled else params.mile_gamma,
             valids=valids,
             softcap=params.softcap,
             filter_eps=params.filter_eps,
@@ -376,6 +421,7 @@ def cce_linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     _validate_cce_inputs(
         e,
@@ -387,23 +433,40 @@ def cce_linear_cross_entropy(
         mile_gamma,
         mu_loss_enabled,
         mu_loss_lambda,
+        patch_training_enabled,
     )
 
-    batch_shape = targets.size()
+    if patch_training_enabled:
+        if int(shift) != 0:
+            raise ValueError(
+                "patch_training_enabled does not support shift; align patches upstream."
+            )
+        if softcap is not None:
+            raise ValueError("patch_training_enabled does not currently support softcap.")
+        if return_lse:
+            raise ValueError("patch_training_enabled does not currently support return_lse.")
+        if vocab_parallel_options is not None:
+            raise ValueError("patch_training_enabled does not currently support vocab parallelism.")
 
     e = e.contiguous()
     targets = targets.contiguous()
-
     shift = int(shift)
-    valids = _build_flat_valids(targets, ignore_index, shift)
-
-    e = e.flatten(0, -2)
-    targets = targets.flatten()
-
-    if (targets.data_ptr() % 16) != 0:
-        targets = torch.nn.functional.pad(targets, (0, 1))[:-1]
-
-    assert (targets.data_ptr() % 16) == 0
+    if patch_training_enabled:
+        batch_shape = targets.size()[:-1]
+        e = e.flatten(0, -2)
+        targets = targets.reshape(-1, targets.size(-1))
+        # Normalize an arbitrary ignore_index once so every indexed kernel can
+        # use the same one-sided, out-of-range-safe target predicate.
+        targets = torch.where(targets == ignore_index, -1, targets)
+        valids = None
+    else:
+        batch_shape = targets.size()
+        valids = _build_flat_valids(targets, ignore_index, shift)
+        e = e.flatten(0, -2)
+        targets = targets.flatten()
+        if (targets.data_ptr() % 16) != 0:
+            targets = torch.nn.functional.pad(targets, (0, 1))[:-1]
+        assert (targets.data_ptr() % 16) == 0
     cce_params = CCEParams(
         targets,
         valids,
@@ -424,6 +487,7 @@ def cce_linear_cross_entropy(
         auto_mixed_grad_accum=_auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
+        patch_training_enabled=patch_training_enabled,
     )
 
     return linear_cross_entropy_apply(e, c, bias, cce_params)
