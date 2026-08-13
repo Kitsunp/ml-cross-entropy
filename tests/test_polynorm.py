@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cut_cross_entropy.polynorm import _cute, polynorm, polynorm_reference
+from cut_cross_entropy.polynorm import (
+    _cute,
+    polynorm,
+    polynorm_reference,
+    polynorm_uses_cute,
+)
 from cut_cross_entropy.polynorm import compiler as polynorm_compiler
 
 
@@ -43,6 +48,37 @@ def test_compiled_size_dispatch_keeps_small_expression_visible(monkeypatch) -> N
 
     assert polynorm_compiler._prefer_compiler_fusion(below)
     assert not polynorm_compiler._prefer_compiler_fusion(at_threshold)
+
+
+def test_public_dispatch_query_matches_reference_fallback(monkeypatch) -> None:
+    x = torch.randn(4, 12, requires_grad=True)
+    weight = torch.randn(3, requires_grad=True)
+    bias = torch.randn(1, requires_grad=True)
+    monkeypatch.setattr(
+        polynorm_compiler,
+        "_cute_supported",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        polynorm_compiler,
+        "_prefer_compiler_fusion",
+        lambda _x: True,
+    )
+    assert not polynorm_uses_cute(x, weight, bias)
+
+    monkeypatch.setattr(
+        polynorm_compiler,
+        "_prefer_compiler_fusion",
+        lambda _x: False,
+    )
+    assert polynorm_uses_cute(x, weight, bias)
+
+    monkeypatch.setattr(
+        polynorm_compiler,
+        "_cute_supported",
+        lambda *args, **kwargs: False,
+    )
+    assert not polynorm_uses_cute(x, weight, bias)
 
 
 @pytest.mark.skipif(
