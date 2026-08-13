@@ -62,6 +62,34 @@ def _cute_supported(
     )
 
 
+def polynorm_uses_cute(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    eps: float = 1.0e-6,
+    exclusive_logits: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+) -> bool:
+    """Return whether :func:`polynorm` will dispatch this call to CuTe."""
+    dropout_p = float(dropout_p)
+    needs_backward = torch.is_grad_enabled() and (
+        x.requires_grad or weight.requires_grad or bias.requires_grad
+    )
+    return bool(
+        not _prefer_compiler_fusion(x)
+        and _cute_supported(
+            x,
+            weight,
+            bias,
+            eps,
+            exclusive_logits,
+            dropout_p,
+            needs_backward,
+        )
+    )
+
+
 @torch.library.custom_op(
     "cut_cross_entropy::polynorm_forward",
     mutates_args=(),
@@ -212,17 +240,13 @@ def polynorm(
     dropout_p = float(dropout_p)
     if not 0.0 <= dropout_p < 1.0:
         raise ValueError("dropout_p must be in [0, 1)")
-    needs_backward = torch.is_grad_enabled() and (
-        x.requires_grad or weight.requires_grad or bias.requires_grad
-    )
-    if _prefer_compiler_fusion(x) or not _cute_supported(
+    if not polynorm_uses_cute(
         x,
         weight,
         bias,
-        eps,
-        exclusive_logits,
-        dropout_p,
-        needs_backward,
+        eps=eps,
+        exclusive_logits=exclusive_logits,
+        dropout_p=dropout_p,
     ):
         output = polynorm_reference(
             x,
@@ -238,6 +262,9 @@ def polynorm(
             )
         return output
 
+    needs_backward = torch.is_grad_enabled() and (
+        x.requires_grad or weight.requires_grad or bias.requires_grad
+    )
     original_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
     seeds = (
@@ -262,4 +289,4 @@ def polynorm(
     return output.reshape(original_shape)
 
 
-__all__ = ["polynorm"]
+__all__ = ["polynorm", "polynorm_uses_cute"]
