@@ -66,6 +66,7 @@ def _prepare_forward_inputs(
     ignore_index: int,
     shift: int,
     patch_training_enabled: bool,
+    vocab_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
     batch_shape = targets.size()[:-1] if patch_training_enabled else targets.size()
     e = e.contiguous().flatten(0, -2)
@@ -74,7 +75,7 @@ def _prepare_forward_inputs(
         targets = targets.reshape(-1, targets.size(-1))
         targets = torch.where(targets == ignore_index, -1, targets)
         return e, targets, _empty(e, dtype=torch.int64), batch_shape
-    valids = _build_flat_valids(targets, ignore_index, shift)
+    valids = _build_flat_valids(targets, ignore_index, shift, vocab_size)
     # The compiler-safe path is deliberately restricted to shift > 0.  In
     # that regime _build_flat_valids always returns an index tensor, including
     # the valid all-token and all-ignored edge cases.
@@ -154,7 +155,7 @@ def _cce_backward_op(
     if patch_training_enabled:
         runtime_valids = None
     else:
-        runtime_valids = _build_flat_valids(targets, ignore_index, shift)
+        runtime_valids = _build_flat_valids(targets, ignore_index, shift, c.size(0))
         assert runtime_valids is not None
         valid_count = runtime_valids.size(0)
         lse = lse[:valid_count]
@@ -339,7 +340,7 @@ def _cce_forward_op(
 ]:
     valid_capacity = _maximum_valid_rows(targets, shift, patch_training_enabled)
     e, targets, valids, batch_shape = _prepare_forward_inputs(
-        e, targets, ignore_index, shift, patch_training_enabled
+        e, targets, ignore_index, shift, patch_training_enabled, c.size(0)
     )
     # Custom-op backend implementations run below Autograd.  Recreate only the
     # metadata used by the existing kernel driver; no input storage is mutated.
