@@ -113,7 +113,12 @@ def _cce_lse_split_partials_kernel(
                         (NegCorrectLogit + direct_offs_b * PATCH_SIZE + patch_slot)[:, None],
                         (BLOCK_B, BLOCK_V),
                     )
-                    tl.store(out_ptrs, -logits, mask=target[:, None] == offs_v[None, :])
+                    tl.store(
+                        out_ptrs,
+                        -logits,
+                        mask=(target[:, None] == offs_v[None, :])
+                        & (offs_v[None, :] < V),
+                    )
 
             tile_max = tl.max(logits, axis=1)
             tile_exp = tl.exp(logits - tile_max[:, None])

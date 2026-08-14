@@ -46,6 +46,73 @@ Changing the number of hidden rows or any other tensor shape can still trigger
 ordinary shape specialization; the flag cannot make two different model input
 signatures share one compiled graph.
 
+## Controlling the patch duration
+
+`PatchTrainingSchedule` exposes the phase boundary to the trainer while keeping
+the optimizer step out of the kernel and compiled model:
+
+```python
+from cut_cross_entropy import PatchTrainingSchedule, linear_cross_entropy
+
+schedule = PatchTrainingSchedule(
+    patch_training_steps=120_000,
+    patch_size=4,
+    ignore_index=-100,
+)
+
+# Run this branch in the trainer/data pipeline, before the compiled core.
+phase = schedule.phase(global_step)
+if phase == "patch":
+    # raw_input_ids/labels contain K * T tokens.
+    T = raw_input_ids.size(-1) // schedule.patch_size
+    token_embeddings = token_embedding(raw_input_ids)
+    core_inputs = token_embeddings.unflatten(-2, (T, schedule.patch_size)).mean(-2)
+    next_patch_ids = labels[..., schedule.patch_size :].unflatten(
+        -1, (T - 1, schedule.patch_size)
+    )
+    targets = schedule.targets_for_step(
+        global_step,
+        patch_targets=next_patch_ids,  # [..., T - 1, K]
+    )
+else:
+    # Token input/labels contain T tokens.
+    core_inputs = token_embedding(raw_input_ids)
+    targets = schedule.targets_for_step(
+        global_step,
+        token_targets=labels[..., 1:],  # [..., T - 1]
+    )
+
+# The compiled core receives the same [..., T, D] input shape in both phases.
+hidden_states = compiled_transformer(core_inputs)[..., :-1, :]
+loss = linear_cross_entropy(
+    hidden_states,
+    classifier,
+    targets,
+    patch_training_enabled=True,  # deliberately unchanged across phases
+)
+```
+
+Steps are zero-based. With `patch_training_steps=120_000`, steps 0 through
+119,999 are patch-level and step 120,000 is the first token-level step.
+`is_transition_step(global_step)` identifies that boundary so the trainer can
+save model parameters and recreate optimizer/scheduler state when exact paper
+reproduction is desired. The schedule does not reset training state silently.
+
+The phase branch must remain outside the compiled core. Passing `global_step`
+through `linear_cross_entropy` or switching `patch_training_enabled` at the
+boundary would introduce value guards or another graph. Both phases feed the
+Transformer the same T embedding rows and CCE the same T - 1 aligned hidden
+rows: the paper uses `K * 2048` raw tokens followed by embedding averaging in
+the patch phase and 2048 raw token rows in the token phase. Position IDs and
+attention masks must likewise be rebuilt for T rows before the compiled core.
+
+`labels[..., K:].unflatten(...)` is a non-contiguous view whose leading stride
+still includes the skipped patch. `prepare_patch_targets` normalizes that small
+target tensor to the same contiguous layout produced by
+`prepare_token_targets`. Without this normalization, shapes and dtypes match
+but Dynamo still specializes a second graph on stride/storage offset. Already
+contiguous patch targets are returned without a copy.
+
 ## Relationship to the paper
 
 The paper's complete method contains model/data responsibilities in addition to
@@ -73,10 +140,20 @@ The main experiments used `K=4` and `lambda=2/3`, giving the theoretical cost
 lambda / K + 1 - lambda = (2/3) / 4 + 1/3 = 0.5
 ```
 
-for 180,000 total steps. Their measured eight-A100 patch stage was 3.50x faster
+for 180,000 total steps. This corresponds to 120,000 patch steps followed by
+60,000 token steps. Their measured eight-A100 patch stage was 3.50x faster
 after reducing gradient accumulation to preserve global batch size, and the
 reported total runtime was approximately 0.523x rather than the theoretical
 0.5x because of data-loading and gradient-synchronization overhead.
+
+The supplied official `PatchTrain-main` example uses 90,000 patch steps and
+45,000 token steps instead. That example trains on `pile-uncopyrighted`, which
+the authors describe as containing roughly 25% fewer tokens than the original
+Pile setup. It launches two separate training processes (`patch_size=4`, then
+`patch_size=1` initialized from the first stage), which naturally resets the
+optimizer and scheduler. The graph-stable CCE integration keeps K fixed inside
+the loss instead, but the trainer must still change embedding aggregation and
+training state at the same semantic boundary.
 
 The paper's 370M-model ablation found K=2 and K=4 loss curves nearly identical,
 while K=8 and K=16 degraded performance; K=4 was selected as the efficiency/data
@@ -164,56 +241,134 @@ a CCE implementation: the latter uses CCE's opaque compiler boundary and is a
 supported path for BF16/FP16 compute. FP32 remains available in eager CCE; the
 opaque compiled boundary currently follows its pre-existing BF16/FP16 contract.
 
-## Measured forward feasibility
+## Measured operator feasibility
 
-The following numbers are retained as feasibility evidence, not as final
-forward+backward claims for this production patch.  They were measured on an
-RTX 5070 Ti with PyTorch `2.12.1+cu130`, Triton `3.7.1`, BF16, 512 rows,
-`D=512`, `V=65,536`, `K=4`, bias, `cce_exact`, MiLe `gamma=1`, μ-loss
-`lambda=1e-4`, five explicit warmups and 20 requested repetitions.  The test
+The final checkout was measured on an RTX 5070 Ti with PyTorch
+`2.12.1+cu130`, CUDA 13.0, Triton `3.7.1`, BF16, 512 rows, `D=512`,
+`V=65,536`, `K=4`, bias, `cce_exact`, MiLe `gamma=1`, and μ-loss
+`lambda=1e-4`.  Float32 matmul precision was the training policy `high`; the
+library does not override it.  Each value below is the mean of the medians from
+two fresh, interleaved processes with 30 warmups and 200 repetitions.  The test
 process—not the library—was capped at 10 GiB.
 
-| Forward route | Median latency | Incremental peak | Delta vs one-target base |
+| Route | Forward | Forward + backward | Incremental peak (forward / training) |
 |---|---:|---:|---:|
-| Existing one-target CCE | 0.8956 ms | 41 KiB | baseline |
-| Patch phase, four valid targets | 0.7960 ms | 74 KiB | −11.1% latency, +33 KiB |
-| Token phase, one valid plus three ignored | 0.8036 ms | 74 KiB | −10.3% latency, +33 KiB |
+| Existing one-target CCE | 1.0092 ms | 4.0576 ms | 41,984 / 202,518,016 bytes |
+| Patch phase, four valid targets | 0.8784 ms | 3.7261 ms | 71,168 / 202,532,352 bytes |
+| Token phase, one valid plus three ignored | 0.8814 ms | 3.6703 ms | 71,168 / 202,532,352 bytes |
+| Repeat the embedding through ordinary CCE four times | 2.1554 ms | 11.1848 ms | 2,142,208 / 207,769,088 bytes |
 
-In a separate algorithmic comparison using the same core geometry, one-LSE
-patch CCE measured 0.8179 ms and repeating the embedding through ordinary CCE
-K times measured 1.9928 ms: 2.44× speedup and 59.0% lower latency.  Incremental
-peaks were 75,776 bytes and 2,150,400 bytes respectively.  The fixed K=4 target
-tensor itself adds 12 KiB over K=1 at 512 rows; the measured total incremental
-difference versus the one-target base was 33 KiB after including weights and
-target-loss temporaries.
+The patch route is 59.2% faster in forward and 66.7% faster in the measured
+forward+backward operator than repeating ordinary CCE four times.  Its small
+fixed target/loss workspace adds 29,184 forward bytes or 14,336 training bytes
+over one-target CCE; it avoids the much larger repeated-embedding reference.
 
-These are operator-forward results.  Rerun the benchmark below on the final
-checkout before quoting training-step speed or memory.
+The out-of-range target fix was also checked directly against its immediate
+parent commit in the same alternating protocol.  Patch forward was 0.8784 ms
+after the guard versus 0.8787 ms before it (−0.03%), and forward+backward was
+3.7261 ms versus 3.7737 ms (−1.26%); incremental peaks were byte-identical.
+The hot lock kernel only adds the vocabulary predicate on its already-masked
+final tile, rather than adding bilateral range checks to every tile.
+
+These are isolated CCE operator results, not end-to-end model-step claims.
+Rerun the benchmark below on the final target GPU before quoting whole-training
+throughput or memory.
+
+## End-to-end `max-autotune` validation
+
+`benchmark.patch_training_e2e` exercises a tied-embedding causal Transformer,
+fused CCE, MiLe, μ-loss, backward, and AdamW. Embedding aggregation and phase
+selection stay outside the compiled function; the Transformer plus loss are
+compiled with `fullgraph=True`. The benchmark uses the training precision
+policy `high` and limits only its own process to 10 GiB.
+
+A 99,517-parameter model completed 4,000 measured BF16 steps (2,000 patch then
+2,000 token) after warmup. AdamW was recreated at the transition. The run
+produced one Dynamo graph and zero graph breaks; loss remained finite and moved
+from 6.9099 to 5.5683. Peak allocated memory was 1,036,288 bytes, 417,792 bytes
+above the post-warmup baseline. The patch and token phases measured 1.8837 and
+1.9559 ms/step respectively. Their raw-token throughputs were 67,953 and 16,361
+tokens/s because each patch step consumes four times as many raw tokens. The
+five boundary steps 1998--2002 measured 1.584, 1.599, 2.260, 2.753, and 1.991
+ms: there was no compile-sized transition spike. Recreating AdamW itself took
+0.097 ms of host time. The timer retains the loss on device and converts only
+the final value after synchronization, avoiding a CPU/GPU synchronization in
+every measured step.
+
+The following comparisons process the same number of raw tokens per step.
+"Token base" sends all `K*T` rows through the Transformer and uses ordinary
+causal CCE with `shift=1`; "patch" averages each K-token group, sends T rows,
+and predicts K targets per row. Every row below used BF16, MiLe, μ-loss,
+`high`, `max-autotune`, one graph, and zero graph breaks on the RTX 5070 Ti.
+
+| Geometry (`B,T,D,L,V,K`) | Parameters | Patch / token-base ms | Patch latency delta | Raw-token throughput delta | Forward FLOP proxy saved | Incremental peak patch / base |
+|---|---:|---:|---:|---:|---:|---:|
+| `2,16,64,1,1021,4` | 99,517 | 1.9814 / 2.0330 | -2.53% | +2.60% | 77.19% | 417,792 / 450,560 B |
+| `3,17,96,2,4093,4` (odd) | 545,437 | 2.3771 / 2.4973 | -4.81% | +5.06% | 76.65% | 2,412,032 / 2,493,440 B |
+| `4,64,256,4,8191,4` | 4,206,847 | 2.8294 / 3.0310 | -6.65% | +7.12% | 77.22% | 13,139,456 / 14,199,296 B |
+| `2,32,128,2,65537,4` (wide vocabulary) | 8,717,697 | 2.3707 / 2.5864 | -8.34% | +9.10% | 75.71% | 50,537,472 / 50,670,592 B |
+
+Across these shapes, raw-token throughput improves by 2.60--9.10% (5.97%
+arithmetic mean) and incremental peak allocation falls by 0.26--7.46% (4.57%
+mean). The gain scales with useful Transformer/classifier work because fixed
+kernel-launch, K-target, and optimizer overhead is proportionally larger in the
+smallest model. The wide-vocabulary case saves little peak allocation because
+the shared dense classifier gradient and AdamW state dominate both runs, even
+though step latency improves.
+
+The model FLOPs are counted with PyTorch's `FlopCounterMode`. The CCE column
+adds the dense-dot work implied by the fused vocabulary LSE,
+`2 * rows * V * D`; it is a transparent forward-work proxy, not a claim about
+hardware instruction counts. Forward and backward speed and VRAM are measured,
+not inferred. Because patch targets omit one cross-patch boundary, predicted
+target counts differ slightly at these short sequence lengths; raw-token
+throughput is used for the fair speed comparison.
+
+Rare compiled cases also passed: `K=8,T=2,D=33` and the degenerate
+`K=1,T=3,D=33`, including MiLe, μ-loss, backward, AdamW reset, one graph, and
+zero breaks. During `max-autotune`, candidates that exceeded the GPU's per-block
+resource limit were rejected and valid candidates were selected; those
+candidate rejections are neither VRAM OOMs nor runtime training failures.
 
 ## Reproduction
 
 Forward, with the same extensions and a 10 GiB test-process ceiling:
 
 ```bash
-python benchmark/cce_patch.py \
+python -m benchmark.cce_patch \
   --rows 512 --dim 512 --vocab 65536 --patch-size 4 \
   --dtype bf16 --mile --mu-loss \
-  --warmup 5 --repetitions 20 --max-test-vram-gib 10
+  --warmup 30 --repetitions 200 --max-test-vram-gib 10
 ```
 
 Forward plus backward:
 
 ```bash
-python benchmark/cce_patch.py \
+python -m benchmark.cce_patch \
   --rows 512 --dim 512 --vocab 65536 --patch-size 4 \
   --dtype bf16 --mile --mu-loss --training \
-  --warmup 5 --repetitions 20 --max-test-vram-gib 10
+  --warmup 30 --repetitions 200 --max-test-vram-gib 10
 ```
 
 The benchmark clears warmup gradients and synchronizes before sampling the
 memory baseline.  Its JSON records GPU, PyTorch/Triton versions, dtype, shape,
 warmup/repetition settings, absolute latency, incremental peak bytes, and
 deltas versus one-target CCE.
+
+End-to-end 4,000-step transition:
+
+```bash
+python -m benchmark.patch_training_e2e \
+  --case transition --steps 4000 --patch-steps 2000 \
+  --batch 2 --sequence 16 --dim 64 --layers 1 --heads 4 \
+  --vocab 1021 --patch-size 4 --dtype bf16 \
+  --compile-mode max-autotune --mile --mu-loss \
+  --reset-optimizer-at-transition --max-test-vram-gib 10
+```
+
+For an equal-raw-token performance pair, run the same command twice with
+`--case patch` and `--case token_baseline`. `--sequence` is T; the token base
+automatically uses `patch_size * T` Transformer rows.
 
 ## Verification coverage
 

@@ -6,6 +6,7 @@ from cut_cross_entropy.linear_cross_entropy import (
 )
 from cut_cross_entropy.meap import meap_mask_inputs
 from cut_cross_entropy.mile import linear_mile_loss
+from cut_cross_entropy.patch import PatchTrainingPhase, PatchTrainingSchedule
 from cut_cross_entropy.vocab_parallel import VocabParallelOptions
 
 __all__ = [
@@ -14,6 +15,8 @@ __all__ = [
     "linear_cross_entropy",
     "linear_mile_loss",
     "meap_mask_inputs",
+    "PatchTrainingPhase",
+    "PatchTrainingSchedule",
     "VocabParallelOptions",
 ]
 

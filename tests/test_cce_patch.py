@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cut_cross_entropy import linear_cross_entropy
+from cut_cross_entropy import PatchTrainingSchedule, linear_cross_entropy
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -210,8 +210,106 @@ def test_patch_target_logit_cannot_exceed_single_class_lse() -> None:
         patch_training_enabled=True,
     )
 
-    assert float(loss) >= 0.0
+    assert float(loss.detach()) >= 0.0
     torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("patch_size", [1, 8])
+@pytest.mark.parametrize("forward_reduction", ["lock", "split"])
+def test_patch_extreme_sizes_with_all_invalid_targets_are_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    patch_size: int,
+    forward_reduction: str,
+) -> None:
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", forward_reduction)
+    generator = torch.Generator(device="cuda").manual_seed(117 + patch_size)
+    rows, vocab, dim = 3, 257, 33
+    e = torch.randn(
+        rows,
+        dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+        requires_grad=True,
+    )
+    c = torch.randn(
+        vocab,
+        dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+        requires_grad=True,
+    )
+    targets = torch.full((rows, patch_size), -100, device="cuda", dtype=torch.long)
+    if patch_size > 1:
+        targets[0, 0] = -1
+        targets[1, 1] = vocab
+
+    loss = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        impl="cce_exact",
+        filter_eps=None,
+        patch_training_enabled=True,
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss), rtol=0.0, atol=0.0)
+    assert e.grad is not None and c.grad is not None
+    torch.testing.assert_close(e.grad, torch.zeros_like(e.grad), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(c.grad, torch.zeros_like(c.grad), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("forward_reduction", ["lock", "split"])
+def test_patch_out_of_range_target_is_ignored_before_padded_vocab_load(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_reduction: str,
+) -> None:
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", forward_reduction)
+    generator = torch.Generator(device="cuda").manual_seed(83)
+    rows, patch_size, vocab, dim = 17, 4, 257, 64
+    e = torch.randn(
+        rows,
+        dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    c = torch.randn(
+        vocab,
+        dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    targets = torch.randint(
+        vocab,
+        (rows, patch_size),
+        device="cuda",
+        generator=generator,
+    )
+    targets[3, 2] = vocab + 3
+
+    actual = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        impl="cce_exact",
+        filter_eps=None,
+        patch_training_enabled=True,
+    )
+    expected, _metrics = _dense_patch_loss(
+        e,
+        c,
+        targets,
+        None,
+        mile_gamma=None,
+        mu_loss_lambda=None,
+    )
+
+    assert torch.isfinite(actual)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 def test_patch_training_compiles_five_steps_without_phase_recompile() -> None:
@@ -226,15 +324,28 @@ def test_patch_training_compiles_five_steps_without_phase_recompile() -> None:
         generator=generator,
     )
     base_c = torch.randn(vocab, dim, device="cuda", dtype=torch.bfloat16, generator=generator)
-    patch_targets = torch.randint(
+    schedule = PatchTrainingSchedule(patch_training_steps=3, patch_size=patch_size)
+    raw_patch_targets = torch.randint(
         vocab,
-        (batch, sequence, patch_size),
+        (batch, (sequence + 1) * patch_size),
         device="cuda",
         dtype=torch.long,
         generator=generator,
     )
-    token_targets = torch.full_like(patch_targets, -100)
-    token_targets[..., 0] = patch_targets[..., 0]
+    shifted_patch_targets = raw_patch_targets[..., patch_size:].unflatten(
+        -1, (sequence, patch_size)
+    )
+    assert not shifted_patch_targets.is_contiguous()
+    patch_targets = schedule.prepare_patch_targets(shifted_patch_targets)
+    token_ids = torch.randint(
+        vocab,
+        (batch, sequence),
+        device="cuda",
+        dtype=torch.long,
+        generator=generator,
+    )
+    token_targets = schedule.prepare_token_targets(token_ids)
+    assert patch_targets.stride() == token_targets.stride()
     compile_count = 0
 
     def counting_backend(graph_module, _example_inputs):

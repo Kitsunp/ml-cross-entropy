@@ -371,11 +371,13 @@ def _cce_lse_forward_kernel(
                 (NegCorrectLogit + direct_offs_b * PATCH_SIZE + patch_slot)[:, None],
                 (BLOCK_B, BLOCK_V),
             )
-            tl.store(
-                neg_correct_logit_ptrs,
-                -logits,
-                mask=this_targets[:, None] == offs_v[None, :],
-            )
+            target_match = this_targets[:, None] == offs_v[None, :]
+            if not EVEN_V:
+                # Invalid positive targets can only match padded columns in the
+                # final tile. Reuse its existing vocab mask instead of adding
+                # two target-range comparisons to every hot tile.
+                target_match &= offs_v[None, :] < V
+            tl.store(neg_correct_logit_ptrs, -logits, mask=target_match)
 
     offs_b = direct_offs_b
     this_mx = tl.max(logits, axis=1)

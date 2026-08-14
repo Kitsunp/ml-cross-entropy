@@ -295,7 +295,32 @@ new graph signature. MiLe is normalized over valid target slots, μ-loss is
 applied once per classifier, and MEAP remains an upstream input transformation.
 See [`docs/patch-training.md`](docs/patch-training.md) for the backward
 decomposition, compiler contract, precision policy, current limitations,
-measured forward feasibility, and exact benchmark commands.
+measured operator and 4,000-step `max-autotune` results, geometry crossover,
+VRAM/FLOP analysis, and exact benchmark commands.
+
+Control the trainer-side boundary explicitly without passing the optimizer step
+through the compiled loss:
+
+```python
+from cut_cross_entropy import PatchTrainingSchedule
+
+patch_schedule = PatchTrainingSchedule(
+    patch_training_steps=120_000,
+    patch_size=4,
+)
+
+phase = patch_schedule.phase(global_step)
+targets = patch_schedule.targets_for_step(
+    global_step,
+    patch_targets=next_patch_ids if phase == "patch" else None,
+    token_targets=next_token_ids if phase == "token" else None,
+)
+```
+
+Steps are zero-based, so step `120_000` is the first token-level step. Run this
+selection outside the compiled model, keep `patch_training_enabled=True` in both
+phases, and use `patch_schedule.is_transition_step(global_step)` if the trainer
+must reset optimizer and scheduler state as described by the paper.
 
 
 ### Vocabulary Parallelism

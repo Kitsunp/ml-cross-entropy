@@ -43,6 +43,9 @@ def test_indexed_dot(
     shape: tuple[int, int, int],
     fn: Callable[..., torch.Tensor],
 ):
+    # This test's tight FP32 tolerance validates the IEEE path. Do not inherit
+    # a process-global TF32 policy from a test that ran earlier in the session.
+    torch.set_float32_matmul_precision("highest")
     torch.cuda.manual_seed(0)
 
     if dtype == torch.bfloat16 and not torch.cuda.is_available():
@@ -109,6 +112,27 @@ def test_indexed_dot_masks_out_of_range_targets(dtype: torch.dtype) -> None:
     torch.testing.assert_close(
         legacy_indexed[invalid], torch.zeros_like(legacy_indexed[invalid])
     )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("fn", [cce_lse_kernel_indexed_dot, indexed_neg_dot_forward_kernel])
+def test_indexed_dot_fp32_high_policy_has_bounded_tf32_error(
+    fn: Callable[..., torch.Tensor],
+) -> None:
+    torch.set_float32_matmul_precision("high")
+    torch.cuda.manual_seed(29)
+    rows, vocab, dim = 256, 512, 512
+    e = torch.randn((rows, dim), device="cuda", dtype=torch.float32) / (dim**0.5)
+    c = torch.randn((vocab, dim), device="cuda", dtype=torch.float32)
+    targets = torch.randint(0, vocab, (rows,), device="cuda")
+
+    # Compute the selected logits directly in FP64. A dense FP32 matmul would
+    # inherit the same TF32 policy and is not a precision-independent oracle.
+    reference = -(e.double() * c[targets].double()).sum(dim=1)
+    actual = fn(e, c, targets)
+
+    max_error = (actual.double() - reference).abs().max()
+    assert float(max_error) < 4e-3
 
 
 @skip_no_cuda
