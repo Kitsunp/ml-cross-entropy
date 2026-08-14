@@ -90,15 +90,36 @@ $$
 
 No probability or full-logit matrix is stored.
 
+### Numerical contract at extreme values
+
+The fused weight path enforces the analytical entropy interval
+$0 \leq H_i \leq \log(V)$. This prevents finite but extreme LSE and
+mean-logit values from overflowing their subtraction and cannot change an
+exact entropy value. The `gamma=1` pretraining path keeps its two-launch
+multi-block schedule. Other exponents normalize in log space after subtracting
+the largest observed `log(1 + H)`, so neither the power nor its reduction can
+overflow before the common scale cancels.
+
+For `reduction="mean"`, CCE evaluates `(NLL / valid_tokens) * weight` before
+the final sum. Scaling before multiplication preserves a finite mean when an
+individual unscaled product would exceed FP32. The unweighted NTP diagnostic is
+accumulated as a mean for the same reason. The backward still applies the same
+detached MiLe weight and `1 / valid_tokens` gradient scale.
+
+Class-index targets outside `[0, V)`, excluding the configured `ignore_index`,
+are removed by the existing valid-token compaction. They therefore cannot
+reach indexed classifier loads and are handled consistently by forward and
+backward without a host synchronization.
+
 ## Fused MiLe weight kernels
 
 The token-wise post-processing has two execution paths:
 
 - **Up to 16,384 valid tokens:** one Triton program computes entropy, raw
   weights, the global weight reduction, normalization, and weighted NLL.
-- **More than 16,384 valid tokens:** a bounded-block kernel writes raw weights
-  and contributes one atomic partial sum per program; a second kernel normalizes
-  the weights in place and multiplies NLL.
+- **More than 16,384 valid tokens:** `gamma=0/1` uses a bounded-block weight/sum
+  kernel followed by normalization. General exponents first find the global
+  `log(1 + H)` maximum, then use the same bounded normalized reduction.
 
 The valid-token count is a runtime value, so different padding counts do not
 compile one kernel per exact token count. Only the power-of-two block shape and
@@ -116,8 +137,9 @@ mile_weight: O(valid tokens), saved for backward
 token_loss:  O(valid tokens), transient until reduction
 ```
 
-The multi-block path also uses one FP32 scalar for the raw-weight sum. It does
-not allocate `O(tokens x vocabulary)` storage. Setting `mile_enabled=False`
+The multi-block path uses one FP32 scalar for the weight sum and, for a general
+exponent, one scalar for the log-weight maximum. It does not allocate
+`O(tokens x vocabulary)` storage. Setting `mile_enabled=False`
 keeps the ordinary CCE path and does not request the MiLe mean-logit statistic.
 
 ## Usage
@@ -144,7 +166,7 @@ Setting `return_loss_metrics=True` with `reduction="mean"` returns the loss and
 a dictionary containing `ntp_ce_unweighted`, `mile_reweighting_delta`, and
 `mu_loss`. These compact device scalars satisfy
 $\mathcal L=\mathcal L_{\mathrm{NTP}}+\Delta_{\mathrm{MiLe}}+\mathcal L_\mu$; the unweighted
-NLL sum is reduced inside the MiLe kernel rather than reconstructed from logits.
+NLL mean is reduced inside the MiLe kernel rather than reconstructed from logits.
 
 ## Precision and gradient filtering
 
@@ -161,7 +183,33 @@ comparison is required.
 - CCE integration: [`cut_cross_entropy/cce.py`](../cut_cross_entropy/cce.py)
 - Weighted backward: [`cut_cross_entropy/cce_backward.py`](../cut_cross_entropy/cce_backward.py)
 - Dense and kernel equivalence tests: [`tests/test_cce_mile.py`](../tests/test_cce_mile.py)
+- Extreme-value tests: [`tests/test_cce_numerical_extremes.py`](../tests/test_cce_numerical_extremes.py)
+- Reproducible probes: [`benchmark/cce_numerical_extremes.py`](../benchmark/cce_numerical_extremes.py),
+  [`benchmark/cce_full_extremes.py`](../benchmark/cce_full_extremes.py), and
+  [`benchmark/cce_compile_extreme_profile.py`](../benchmark/cce_compile_extreme_profile.py)
 
 The tests cover gamma values `0`, `0.5`, `1`, and `2`; both kernel-size paths;
 bias, soft-capping, shift, padding/ignore entries, reductions, returned LSE, and
 forward/backward agreement with a dense formulation.
+
+The numerical-hardening run used an RTX 5090, PyTorch `2.13.0+cu130`, CUDA
+`13.0`, and Triton `3.7.1`. The production-like compiled profile used BF16,
+`32,704` valid tokens, `V=151,936`, `D=512`, and
+`torch.compile(mode="max-autotune")`:
+
+| 500-step result | main baseline | hardened |
+|---|---:|---:|
+| Mean forward+backward step | 82.445 ms | 81.721 ms |
+| Minimum / maximum | 80.866 / 82.727 ms | 79.612 / 82.474 ms |
+| Peak allocated | 767,428,608 B | 767,428,608 B |
+| Incremental peak | 578,029,568 B | 578,029,568 B |
+| Finite extreme MiLe cases | 3 / 24 | 24 / 24 |
+
+Reproduce the checks without changing library compile flags:
+
+```bash
+PYTHONPATH=. python benchmark/cce_numerical_extremes.py --steps 500
+PYTHONPATH=. python benchmark/cce_full_extremes.py --steps 500
+PYTHONPATH=. python benchmark/cce_compile_extreme_profile.py --steps 500
+PYTHONPATH=. python -m pytest -q tests/test_cce_numerical_extremes.py tests/test_cce_mile.py tests/test_cce_compile.py
+```

@@ -70,7 +70,12 @@ def torch_compile_linear_cross_entropy(
     targets = targets.contiguous()
 
     shift = int(shift)
-    valids = _build_flat_valids(targets, ignore_index, shift)
+    global_vocab_size = c.size(0) * (
+        1
+        if vocab_parallel_options is None
+        else torch.distributed.get_world_size(vocab_parallel_options.group)
+    )
+    valids = _build_flat_valids(targets, ignore_index, shift, global_vocab_size)
 
     e = e.flatten(0, -2)
     targets = targets.flatten()

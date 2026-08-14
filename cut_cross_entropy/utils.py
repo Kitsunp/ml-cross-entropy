@@ -31,13 +31,17 @@ def _build_flat_valids(
     targets: torch.Tensor,
     ignore_index: int,
     shift: int,
+    vocab_size: int | None = None,
 ) -> torch.Tensor | None:
     if shift != 0:
         targets = targets[..., shift:]
     else:
         targets = targets.flatten()
 
-    valids = (targets != ignore_index).nonzero().to(torch.int32)
+    valid_mask = targets != ignore_index
+    if vocab_size is not None:
+        valid_mask &= (targets >= 0) & (targets < vocab_size)
+    valids = valid_mask.nonzero().to(torch.int32)
 
     if shift == 0:
         assert valids.size(1) == 1

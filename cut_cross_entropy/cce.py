@@ -184,7 +184,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             )
             nll = None
             token_loss = None
-            unweighted_nll_sum = None
+            unweighted_nll_mean = None
         else:
             assert ret.neg_correct_logit is not None
             neg_correct_logit = ret.neg_correct_logit
@@ -205,22 +205,33 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                     neg_correct_logit, pg=params.vocab_parallel_options.group, dtype=lse.dtype
                 )
 
-            nll = neg_correct_logit.add_(lse)
+            nll = neg_correct_logit.add_(lse).clamp_min_(0.0)
             patch_unweighted_ce = None
             patch_target_weight = None
             if params.mile_gamma is not None:
                 assert mean_logit is not None
-                mile_weight, token_loss, unweighted_nll_sum = cce_mile_forward_kernel(
+                mile_weight, token_loss, unweighted_nll_mean = cce_mile_forward_kernel(
                     lse,
                     mean_logit,
                     nll,
                     params.mile_gamma,
-                    return_unweighted_nll_sum=params.return_loss_metrics,
+                    return_unweighted_nll_mean=params.return_loss_metrics,
+                    mean_reduction=params.reduction == "mean",
+                    max_entropy=math.log(
+                        c.size(0)
+                        * (
+                            1
+                            if params.vocab_parallel_options is None
+                            else torch.distributed.get_world_size(
+                                params.vocab_parallel_options.group
+                            )
+                        )
+                    ),
                 )
             else:
                 token_loss = nll
                 mile_weight = None
-                unweighted_nll_sum = None
+                unweighted_nll_mean = None
 
         ctx.save_for_backward(
             e,
@@ -248,7 +259,9 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         if not params.patch_training_enabled:
             assert token_loss is not None
             if reduction == "mean":
-                objective_loss = token_loss.mean()
+                objective_loss = (
+                    token_loss.sum() if params.mile_gamma is not None else token_loss.mean()
+                )
             elif reduction == "sum":
                 objective_loss = token_loss.sum()
             elif reduction == "none":
@@ -262,11 +275,10 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             assert reduction == "mean"
             if patch_unweighted_ce is not None:
                 unweighted_ce = patch_unweighted_ce
-            elif unweighted_nll_sum is None:
+            elif unweighted_nll_mean is None:
                 unweighted_ce = objective_loss
             else:
-                assert nll is not None
-                unweighted_ce = unweighted_nll_sum / max(nll.numel(), 1)
+                unweighted_ce = unweighted_nll_mean
             mu_loss_metric = (
                 mu_loss if mu_loss is not None else objective_loss.new_zeros(())
             )
@@ -462,7 +474,12 @@ def cce_linear_cross_entropy(
         valids = None
     else:
         batch_shape = targets.size()
-        valids = _build_flat_valids(targets, ignore_index, shift)
+        global_vocab_size = c.size(0) * (
+            1
+            if vocab_parallel_options is None
+            else torch.distributed.get_world_size(vocab_parallel_options.group)
+        )
+        valids = _build_flat_valids(targets, ignore_index, shift, global_vocab_size)
         e = e.flatten(0, -2)
         targets = targets.flatten()
         if (targets.data_ptr() % 16) != 0:
