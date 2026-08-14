@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import time
 from collections.abc import Callable
 from typing import Literal
@@ -93,7 +94,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-ratio", type=int, default=2)
     parser.add_argument("--vocab", type=int, default=1021)
     parser.add_argument("--patch-size", type=int, default=4)
-    parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--compile-mode", default="max-autotune")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-test-vram-gib", type=float, default=10.0)
@@ -119,6 +120,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
+    if args.sequence < 2:
+        parser.error("--sequence must be at least 2")
     if args.dim % args.heads != 0:
         parser.error("--dim must be divisible by --heads")
     if not 0 <= args.patch_steps <= args.steps:
@@ -155,9 +158,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
     torch.cuda.set_per_process_memory_fraction(min(1.0, args.max_test_vram_gib / total_gib))
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
-        args.dtype
-    ]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
     schedule = PatchTrainingSchedule(args.patch_steps, args.patch_size)
     torch.manual_seed(20260814)
     torch.cuda.manual_seed_all(20260814)
@@ -264,6 +265,9 @@ def main() -> None:
         dynamic=False,
         mode=args.compile_mode,
     )
+    initial_model_state = {
+        name: value.detach().cpu().clone() for name, value in model.state_dict().items()
+    }
     optimizer = new_optimizer()
 
     def train_step(step: int, pool_index: int) -> torch.Tensor:
@@ -272,6 +276,20 @@ def main() -> None:
         loss = compiled_loss(core_inputs, targets)
         loss.backward()
         optimizer.step()
+        return loss.detach()
+
+    def profiled_train_step(step: int, pool_index: int) -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        core_inputs, targets = prepare(step, pool_index)
+        torch.cuda.nvtx.range_push(f"patch_training_e2e_{args.case}_forward")
+        loss = compiled_loss(core_inputs, targets)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"patch_training_e2e_{args.case}_backward")
+        loss.backward()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"patch_training_e2e_{args.case}_optimizer")
+        optimizer.step()
+        torch.cuda.nvtx.range_pop()
         return loss.detach()
 
     warmup_steps = []
@@ -284,6 +302,14 @@ def main() -> None:
     for warmup_index in range(args.warmup):
         train_step(warmup_steps[warmup_index % len(warmup_steps)], warmup_index % args.pool_size)
     optimizer.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_model_state)
+    del initial_model_state
+    for state in optimizer.state.values():
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+    under_ncu = "NV_COMPUTE_PROFILER_PERFWORKS_DIR" in os.environ
+    measured_train_step = profiled_train_step if under_ncu else train_step
     torch.cuda.synchronize()
     gc.collect()
 
@@ -310,6 +336,8 @@ def main() -> None:
     first_loss_tensor: torch.Tensor | None = None
     final_loss_tensor: torch.Tensor | None = None
 
+    if under_ncu:
+        torch.cuda.nvtx.range_push(f"patch_training_e2e_{args.case}")
     total_start.record()
     if args.case == "transition" and args.patch_steps > 0:
         patch_start.record()
@@ -327,7 +355,7 @@ def main() -> None:
         events = boundary_events.get(step)
         if events is not None:
             events[0].record()
-        loss = train_step(step, step % args.pool_size)
+        loss = measured_train_step(step, step % args.pool_size)
         if events is not None:
             events[1].record()
         if step == 0:
@@ -339,6 +367,8 @@ def main() -> None:
             patch_end.record()
         else:
             token_end.record()
+    if under_ncu:
+        torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
     if first_loss_tensor is None or final_loss_tensor is None:
         raise RuntimeError("The measured loop did not execute any steps.")

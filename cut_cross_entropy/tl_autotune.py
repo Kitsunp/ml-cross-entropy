@@ -394,11 +394,38 @@ def get_autotune_config() -> list[Config]:
 
 
 def _heuristics_from_config(
-    config: Config, fp32_config: Config | None = None, arg_name: str | None = None
+    config: Config,
+    fp32_config: Config | None = None,
+    arg_name: str | None = None,
+    *,
+    adaptive_block_b: bool = False,
 ) -> Callable[..., autotuner.Heuristics]:
+    def block_b(args, default: int, fp32_default: int | None) -> int:
+        if fp32_default is not None and arg_name is not None:
+            if args[arg_name].dtype == torch.float32:
+                return fp32_default
+        if not adaptive_block_b:
+            return default
+        b = args["B"]
+        if b <= 16:
+            return 16
+        if b <= 32:
+            return 32
+        if b <= 64:
+            return 64
+        return default
+
     if fp32_config is None:
+        kwargs = config.all_kwargs()
         return triton.heuristics(
-            {k: (lambda args, _v=v: _v) for k, v in config.all_kwargs().items()}
+            {
+                k: (
+                    (lambda args, _v=v: block_b(args, _v, None))
+                    if k == "BLOCK_B"
+                    else (lambda args, _v=v: _v)
+                )
+                for k, v in kwargs.items()
+            }
         )
     else:
         assert arg_name is not None
@@ -412,8 +439,16 @@ def _heuristics_from_config(
         return triton.heuristics(
             {
                 k: (
-                    lambda args, _v=v, _fp32_v=fp32_v: (
-                        _fp32_v if args[arg_name].dtype == torch.float32 else _v
+                    (
+                        lambda args, _v=v, _fp32_v=fp32_v: block_b(
+                            args, _v, _fp32_v
+                        )
+                    )
+                    if k == "BLOCK_B"
+                    else (
+                        lambda args, _v=v, _fp32_v=fp32_v: (
+                            _fp32_v if args[arg_name].dtype == torch.float32 else _v
+                        )
                     )
                 )
                 for (k, v), fp32_v in zip(keys_opts, fp32_opts, strict=True)
@@ -490,7 +525,12 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
             cache_results=True,
         )
     else:
-        return _heuristics_from_config(_cce_best_config(), _cce_best_config_fp32(), "E")
+        return _heuristics_from_config(
+            _cce_best_config(),
+            _cce_best_config_fp32(),
+            "E",
+            adaptive_block_b=True,
+        )
 
 
 def _bw_total_ops_fn(B, V, D) -> float:
@@ -522,7 +562,10 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
         )
     else:
         return _heuristics_from_config(
-            _cce_backward_heuristic_config(), _cce_backward_best_config_fp32(), "E"
+            _cce_backward_heuristic_config(),
+            _cce_backward_best_config_fp32(),
+            "E",
+            adaptive_block_b=True,
         )
 
 
