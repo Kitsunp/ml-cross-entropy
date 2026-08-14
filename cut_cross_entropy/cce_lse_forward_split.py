@@ -31,6 +31,8 @@ def _cce_lse_split_partials_kernel(
     stride_cd,
     stride_biasv,
     stride_vb,
+    stride_tb,
+    stride_tk,
     BLOCK_B: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -44,6 +46,7 @@ def _cce_lse_split_partials_kernel(
     HAS_TARGETS: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    PATCH_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(0).to(tl.int64)
     pid_split = tl.program_id(1).to(tl.int64)
@@ -100,15 +103,22 @@ def _cce_lse_split_partials_kernel(
 
             if HAS_TARGETS:
                 target_offs_b = offs_b + shift if HAS_SHIFT else offs_b
-                targets = tl.load(
-                    Targets + target_offs_b,
-                    mask=target_offs_b < BMax,
-                    other=V + 1,
-                )
-                out_ptrs = tl.broadcast_to(
-                    (NegCorrectLogit + direct_offs_b)[:, None], (BLOCK_B, BLOCK_V)
-                )
-                tl.store(out_ptrs, -logits, mask=targets[:, None] == offs_v[None, :])
+                for patch_slot in tl.static_range(0, PATCH_SIZE):
+                    target = tl.load(
+                        Targets + target_offs_b * stride_tb + patch_slot * stride_tk,
+                        mask=target_offs_b < BMax,
+                        other=V + 1,
+                    )
+                    out_ptrs = tl.broadcast_to(
+                        (NegCorrectLogit + direct_offs_b * PATCH_SIZE + patch_slot)[:, None],
+                        (BLOCK_B, BLOCK_V),
+                    )
+                    tl.store(
+                        out_ptrs,
+                        -logits,
+                        mask=(target[:, None] == offs_v[None, :])
+                        & (offs_v[None, :] < V),
+                    )
 
             tile_max = tl.max(logits, axis=1)
             tile_exp = tl.exp(logits - tile_max[:, None])
@@ -240,7 +250,18 @@ def cce_lse_forward_split(
     lse = e.new_empty((b,), dtype=torch.float32)
     mean_logit = e.new_empty((b,), dtype=torch.float32) if return_mean_logit else None
     logit_avg = e.new_zeros((v,), dtype=torch.float32) if return_logit_avg else None
-    neg_correct_logit = e.new_zeros((b,), dtype=torch.float32) if targets is not None else None
+    if targets is not None:
+        assert targets.ndim in (1, 2)
+        patch_size = targets.size(1) if targets.ndim == 2 else 1
+        target_stride_b = targets.stride(0)
+        target_stride_k = targets.stride(1) if targets.ndim == 2 else 1
+        target_shape = (b, patch_size) if targets.ndim == 2 else (b,)
+        neg_correct_logit = e.new_zeros(target_shape, dtype=torch.float32)
+    else:
+        patch_size = 1
+        target_stride_b = 1
+        target_stride_k = 1
+        neg_correct_logit = None
 
     _cce_lse_split_partials_kernel[(triton.cdiv(b, block_b), splits)](
         e,
@@ -264,10 +285,13 @@ def cce_lse_forward_split(
         c.stride(1),
         1 if bias is None else bias.stride(0),
         1 if valids is None else valids.stride(0),
+        target_stride_b,
+        target_stride_k,
         BLOCK_B=block_b,
         BLOCK_V=block_v,
         BLOCK_D=block_d,
         SPLITS=splits,
+        PATCH_SIZE=patch_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )

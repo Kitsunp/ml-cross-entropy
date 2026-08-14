@@ -77,6 +77,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -103,6 +104,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -129,6 +131,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]: ...
 
 
@@ -155,6 +158,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: ...
 
 
@@ -181,6 +185,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
@@ -215,6 +220,7 @@ def linear_cross_entropy(
     mile_gamma: float = 1.0,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
+    patch_training_enabled: bool = False,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
@@ -249,6 +255,18 @@ def linear_cross_entropy(
             f"Bias has a different number of elements than c. {bias.size(0)} vs. {c.size(0)}."
         )
 
+    if patch_training_enabled:
+        if int(shift) != 0:
+            raise ValueError(
+                "patch_training_enabled does not support shift; align patches upstream."
+            )
+        if softcap is not None:
+            raise ValueError("patch_training_enabled does not currently support softcap.")
+        if return_lse:
+            raise ValueError("patch_training_enabled does not currently support return_lse.")
+        if vocab_parallel_options is not None:
+            raise ValueError("patch_training_enabled does not currently support vocab parallelism.")
+
     if impl in CCEPresets.names:
         if platform.system() == "Darwin":
             raise RuntimeError(
@@ -282,7 +300,7 @@ def linear_cross_entropy(
             and vocab_parallel_options is None
             and reduction == "mean"
             and not return_lse
-            and int(shift) > 0
+            and (int(shift) > 0 or patch_training_enabled)
             and e.is_cuda
             and compute_dtype in (torch.float16, torch.bfloat16)
         )
@@ -298,6 +316,7 @@ def linear_cross_entropy(
                 mile_gamma,
                 mu_loss_enabled,
                 mu_loss_lambda,
+                patch_training_enabled,
             )
             resolved_filter_eps = _handle_eps(cce_opts["filter_eps"], compute_dtype)
             filter_e_grad = (
@@ -325,6 +344,7 @@ def linear_cross_entropy(
                 mile_gamma,
                 mu_loss_enabled,
                 mu_loss_lambda,
+                patch_training_enabled,
                 compute_dtype == torch.bfloat16,
                 cuda_autocast_enabled,
             )
@@ -349,6 +369,7 @@ def linear_cross_entropy(
                 mile_gamma=mile_gamma,
                 mu_loss_enabled=mu_loss_enabled,
                 mu_loss_lambda=mu_loss_lambda,
+                patch_training_enabled=patch_training_enabled,
             )
     elif impl == "torch_compile":
         if return_loss_metrics:
@@ -357,6 +378,8 @@ def linear_cross_entropy(
             raise ValueError("mile_enabled is only supported by CCE implementations.")
         if mu_loss_enabled:
             raise ValueError("mu_loss_enabled is only supported by CCE implementations.")
+        if patch_training_enabled:
+            raise ValueError("patch_training_enabled is only supported by CCE implementations.")
         loss, lse = torch_compile_linear_cross_entropy(
             e,
             c,
@@ -410,6 +433,7 @@ class LinearCrossEntropy(nn.Module):
         mile_gamma: float = 1.0,
         mu_loss_enabled: bool = False,
         mu_loss_lambda: float = 1e-4,
+        patch_training_enabled: bool = False,
     ):
         super().__init__()
         self.ignore_index = ignore_index
@@ -431,6 +455,7 @@ class LinearCrossEntropy(nn.Module):
         self.mile_gamma = mile_gamma
         self.mu_loss_enabled = mu_loss_enabled
         self.mu_loss_lambda = mu_loss_lambda
+        self.patch_training_enabled = patch_training_enabled
 
     def forward(
         self,
@@ -465,4 +490,5 @@ class LinearCrossEntropy(nn.Module):
             mile_gamma=self.mile_gamma,
             mu_loss_enabled=self.mu_loss_enabled,
             mu_loss_lambda=self.mu_loss_lambda,
+            patch_training_enabled=self.patch_training_enabled,
         )

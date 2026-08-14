@@ -265,6 +265,8 @@ def _cce_lse_forward_kernel(
     stride_cd,
     stride_biasv,
     stride_vb,
+    stride_tb,
+    stride_tk,
     MODE,
     # Meta-parameters
     B_BIN,
@@ -284,6 +286,7 @@ def _cce_lse_forward_kernel(
     DOT_PRECISION: tl.constexpr,
     HAS_TARGETS: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
+    PATCH_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_b = tl.cdiv(B, BLOCK_B)
@@ -358,15 +361,23 @@ def _cce_lse_forward_kernel(
 
     if HAS_TARGETS:
         target_offs_b = offs_b + shift if HAS_SHIFT else offs_b
-        this_targets = tl.load(Targets + target_offs_b, mask=target_offs_b < BMax, other=V + 1)
-        neg_correct_logit_ptrs = tl.broadcast_to(
-            (NegCorrectLogit + direct_offs_b)[:, None], (BLOCK_B, BLOCK_V)
-        )
-        tl.store(
-            neg_correct_logit_ptrs,
-            -logits,
-            mask=this_targets[:, None] == offs_v[None, :],
-        )
+        for patch_slot in tl.static_range(0, PATCH_SIZE):
+            this_targets = tl.load(
+                Targets + target_offs_b * stride_tb + patch_slot * stride_tk,
+                mask=target_offs_b < BMax,
+                other=V + 1,
+            )
+            neg_correct_logit_ptrs = tl.broadcast_to(
+                (NegCorrectLogit + direct_offs_b * PATCH_SIZE + patch_slot)[:, None],
+                (BLOCK_B, BLOCK_V),
+            )
+            target_match = this_targets[:, None] == offs_v[None, :]
+            if not EVEN_V:
+                # Invalid positive targets can only match padded columns in the
+                # final tile. Reuse its existing vocab mask instead of adding
+                # two target-range comparisons to every hot tile.
+                target_match &= offs_v[None, :] < V
+            tl.store(neg_correct_logit_ptrs, -logits, mask=target_match)
 
     offs_b = direct_offs_b
     this_mx = tl.max(logits, axis=1)
@@ -487,6 +498,15 @@ def cce_lse_forward_kernel(
         assert c.shape[0] == bias.shape[0]
 
     V, D = c.shape
+    if targets is not None:
+        assert targets.ndim in (1, 2)
+        patch_size = targets.size(1) if targets.ndim == 2 else 1
+        target_stride_b = targets.stride(0)
+        target_stride_k = targets.stride(1) if targets.ndim == 2 else 1
+    else:
+        patch_size = 1
+        target_stride_b = 1
+        target_stride_k = 1
 
     reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
     if reduction not in {"auto", "lock", "split"}:
@@ -518,14 +538,20 @@ def cce_lse_forward_kernel(
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
     mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
-    # The fixed K=32 path reconstructs targets with a diagonal tl.dot using the
-    # same arithmetic as LSE. Autotuning may select a different K, so keep the
-    # target fused there rather than risk inconsistent rounding.
-    use_indexed_target = targets is not None and os.getenv("CCE_AUTOTUNE", "0") == "0"
+    # The fixed K=32 single-target path reconstructs targets with a diagonal
+    # tl.dot. Patch targets stay fused because every slot must observe the exact
+    # logit tile used by LSE; an independent K-target reduction could round
+    # differently in one-class or highly peaked distributions.
+    use_indexed_target = (
+        targets is not None and targets.ndim == 1 and os.getenv("CCE_AUTOTUNE", "0") == "0"
+    )
     kernel_targets = None if use_indexed_target else targets
     kernel_shift = shift if kernel_targets is not None else 0
+    kernel_target_shape = (B, patch_size) if targets is not None and targets.ndim == 2 else (B,)
     kernel_neg_correct_logit = (
-        e.new_zeros((B,), dtype=torch.float32) if kernel_targets is not None else None
+        e.new_zeros(kernel_target_shape, dtype=torch.float32)
+        if kernel_targets is not None
+        else None
     )
     assert lse.stride(0) == 1
 
@@ -580,6 +606,8 @@ def cce_lse_forward_kernel(
             c_slice.stride(1),  #
             1 if bias_slice is None else bias_slice.stride(0),
             1 if valids_slice is None else valids_slice.stride(0),
+            target_stride_b,
+            target_stride_k,
             # Normalize optional features into cost families. Individual constexpr
             # branches still compile independently, but equivalent modes share one
             # autotune result instead of fragmenting the timing cache.
@@ -592,6 +620,7 @@ def cce_lse_forward_kernel(
             ),
             B_BIN=b_bin_fn(slice_b),
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
+            PATCH_SIZE=patch_size,
         )
 
     fixed_tile_v = 128

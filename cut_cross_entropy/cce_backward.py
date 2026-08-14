@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from cut_cross_entropy.cce_patch import patch_target_backward
 from cut_cross_entropy.mu_loss import add_mu_loss_gradient_kernel
 from cut_cross_entropy.tl_autotune import (
     CCE_LOCK_BLOCK_B,
@@ -721,6 +722,7 @@ def cce_backward_kernel(
     bias_info: TensorInfo | None,
     lse: torch.Tensor,
     mile_weight: torch.Tensor | None,
+    patch_target_weight: torch.Tensor | None,
     mu: torch.Tensor | None,
     mu_vocab_size: torch.Tensor | None,
     mu_loss_lambda: float | None,
@@ -748,6 +750,9 @@ def cce_backward_kernel(
     lse = lse.contiguous()
     if mile_weight is not None:
         mile_weight = mile_weight.contiguous()
+    if patch_target_weight is not None:
+        assert targets is not None and targets.ndim == 2
+        patch_target_weight = patch_target_weight.contiguous()
     if mu is not None:
         assert mu_vocab_size is not None
         assert mu_loss_lambda is not None
@@ -843,6 +848,10 @@ def cce_backward_kernel(
     mile_weight_bound = (
         _mile_weight_bound(c.size(0), mile_gamma) if mile_weight is not None else 1.0
     )
+    if patch_target_weight is not None:
+        # Patch rows can contain a data-dependent number of valid targets.
+        # B is a conservative bound for the normalized dense row coefficient.
+        mile_weight_bound *= effective_b
     safe_scale = (
         _fp16_accum_scale(grad_scale, mile_weight_bound)
         if fp16_scale_mode == "auto" and dlse is None
@@ -897,12 +906,11 @@ def cce_backward_kernel(
     # once the dense BxV work is large enough to repay the extra launch.  Tiny
     # problems keep the already-supported fused path, where launch latency is
     # more expensive than the target comparison.
+    patch_targets = patch_target_weight is not None
     separate_target = (
-        targets is not None
-        and softcap is None
-        and B * c.size(0) >= 1 << 24
+        targets is not None and not patch_targets and softcap is None and B * c.size(0) >= 1 << 24
     )
-    kernel_targets = None if separate_target else targets
+    kernel_targets = None if separate_target or patch_targets else targets
 
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None and not use_atomic_e:
@@ -1051,6 +1059,23 @@ def cce_backward_kernel(
             COMPUTE_DC=dc is not None,
             COMPUTE_DBIAS=dbias is not None,
             num_warps=4,
+        )
+
+    if patch_targets:
+        assert targets is not None
+        assert patch_target_weight is not None
+        patch_target_backward(
+            e,
+            c,
+            targets,
+            patch_target_weight,
+            do,
+            de,
+            dc,
+            dbias,
+            grad_scale,
+            de_accum_scale,
+            dc_accum_scale,
         )
 
     if reduce_e_grad and de is not None:

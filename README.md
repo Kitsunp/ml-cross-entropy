@@ -270,6 +270,58 @@ With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.
 
+### Patch-level training
+
+CCE can predict a fixed patch of target tokens from one hidden-state row without
+repeating that row or its vocabulary LSE. Enable `patch_training_enabled=True`
+and pass targets with shape `(..., Kmax)`:
+
+```python
+loss = linear_cross_entropy(
+    patch_hidden_states,  # [..., D]
+    classifier,          # [V, D]
+    patch_targets,       # [..., Kmax]
+    impl="cce_kahan_full_c",
+    patch_training_enabled=True,
+    mile_enabled=True,
+    mu_loss_enabled=True,
+)
+```
+
+Keep the flag and `Kmax` unchanged at the patch-to-token transition. Put the
+single token target in slot zero and fill the remaining slots with
+`ignore_index`; only data values change, so the transition does not introduce a
+new graph signature. MiLe is normalized over valid target slots, μ-loss is
+applied once per classifier, and MEAP remains an upstream input transformation.
+See [`docs/patch-training.md`](docs/patch-training.md) for the backward
+decomposition, compiler contract, precision policy, current limitations,
+measured operator and 4,000-step `max-autotune` results, geometry crossover,
+VRAM/FLOP analysis, and exact benchmark commands.
+
+Control the trainer-side boundary explicitly without passing the optimizer step
+through the compiled loss:
+
+```python
+from cut_cross_entropy import PatchTrainingSchedule
+
+patch_schedule = PatchTrainingSchedule(
+    patch_training_steps=120_000,
+    patch_size=4,
+)
+
+phase = patch_schedule.phase(global_step)
+targets = patch_schedule.targets_for_step(
+    global_step,
+    patch_targets=next_patch_ids if phase == "patch" else None,
+    token_targets=next_token_ids if phase == "token" else None,
+)
+```
+
+Steps are zero-based, so step `120_000` is the first token-level step. Run this
+selection outside the compiled model, keep `patch_training_enabled=True` in both
+phases, and use `patch_schedule.is_transition_step(global_step)` if the trainer
+must reset optimizer and scheduler state as described by the paper.
+
 
 ### Vocabulary Parallelism
 
