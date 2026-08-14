@@ -4,8 +4,79 @@ import pytest
 import torch
 
 from cut_cross_entropy import PatchTrainingSchedule, linear_cross_entropy
+from cut_cross_entropy.cce_patch import patch_loss_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+@pytest.mark.parametrize(
+    ("rows", "patch_size", "mile_gamma", "return_unweighted"),
+    [
+        (1, 1, None, False),
+        (3, 8, 0.0, True),
+        (30, 4, 1.0, True),
+        (65, 3, 0.5, True),
+        (129, 4, 2.0, True),
+    ],
+)
+def test_patch_loss_fused_small_and_fallback_match_reference(
+    rows: int,
+    patch_size: int,
+    mile_gamma: float | None,
+    return_unweighted: bool,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(700 + rows + patch_size)
+    vocab = 257
+    lse = torch.rand(rows, device="cuda", generator=generator, dtype=torch.float32) + 2.0
+    mean_logit = torch.randn(rows, device="cuda", generator=generator, dtype=torch.float32)
+    neg_correct_logit = -torch.rand(
+        rows,
+        patch_size,
+        device="cuda",
+        generator=generator,
+        dtype=torch.float32,
+    )
+    targets = torch.randint(
+        vocab,
+        (rows, patch_size),
+        device="cuda",
+        generator=generator,
+    )
+    targets[0, 0] = -1
+    if rows > 1:
+        targets[1, -1] = vocab
+
+    actual = patch_loss_forward(
+        lse,
+        mean_logit if mile_gamma is not None else None,
+        neg_correct_logit,
+        targets,
+        vocab,
+        mile_gamma,
+        return_unweighted,
+    )
+
+    valid = (targets >= 0) & (targets < vocab)
+    valid_f32 = valid.float()
+    counts = valid_f32.sum(dim=1)
+    row_nll = ((lse[:, None] + neg_correct_logit) * valid_f32).sum(dim=1)
+    if mile_gamma is None:
+        base_weight = torch.ones_like(lse)
+    else:
+        base_weight = (1.0 + torch.clamp_min(lse - mean_logit, 0.0)).pow(mile_gamma)
+    denominator = (base_weight * counts).sum().clamp_min(1.0)
+    expected_objective = (base_weight * row_nll).sum() / denominator
+    expected_unweighted = row_nll.sum() / counts.sum().clamp_min(1.0)
+    expected_target_weight = base_weight * (rows / denominator)
+    expected_dense_weight = expected_target_weight * counts
+
+    torch.testing.assert_close(actual[0], expected_objective, rtol=1e-5, atol=1e-6)
+    if return_unweighted:
+        torch.testing.assert_close(actual[1], expected_unweighted, rtol=1e-5, atol=1e-6)
+    else:
+        assert actual[1].data_ptr() == actual[0].data_ptr()
+    torch.testing.assert_close(actual[2], expected_dense_weight, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual[3], expected_target_weight, rtol=1e-5, atol=1e-6)
 
 
 def _dense_patch_loss(

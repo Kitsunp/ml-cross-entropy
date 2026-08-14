@@ -13,6 +13,75 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _patch_loss_small_kernel(
+    LSE,
+    MeanLogit,
+    NegCorrectLogit,
+    Targets,
+    Objective,
+    Unweighted,
+    DenseWeight,
+    TargetWeight,
+    B,
+    V,
+    stride_nb,
+    stride_nk,
+    stride_tb,
+    stride_tk,
+    PATCH_SIZE: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_MILE: tl.constexpr,
+    MILE_GAMMA: tl.constexpr,
+    RETURN_UNWEIGHTED: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK_B)
+    slots = tl.arange(0, BLOCK_K)
+    row_mask = rows < B
+    slot_mask = slots < PATCH_SIZE
+    targets = tl.load(
+        Targets + rows[:, None] * stride_tb + slots[None, :] * stride_tk,
+        mask=row_mask[:, None] & slot_mask[None, :],
+        other=V,
+    ).to(tl.int64)
+    valid = row_mask[:, None] & slot_mask[None, :] & (targets >= 0) & (targets < V)
+    valid_f32 = valid.to(tl.float32)
+    counts = tl.sum(valid_f32, axis=1)
+
+    lse = tl.load(LSE + rows, mask=row_mask, other=0.0).to(tl.float32)
+    neg_correct_logit = tl.load(
+        NegCorrectLogit + rows[:, None] * stride_nb + slots[None, :] * stride_nk,
+        mask=row_mask[:, None] & slot_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    row_nll = tl.sum((lse[:, None] + neg_correct_logit) * valid_f32, axis=1)
+
+    if HAS_MILE:
+        mean_logit = tl.load(MeanLogit + rows, mask=row_mask, other=0.0).to(tl.float32)
+        entropy_base = 1.0 + tl.maximum(lse - mean_logit, 0.0)
+        if MILE_GAMMA == 0.0:
+            base_weight = tl.full((BLOCK_B,), 1.0, tl.float32)
+        elif MILE_GAMMA == 1.0:
+            base_weight = entropy_base
+        else:
+            base_weight = tl.exp(MILE_GAMMA * tl.log(entropy_base))
+    else:
+        base_weight = tl.full((BLOCK_B,), 1.0, tl.float32)
+    base_weight = tl.where(row_mask, base_weight, 0.0)
+
+    denominator = tl.maximum(tl.sum(base_weight * counts, axis=0), 1.0)
+    weighted_nll = tl.sum(base_weight * row_nll, axis=0)
+    target_weight = base_weight * (B / denominator)
+    tl.store(TargetWeight + rows, target_weight, mask=row_mask)
+    tl.store(DenseWeight + rows, target_weight * counts, mask=row_mask)
+
+    tl.store(Objective, weighted_nll / denominator)
+    if RETURN_UNWEIGHTED:
+        total_valid = tl.maximum(tl.sum(counts, axis=0), 1.0)
+        tl.store(Unweighted, tl.sum(row_nll, axis=0) / total_valid)
+
+
 def patch_loss_forward(
     lse: torch.Tensor,
     mean_logit: torch.Tensor | None,
@@ -20,6 +89,7 @@ def patch_loss_forward(
     targets: torch.Tensor,
     vocab_size: int,
     mile_gamma: float | None,
+    return_unweighted: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reduce patch targets and build detached backward row weights.
 
@@ -28,6 +98,39 @@ def patch_loss_forward(
     the static row count lets the existing backward retain its ``1 / B``
     reduction without reading a data-dependent valid-target count on the host.
     """
+    rows, patch_size = targets.shape
+    block_b = triton.next_power_of_2(rows) if rows > 0 else 1
+    block_k = triton.next_power_of_2(patch_size)
+    if rows > 0 and block_b <= 128 and block_b * block_k <= 1024:
+        objective = lse.new_empty(())
+        unweighted = lse.new_empty(()) if return_unweighted else objective
+        dense_weight = torch.empty_like(lse)
+        target_weight = torch.empty_like(lse)
+        _patch_loss_small_kernel[(1,)](
+            lse,
+            mean_logit,
+            neg_correct_logit,
+            targets,
+            objective,
+            unweighted,
+            dense_weight,
+            target_weight,
+            rows,
+            vocab_size,
+            neg_correct_logit.stride(0),
+            neg_correct_logit.stride(1),
+            targets.stride(0),
+            targets.stride(1),
+            PATCH_SIZE=patch_size,
+            BLOCK_B=block_b,
+            BLOCK_K=block_k,
+            HAS_MILE=mile_gamma is not None,
+            MILE_GAMMA=0.0 if mile_gamma is None else mile_gamma,
+            RETURN_UNWEIGHTED=return_unweighted,
+            num_warps=4,
+        )
+        return objective, unweighted, dense_weight, target_weight
+
     valid = (targets >= 0) & (targets < vocab_size)
     valid_f32 = valid.to(torch.float32)
     counts = valid_f32.sum(dim=1)
@@ -47,8 +150,11 @@ def patch_loss_forward(
 
     denominator = (base_weight * counts).sum().clamp_min(1.0)
     objective = (nll * valid_f32 * base_weight[:, None]).sum() / denominator
-    total_valid = counts.sum().clamp_min(1.0)
-    unweighted = (nll * valid_f32).sum() / total_valid
+    if return_unweighted:
+        total_valid = counts.sum().clamp_min(1.0)
+        unweighted = (nll * valid_f32).sum() / total_valid
+    else:
+        unweighted = objective
 
     target_weight = base_weight * (lse.numel() / denominator)
     dense_weight = target_weight * counts

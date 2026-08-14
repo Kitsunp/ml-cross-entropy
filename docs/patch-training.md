@@ -280,18 +280,21 @@ throughput or memory.
 fused CCE, MiLe, μ-loss, backward, and AdamW. Embedding aggregation and phase
 selection stay outside the compiled function; the Transformer plus loss are
 compiled with `fullgraph=True`. The benchmark uses the training precision
-policy `high` and limits only its own process to 10 GiB.
+policy `high` and limits only its own process to 10 GiB. This compiled benchmark
+accepts BF16 or FP16; use the eager operator benchmark for FP32. Compilation
+warmup also allocates AdamW state, after which the benchmark restores the
+initial model and zeros the preallocated optimizer state before measurement.
 
 A 99,517-parameter model completed 4,000 measured BF16 steps (2,000 patch then
 2,000 token) after warmup. AdamW was recreated at the transition. The run
 produced one Dynamo graph and zero graph breaks; loss remained finite and moved
-from 6.9099 to 5.5683. Peak allocated memory was 1,036,288 bytes, 417,792 bytes
-above the post-warmup baseline. The patch and token phases measured 1.8837 and
-1.9559 ms/step respectively. Their raw-token throughputs were 67,953 and 16,361
+from 6.9351 to 5.5466. Peak allocated memory was 1,037,312 bytes, 418,816 bytes
+above the post-warmup baseline. The patch and token phases measured 1.8408 and
+1.8385 ms/step respectively. Their raw-token throughputs were 69,535 and 17,406
 tokens/s because each patch step consumes four times as many raw tokens. The
-five boundary steps 1998--2002 measured 1.584, 1.599, 2.260, 2.753, and 1.991
+five boundary steps 1998--2002 measured 1.656, 1.474, 1.760, 2.364, and 2.167
 ms: there was no compile-sized transition spike. Recreating AdamW itself took
-0.097 ms of host time. The timer retains the loss on device and converts only
+0.091 ms of host time. The timer retains the loss on device and converts only
 the final value after synchronization, avoiding a CPU/GPU synchronization in
 every measured step.
 
@@ -303,18 +306,19 @@ and predicts K targets per row. Every row below used BF16, MiLe, μ-loss,
 
 | Geometry (`B,T,D,L,V,K`) | Parameters | Patch / token-base ms | Patch latency delta | Raw-token throughput delta | Forward FLOP proxy saved | Incremental peak patch / base |
 |---|---:|---:|---:|---:|---:|---:|
-| `2,16,64,1,1021,4` | 99,517 | 1.9814 / 2.0330 | -2.53% | +2.60% | 77.19% | 417,792 / 450,560 B |
-| `3,17,96,2,4093,4` (odd) | 545,437 | 2.3771 / 2.4973 | -4.81% | +5.06% | 76.65% | 2,412,032 / 2,493,440 B |
-| `4,64,256,4,8191,4` | 4,206,847 | 2.8294 / 3.0310 | -6.65% | +7.12% | 77.22% | 13,139,456 / 14,199,296 B |
-| `2,32,128,2,65537,4` (wide vocabulary) | 8,717,697 | 2.3707 / 2.5864 | -8.34% | +9.10% | 75.71% | 50,537,472 / 50,670,592 B |
+| `2,16,64,1,1021,4` | 99,517 | 1.8403 / 2.3479 | -21.62% | +27.58% | 77.19% | 417,792 / 450,560 B |
+| `3,17,96,2,4093,4` (odd) | 545,437 | 2.0621 / 2.2794 | -9.53% | +10.54% | 76.65% | 2,412,032 / 2,493,440 B |
+| `4,64,256,4,8191,4` | 4,206,847 | 2.4001 / 2.8774 | -16.59% | +19.88% | 77.22% | 13,139,456 / 14,201,856 B |
+| `2,32,128,2,65537,4` (wide vocabulary) | 8,717,697 | 2.1813 / 2.9531 | -26.13% | +35.38% | 75.71% | 50,537,472 / 50,670,592 B |
 
-Across these shapes, raw-token throughput improves by 2.60--9.10% (5.97%
-arithmetic mean) and incremental peak allocation falls by 0.26--7.46% (4.57%
-mean). The gain scales with useful Transformer/classifier work because fixed
-kernel-launch, K-target, and optimizer overhead is proportionally larger in the
-smallest model. The wide-vocabulary case saves little peak allocation because
-the shared dense classifier gradient and AdamW state dominate both runs, even
-though step latency improves.
+Across these shapes, raw-token throughput improves by 10.54--35.38% (23.35%
+arithmetic mean), step latency falls by 9.53--26.13% (18.47% mean), and
+incremental peak allocation falls by 0.26--7.48% (4.57% mean). The smallest
+case no longer loses to fixed overhead: the small-patch path fuses its scalar
+reductions and the classifier autotuner selects a tile proportional to the
+actual row count instead of padding 30 rows to 128. The wide-vocabulary case
+saves little peak allocation because the shared dense classifier gradient and
+AdamW state dominate both runs, even though step latency improves.
 
 The model FLOPs are counted with PyTorch's `FlopCounterMode`. The CCE column
 adds the dense-dot work implied by the fused vocabulary LSE,
@@ -323,6 +327,37 @@ hardware instruction counts. Forward and backward speed and VRAM are measured,
 not inferred. Because patch targets omit one cross-patch boundary, predicted
 target counts differ slightly at these short sequence lengths; raw-token
 throughput is used for the fair speed comparison.
+
+Nsight Compute 2025.3.1 was also used to measure physical forward work for the
+smallest geometry in the table. The two reports used the same compiled model,
+precision, extensions, and inputs as the latency comparison. Unlike the
+algorithmic proxy, these counters include tile padding and auxiliary kernels:
+
+| Physical NCU counter | Optimized patch | Token base | Patch delta |
+|---|---:|---:|---:|
+| Forward kernels | 23 | 31 | -25.81% |
+| Tensor BF16-to-FP32 FLOPs | 23,068,672 | 42,467,328 | -45.68% |
+| All measured floating-point operations | 24,662,785 | 44,943,407 | -45.12% |
+| DRAM bytes | 968,704 | 1,561,088 | -37.95% |
+| Summed kernel duration | 69,440 ns | 99,392 ns | -30.14% |
+
+The previous implementation required 47 forward kernels, 37,943,675 measured
+floating-point operations, 1,804,032 DRAM bytes, and 134,432 ns of summed kernel
+duration for the same patch input. Fusing the small patch reduction and adapting
+the classifier tile therefore remove 51.06% of its launches, 35.00% of its
+executed floating-point work, 46.30% of its DRAM traffic, and 48.35% of its
+summed kernel duration. The 77.19% proxy still describes mathematical work
+rather than hardware instructions, but the optimized path now converts a
+material part of that saving into a measured 45.12% physical FLOP reduction
+against token base.
+
+The matching backward profile measured 12,854,272 floating-point operations,
+635,034 DRAM bytes, and 14,284 ns for patch, versus 51,403,776 operations,
+584,090 bytes, and 17,011 ns for token base. That is 74.99% fewer operations and
+16.03% less summed kernel duration; DRAM traffic is 8.72% higher because the
+patch route updates several correct-class targets per retained row. NCU replays
+kernels to collect counters, so the end-to-end wall time printed by a profiled
+run is intentionally not used as a latency result.
 
 Rare compiled cases also passed: `K=8,T=2,D=33` and the degenerate
 `K=1,T=3,D=33`, including MiLe, μ-loss, backward, AdamW reset, one graph, and
@@ -369,6 +404,24 @@ python -m benchmark.patch_training_e2e \
 For an equal-raw-token performance pair, run the same command twice with
 `--case patch` and `--case token_baseline`. `--sequence` is T; the token base
 automatically uses `patch_size * T` Transformer rows.
+
+To reproduce the physical forward counters, first run each case normally once
+so `max-autotune` can populate its cache. Then profile the measured forward NVTX
+range. This example records the patch case; replace both `patch` occurrences
+with `token_baseline` for the matching baseline:
+
+```bash
+ncu --export patch-forward --target-processes application-only \
+  --nvtx --nvtx-include 'patch_training_e2e_patch_forward/' \
+  --metrics \
+sm__ops_path_tensor_src_bf16_dst_fp32.sum,smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,smsp__sass_thread_inst_executed_op_fmul_pred_on.sum,smsp__sass_thread_inst_executed_op_hadd_pred_on.sum,smsp__sass_thread_inst_executed_op_hfma_pred_on.sum,smsp__sass_thread_inst_executed_op_hmul_pred_on.sum,dram__bytes.sum,gpu__time_duration.sum \
+  python -m benchmark.patch_training_e2e \
+  --case patch --steps 1 --warmup 4 --batch 2 --sequence 16 --dim 64 \
+  --layers 1 --heads 4 --vocab 1021 --patch-size 4 --dtype bf16 \
+  --compile-mode max-autotune --mile --mu-loss --max-test-vram-gib 10
+
+python -m benchmark.patch_ncu_report patch-forward.ncu-rep
+```
 
 ## Verification coverage
 

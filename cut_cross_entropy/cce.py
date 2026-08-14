@@ -180,6 +180,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                 targets,
                 c.size(0),
                 params.mile_gamma,
+                params.return_loss_metrics,
             )
             nll = None
             token_loss = None
