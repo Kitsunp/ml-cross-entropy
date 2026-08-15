@@ -32,6 +32,10 @@ SWIZZLE_M = 4
 SWIZZLE_S = 3
 DESCRIPTOR_ALIGNMENT = 32
 MAX_DROPOUT_P = ((1 << 32) - 1) / (1 << 32)
+# Leave eight exponent bits of headroom below FP32 max. Ordinary rows keep the
+# original two reads; only rows whose sixth-moment sum exceeds this value scan
+# for a power-of-two scale and recompute bounded moments.
+RAW_MOMENT_SAFE_SUM6 = float(2**120)
 
 
 if cute is not None and cutlass is not None and cuda is not None:
@@ -61,7 +65,7 @@ if cute is not None and cutlass is not None and cuda is not None:
         )
         norms = allocator.allocate_tensor(
             element_type=cutlass.Float32,
-            layout=cute.make_layout((3,)),
+            layout=cute.make_layout((4,)),
             byte_alignment=16,
         )
 
@@ -104,18 +108,101 @@ if cute is not None and cutlass is not None and cuda is not None:
             inv_width = cutlass.Float32(1.0) / cutlass.Float32(hidden)
             eps = cutlass.Float32(1.0e-6)
             if lane == 0:
-                norms[0] = cute.math.rsqrt(block_sum2 * inv_width + eps)
-                norms[1] = cute.math.rsqrt(block_sum4 * inv_width + eps)
-                norms[2] = cute.math.rsqrt(block_sum6 * inv_width + eps)
-                if cutlass.const_expr(save_stats):
-                    stats[row, 0] = norms[0]
-                    stats[row, 1] = norms[1]
-                    stats[row, 2] = norms[2]
+                inv_scale = cutlass.Float32(1.0)
+                if block_sum6 > cutlass.Float32(RAW_MOMENT_SAFE_SUM6):
+                    inv_scale = cutlass.Float32(0.0)
+                norms[0] = inv_scale
+                if inv_scale == cutlass.Float32(1.0):
+                    norms[1] = cute.math.rsqrt(block_sum2 * inv_width + eps)
+                    norms[2] = cute.math.rsqrt(block_sum4 * inv_width + eps)
+                    norms[3] = cute.math.rsqrt(block_sum6 * inv_width + eps)
         cute.arch.sync_threads()
 
-        inv1 = cutlass.Float32(norms[0])
-        inv2 = cutlass.Float32(norms[1])
-        inv3 = cutlass.Float32(norms[2])
+        inv_scale = cutlass.Float32(norms[0])
+        if inv_scale == cutlass.Float32(0.0):
+            max_abs = cutlass.Float32(0.0)
+            for group in range(thread, x.shape[1], block_threads):
+                cute.autovec_copy(x[row, group, None], values)
+                for item in cutlass.range_constexpr(vector_width):
+                    value = cutlass.Float32(values[item])
+                    max_abs = cute.math.max(max_abs, cute.math.abs(value))
+            max_abs = cute.arch.warp_reduction_max(max_abs)
+            if lane == 0:
+                partials[warp, 0] = max_abs
+            cute.arch.sync_threads()
+            if warp == 0:
+                block_max_abs = cutlass.Float32(0.0)
+                if lane < num_warps:
+                    block_max_abs = cutlass.Float32(partials[lane, 0])
+                block_max_abs = cute.arch.warp_reduction_max(block_max_abs)
+                if lane == 0:
+                    scale_exponent = cute.math.ceil(
+                        cute.math.log2(block_max_abs)
+                    )
+                    if scale_exponent > cutlass.Float32(127.0):
+                        scale_exponent = cutlass.Float32(127.0)
+                    scale = cute.math.exp2(scale_exponent)
+                    norms[0] = cutlass.Float32(1.0) / scale
+            cute.arch.sync_threads()
+            inv_scale = cutlass.Float32(norms[0])
+
+        if inv_scale != cutlass.Float32(1.0):
+            scaled_sum2 = cutlass.Float32(0.0)
+            scaled_sum4 = cutlass.Float32(0.0)
+            scaled_sum6 = cutlass.Float32(0.0)
+            for group in range(thread, x.shape[1], block_threads):
+                cute.autovec_copy(x[row, group, None], values)
+                for item in cutlass.range_constexpr(vector_width):
+                    value = cutlass.Float32(values[item]) * inv_scale
+                    value2 = value * value
+                    value3 = value * value2
+                    scaled_sum2 = scaled_sum2 + value2
+                    scaled_sum4 = scaled_sum4 + value2 * value2
+                    scaled_sum6 = scaled_sum6 + value3 * value3
+            scaled_sum2 = cute.arch.warp_reduction_sum(scaled_sum2)
+            scaled_sum4 = cute.arch.warp_reduction_sum(scaled_sum4)
+            scaled_sum6 = cute.arch.warp_reduction_sum(scaled_sum6)
+            if lane == 0:
+                partials[warp, 0] = scaled_sum2
+                partials[warp, 1] = scaled_sum4
+                partials[warp, 2] = scaled_sum6
+            cute.arch.sync_threads()
+            if warp == 0:
+                block_sum2 = cutlass.Float32(0.0)
+                block_sum4 = cutlass.Float32(0.0)
+                block_sum6 = cutlass.Float32(0.0)
+                if lane < num_warps:
+                    block_sum2 = cutlass.Float32(partials[lane, 0])
+                    block_sum4 = cutlass.Float32(partials[lane, 1])
+                    block_sum6 = cutlass.Float32(partials[lane, 2])
+                block_sum2 = cute.arch.warp_reduction_sum(block_sum2)
+                block_sum4 = cute.arch.warp_reduction_sum(block_sum4)
+                block_sum6 = cute.arch.warp_reduction_sum(block_sum6)
+                inv_width = cutlass.Float32(1.0) / cutlass.Float32(hidden)
+                eps = cutlass.Float32(1.0e-6)
+                scale2 = inv_scale * inv_scale
+                if lane == 0:
+                    norms[1] = cute.math.rsqrt(
+                        block_sum2 * inv_width + eps * scale2
+                    )
+                    norms[2] = cute.math.rsqrt(
+                        block_sum4 * inv_width + eps * scale2 * scale2
+                    )
+                    norms[3] = cute.math.rsqrt(
+                        block_sum6 * inv_width
+                        + eps * scale2 * scale2 * scale2
+                    )
+            cute.arch.sync_threads()
+
+        inv1 = cutlass.Float32(norms[1])
+        inv2 = cutlass.Float32(norms[2])
+        inv3 = cutlass.Float32(norms[3])
+        if cutlass.const_expr(save_stats):
+            if thread == 0:
+                stats[row, 0] = inv_scale
+                stats[row, 1] = inv1
+                stats[row, 2] = inv2
+                stats[row, 3] = inv3
         w3 = cutlass.Float32(weight[0])
         w2 = cutlass.Float32(weight[1])
         w1 = cutlass.Float32(weight[2])
@@ -169,7 +256,7 @@ if cute is not None and cutlass is not None and cuda is not None:
                     c3 >= cutlass.Uint32(dropout_threshold)
                 ) * dropout_scale
             for item in cutlass.range_constexpr(vector_width):
-                value = cutlass.Float32(values[item])
+                value = cutlass.Float32(values[item]) * inv_scale
                 value2 = value * value
                 value3 = value * value2
                 result = dropout_values[item] * (
@@ -255,7 +342,6 @@ if cute is not None and cutlass is not None and cuda is not None:
         for group in range(thread, x.shape[1], block_threads):
             cute.autovec_copy(x[row, group, None], value_fragment)
             cute.autovec_copy(grad_output[row, group, None], grad_fragment)
-            cute.autovec_copy(value_fragment, values[group, None])
             cute.autovec_copy(grad_fragment, grads[group, None])
             if cutlass.const_expr(dropout_p == 0.0):
                 for item in cutlass.range_constexpr(vector_width):
@@ -299,7 +385,9 @@ if cute is not None and cutlass is not None and cuda is not None:
                     c3 >= cutlass.Uint32(dropout_threshold)
                 ) * dropout_scale
             for item in cutlass.range_constexpr(vector_width):
-                value = cutlass.Float32(value_fragment[item])
+                value = cutlass.Float32(value_fragment[item]) * cutlass.Float32(
+                    stats[row, 0]
+                )
                 grad = cutlass.Float32(grad_fragment[item]) * dropout_values[item]
                 value2 = value * value
                 value3 = value * value2
@@ -307,6 +395,11 @@ if cute is not None and cutlass is not None and cuda is not None:
                 dot2 = dot2 + grad * value2
                 dot3 = dot3 + grad * value3
                 grad_sum = grad_sum + grad
+                if cutlass.const_expr(x.element_type == cutlass.BFloat16):
+                    value_fragment[item] = cutlass.BFloat16(value)
+                else:
+                    value_fragment[item] = value
+            cute.autovec_copy(value_fragment, values[group, None])
 
         dot1 = cute.arch.warp_reduction_sum(dot1)
         dot2 = cute.arch.warp_reduction_sum(dot2)
@@ -338,9 +431,9 @@ if cute is not None and cutlass is not None and cuda is not None:
                 totals[1] = block_dot2
                 totals[2] = block_dot3
                 totals[3] = block_grad_sum
-                inv1 = cutlass.Float32(stats[row, 0])
-                inv2 = cutlass.Float32(stats[row, 1])
-                inv3 = cutlass.Float32(stats[row, 2])
+                inv1 = cutlass.Float32(stats[row, 1])
+                inv2 = cutlass.Float32(stats[row, 2])
+                inv3 = cutlass.Float32(stats[row, 3])
                 partials[row, 0] = block_dot3 * inv3
                 partials[row, 1] = block_dot2 * inv2
                 partials[row, 2] = block_dot1 * inv1
@@ -350,13 +443,23 @@ if cute is not None and cutlass is not None and cuda is not None:
         dot1 = cutlass.Float32(totals[0])
         dot2 = cutlass.Float32(totals[1])
         dot3 = cutlass.Float32(totals[2])
-        inv1 = cutlass.Float32(stats[row, 0])
-        inv2 = cutlass.Float32(stats[row, 1])
-        inv3 = cutlass.Float32(stats[row, 2])
+        inv_scale = cutlass.Float32(stats[row, 0])
+        inv1 = cutlass.Float32(stats[row, 1])
+        inv2 = cutlass.Float32(stats[row, 2])
+        inv3 = cutlass.Float32(stats[row, 3])
         w3 = cutlass.Float32(weight[0])
         w2 = cutlass.Float32(weight[1])
         w1 = cutlass.Float32(weight[2])
         inv_width = cutlass.Float32(1.0) / cutlass.Float32(hidden)
+        mean1 = cutlass.Float32(1.0) / (inv1 * inv1)
+        mean2 = cutlass.Float32(1.0) / (inv2 * inv2)
+        mean3 = cutlass.Float32(1.0) / (inv3 * inv3)
+        mean_dot1 = dot1 * inv_width
+        mean_dot2 = dot2 * inv_width
+        mean_dot3 = dot3 * inv_width
+        coeff1 = w1 * inv_scale * inv1 / mean1
+        coeff2 = cutlass.Float32(2.0) * w2 * inv_scale * inv2 / mean2
+        coeff3 = cutlass.Float32(3.0) * w3 * inv_scale * inv3 / mean3
         direct1 = w1 * inv1
         direct2 = cutlass.Float32(2.0) * w2 * inv2
         direct3 = cutlass.Float32(3.0) * w3 * inv3
@@ -428,9 +531,23 @@ if cute is not None and cutlass is not None and cuda is not None:
                 value = cutlass.Float32(value_fragment[item])
                 grad = cutlass.Float32(grad_fragment[item]) * dropout_values[item]
                 value2 = value * value
-                direct = direct1 + value * (direct2 + direct3 * value)
-                correction = value * (corr1 + value2 * (corr2 + corr3 * value2))
-                result = grad * direct - correction
+                value3 = value * value2
+                result = cutlass.Float32(0.0)
+                if inv_scale == cutlass.Float32(1.0):
+                    direct = direct1 + value * (direct2 + direct3 * value)
+                    correction = value * (
+                        corr1 + value2 * (corr2 + corr3 * value2)
+                    )
+                    result = grad * direct - correction
+                else:
+                    branch1 = coeff1 * (grad * mean1 - value * mean_dot1)
+                    branch2 = coeff2 * value * (
+                        grad * mean2 - value2 * mean_dot2
+                    )
+                    branch3 = coeff3 * value2 * (
+                        grad * mean3 - value3 * mean_dot3
+                    )
+                    result = branch1 + branch2 + branch3
                 if cutlass.const_expr(grad_x.element_type == cutlass.BFloat16):
                     grad_x_fragment[item] = cutlass.BFloat16(result)
                 else:
@@ -721,7 +838,7 @@ def forward(
     bias = _aligned_contiguous(bias)
     output = torch.empty_like(x)
     stats_rows = x.shape[0] if save_stats else 1
-    stats = torch.empty((stats_rows, 3), device=x.device, dtype=torch.float32)
+    stats = torch.empty((stats_rows, 4), device=x.device, dtype=torch.float32)
     shape = _kernel_shape(x)
     tensors = (
         x.view(shape),

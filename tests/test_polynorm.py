@@ -175,10 +175,114 @@ def test_cuda_inference_uses_constant_size_dummy_stats() -> None:
         save_stats=False,
     )
 
-    assert stats.shape == (1, 3)
+    assert stats.shape == (1, 4)
     torch.testing.assert_close(
         output,
         polynorm_reference(x, weight, bias),
         rtol=2.0e-2,
         atol=2.0e-2,
+    )
+
+
+def _polynorm_float64_oracle(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    x64 = x.double()
+    square = x64.square()
+    cube = x64 * square
+    branches = (
+        cube * (cube.square().mean(-1, keepdim=True) + 1.0e-6).rsqrt(),
+        square * (square.square().mean(-1, keepdim=True) + 1.0e-6).rsqrt(),
+        x64 * (square.mean(-1, keepdim=True) + 1.0e-6).rsqrt(),
+    )
+    return sum(
+        weight[index].double() * branch
+        for index, branch in enumerate(branches)
+    ) + bias.double()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _cute.is_available(),
+    reason="CUDA and nvidia-cutlass-dsl are required",
+)
+@pytest.mark.parametrize(
+    "scale",
+    (65_536.0, 1_048_576.0, 1.0e13, torch.finfo(torch.float32).max),
+)
+def test_cuda_scaled_rows_match_float64_forward_and_backward(scale: float) -> None:
+    pattern = torch.linspace(
+        -1.0,
+        1.0,
+        1536,
+        device="cuda",
+        dtype=torch.float32,
+    ).reshape(1, -1)
+    x = (pattern * scale).detach().requires_grad_()
+    weight = torch.tensor(
+        (0.37, -0.21, 0.58),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    bias = torch.tensor(
+        (0.13,), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    grad_output = torch.cos(pattern * 3.0)
+
+    assert polynorm_uses_cute(x, weight, bias)
+    actual = polynorm(x, weight, bias)
+    assert torch.isfinite(actual).all()
+    expected = _polynorm_float64_oracle(x, weight, bias)
+    actual_gradients = torch.autograd.grad(
+        actual, (x, weight, bias), grad_output
+    )
+    expected_gradients = torch.autograd.grad(
+        expected, (x, weight, bias), grad_output.double()
+    )
+
+    assert all(torch.isfinite(gradient).all() for gradient in actual_gradients)
+    torch.testing.assert_close(
+        actual.double(), expected, rtol=2.0e-5, atol=2.0e-5
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(
+            actual_gradient.double(),
+            expected_gradient.double(),
+            rtol=2.0e-4,
+            atol=2.0e-5,
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _cute.is_available(),
+    reason="CUDA and nvidia-cutlass-dsl are required",
+)
+def test_cuda_rescaling_boundary_selects_expected_path() -> None:
+    seeds = torch.empty(4, device="cuda", dtype=torch.int64)
+    weight = torch.ones(3, device="cuda", dtype=torch.float32) / 3
+    bias = torch.zeros(1, device="cuda", dtype=torch.float32)
+    inputs = torch.tensor(
+        ((524_288.0,) * 4, (1_048_576.0,) * 4),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    output, stats = _cute.forward(
+        inputs,
+        seeds,
+        weight,
+        bias,
+        dropout_p=0.0,
+        save_stats=True,
+    )
+
+    assert torch.isfinite(output).all()
+    assert stats[0, 0].item() == 1.0
+    assert stats[1, 0].item() == 1.0 / 1_048_576.0
+    torch.testing.assert_close(
+        output[0], output[1], rtol=2.0e-5, atol=2.0e-5
     )
