@@ -123,7 +123,7 @@ def _polynorm_forward_fake(
     del seeds, weight, bias, dropout_p
     return (
         torch.empty_like(x),
-        torch.empty((x.shape[0], 3), device=x.device, dtype=torch.float32),
+        torch.empty((x.shape[0], 4), device=x.device, dtype=torch.float32),
     )
 
 

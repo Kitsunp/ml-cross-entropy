@@ -37,9 +37,9 @@ The supported CuTe path uses the following design:
 - FP32 moments, normalized branches, direct derivatives, and reductions;
 - an output in the input dtype, giving a BF16 handoff to the next training
   operation without a full FP32 activation tensor;
-- saved FP32 inverse norms only (`rows x 3`) during training, rather than
-  materialized powers or normalized branches. Inference compiles out the stores
-  and uses only a constant-size internal placeholder;
+- saved FP32 row scale and inverse norms only (`rows x 4`) during training,
+  rather than materialized powers or normalized branches. Inference compiles
+  out the stores and uses only a constant-size internal placeholder;
 - backward recomputation of powers and dropout decisions;
 - deterministic FP32 row/parameter reduction;
 - an XOR shared-memory layout `Swizzle<2,4,3>` in backward. The same logical
@@ -70,6 +70,52 @@ Larger tensors use the CuTe custom op. This internal, static dispatch avoids
 the fixed custom-op cost at small batch/sequence sizes without adding a user
 flag. Eager execution continues to prefer CuTe because an unfused eager
 reference would launch many separate kernels.
+
+## Numerically bounded high-magnitude path
+
+The ordinary path preserves the original operation order. It forms the three
+FP32 moment sums and uses the same forward and backward arithmetic as before.
+The sixth-moment sum is also a scalar safety detector. When it exceeds `2^120`,
+the row takes an exceptional path:
+
+```text
+s = min(next_power_of_two(max(abs(x))), 2^127)
+q = x / s
+```
+
+The kernel then evaluates each branch as
+
+```text
+q^k / sqrt(mean(q^(2k)) + eps / s^(2k)),  k in {1, 2, 3}
+```
+
+which is algebraically identical to the public PyTorch expression for every
+finite positive `s`. The cap keeps the scale itself finite at the top of the
+FP32 range; `abs(q) < 2` still keeps the cubic value and sixth moment bounded.
+The scaled backward uses the factored vector-Jacobian product; the common path
+retains the previous evaluation order because the factored order showed larger
+BF16 cancellation on ordinary rows.
+
+The PyTorch fallback is intentionally unchanged. Consequently, supported
+ordinary inputs have the same inference and training semantics with or without
+CuTe. At magnitudes where the fallback itself overflows while forming `x**6`,
+the CuTe result deliberately remains finite; that is the safety difference this
+path provides, not a change to the PolyNorm definition.
+
+Validation on RTX 5090 used PyTorch `2.13.0+cu130`, CUDA runtime `13.0`, and
+nvidia-cutlass-dsl `4.7.0`. Rows on both sides of the dispatch boundary, rows
+scaled to `1e13`, and the largest finite FP32 scale matched an independent FP64
+oracle in forward and backward. Six-layer, five-step compiled training
+completed with finite outputs and FP32-master updates in FP32, BF16, and
+TorchAO FP8 modes.
+
+For `8192 x 1536` BF16 under `max-autotune`, paired clean-process medians were
+`0.19333 ms` on the preceding implementation and `0.19408 ms` after hardening
+for forward plus backward. Forward-only inference measured `0.06370 ms` and
+`0.06358 ms`, respectively. Compiled peak allocated memory was unchanged at
+`75,508,224` bytes. These measurements use isolated Inductor cache directories
+so custom-op metadata from the `rows x 3` and `rows x 4` implementations cannot
+cross-contaminate the comparison.
 
 ## Stateless Philox dropout
 
