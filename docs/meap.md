@@ -65,11 +65,55 @@ occupancy, so it would require a separate multi-block design and benchmark.
 2. Reuse the existing padding mask directly. Build an eligibility mask only
    when BOS, EOS, or other protected positions also need to be excluded.
 3. Call `meap_mask_inputs` once, before the model forward.
-4. Run the ordinary causal model with the original causal and padding masks.
-5. Pass its hidden states and the clean labels to `linear_cross_entropy`.
+4. Compose dense or Leviathan embeddings and optional Spelling Bee features.
+5. Replace selected positions with one independent trainable MEAP vector.
+   This override must be the final input-embedding operation.
+6. Run the ordinary causal model with the original causal and padding masks.
+7. Pass its hidden states and the clean labels to `linear_cross_entropy`.
 
 MEAP is not part of the CCE loss kernel. Calling it after the model or from
 inside CCE would be too late to change the contextual hidden states.
+
+## Dedicated embedding contract
+
+The mask ID must be a reserved vocabulary ID that is absent from clean data and
+different from PAD, BOS, and EOS. Reusing PAD is incorrect for three separate
+reasons: a dense embedding commonly has `padding_idx=pad_token_id` and therefore
+does not learn that row; Leviathan derives the ID through shared codebooks; and
+Spelling Bee adds shared byte parameters. A final independent override avoids
+all three couplings without changing clean tokens.
+
+```python
+from cut_cross_entropy import MEAPEmbeddingOverride
+
+self.meap_embedding = MEAPEmbeddingOverride(hidden_size, mask_token_id)
+
+# `composed` is already the result of either dense or Leviathan embedding and
+# any optional Spelling Bee augmentation.
+composed = self.meap_embedding(masked_input_ids, composed)
+```
+
+For a continuous migration from a legacy PAD-based checkpoint, compute the old
+PAD representation after every active embedding augmentation and call
+`meap_embedding.initialize_from(old_final_pad_embedding)` once. New training can
+use the normal model initializer.
+
+### Optional backend requirements
+
+| Execution case | MEAP masking API | Triton/CUDA | Dedicated vector |
+| --- | --- | --- | --- |
+| Active MEAP training, `implementation="triton"` | Required | Required | Required |
+| Active MEAP training, `implementation="torch"` | Required | Optional | Required |
+| Clean training with MEAP disabled | Optional | Optional | Harmless/optional |
+| Evaluation or inference | Not required by MEAP | Optional | Loaded from checkpoint when present |
+
+The model must defer its backend availability check until active MEAP training.
+Merely loading a checkpoint with `use_meap=True` must not make inference depend
+on the corruption kernel. Other configured loss backends can retain their own
+requirements. Labels and attention masks always remain clean.
+
+The override is deliberately after every optional route, so the same contract
+covers dense, dense+Spelling Bee, Leviathan, and Leviathan+Spelling Bee.
 
 ## Kernel contract
 
@@ -194,3 +238,56 @@ MEAP positions are sampled.
 Validation and inference should use clean inputs (`enabled=False`). A corrupted
 validation pass may be reported separately as a robustness diagnostic, but it
 is not the clean language-model NLL.
+
+## Metrics
+
+`masked_count / eligible_count` is the correct per-step **implementation
+metric**. It verifies the requested ratio and catches padding/exclusion errors,
+but it does not demonstrate that MEAP improves retrieval.
+
+The paper's mechanistic metric is a paired evaluation on the same examples and
+checkpoint: run clean inputs and a copy with fixed selected positions, retain
+attention probabilities, then report (1) relative attention-score decay at the
+selected keys and (2) relative attention-variance change at unselected keys.
+`meap_attention_diagnostics` implements those paired calculations. Run them at
+evaluation cadence rather than every training step because retaining attention
+matrices changes the memory and latency profile. Pass the original eligibility
+mask so padding keys do not bias either statistic. Track the dedicated vector RMS
+as a cheap health metric, and use Needle-in-a-Haystack or multi-document QA as
+the outcome metric; training loss alone cannot measure MEAP's retrieval effect.
+
+## Reproducing compile latency and memory
+
+The isolated runner below uses `torch.compile(..., mode="max-autotune")` only
+inside the benchmark, checks eager/compiled outputs and gradients, measures five
+steps, clears warmup gradients before the memory baseline, and enforces a 10 GiB
+total allocated-peak ceiling:
+
+```bash
+python benchmark/meap_embedding_profile.py \
+  --batch 64 --sequence 512 --hidden 512 --dtype bfloat16 --steps 5
+```
+
+MXFP8 weight training still presents BF16 (or the configured activation dtype)
+at this embedding boundary, so benchmark that activation dtype rather than
+passing an FP8 storage tensor directly to the override.
+
+Reference measurements on an RTX 5070 Ti with PyTorch 2.12.1+cu130 are below.
+They measure only the override plus a synthetic reduction/backward, not a full
+training step. Every row uses five measured steps and passes eager/compiled
+output and gradient checks.
+
+| Shape `[B,S,D]` | Dtype | Eager mean | max-autotune mean | Compiled peak allocated |
+| --- | --- | ---: | ---: | ---: |
+| `[1,512,512]` | BF16 | 0.1869 ms | 0.1090 ms | 2.02 MiB |
+| `[8,512,512]` | BF16 | 0.2343 ms | 0.1070 ms | 16.04 MiB |
+| `[8,2048,512]` | BF16 | 0.7118 ms | 0.1640 ms | 64.14 MiB |
+| `[64,512,512]` | BF16 | 1.6446 ms | 0.1801 ms | 128.26 MiB |
+| `[64,512,512]` | FP16 | 1.5880 ms | 0.2300 ms | 128.26 MiB |
+| `[64,512,512]` | FP32 | 1.6549 ms | 0.4306 ms | 256.26 MiB |
+
+The FP16 compiled reduction differed from eager by at most `1.41e-4` in the
+FP32 mask-vector gradient; BF16 passed its dtype tolerance, and FP32's maximum
+absolute difference was `9.32e-10`. The compiled steady-state incremental peak
+was zero because Inductor reused its live allocation pool; the table therefore
+reports total peak allocated memory as the non-misleading bound.

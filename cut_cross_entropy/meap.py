@@ -12,6 +12,227 @@ import math
 import torch
 import triton
 import triton.language as tl
+from torch import nn
+
+
+def meap_attention_diagnostics(
+    clean_attention: torch.Tensor,
+    masked_attention: torch.Tensor,
+    selected_mask: torch.Tensor,
+    *,
+    eligible_mask: torch.Tensor | None = None,
+    eps: float = 1e-12,
+) -> dict[str, torch.Tensor]:
+    """Compute the paired attention diagnostics used to evaluate MEAP.
+
+    This is an evaluation-only helper. ``clean_attention`` and
+    ``masked_attention`` must come from the same examples and checkpoint; the
+    final dimension is the attended key/token dimension. ``selected_mask``
+    identifies the keys replaced in the masked copy and may have leading
+    singleton dimensions before its final sequence dimension. ``eligible_mask``
+    can exclude padding or other invalid keys from both populations.
+
+    The returned relative score decay and non-mask variance change distinguish
+    MEAP's intended attention effect from the operational masking fraction.
+    """
+    if clean_attention.shape != masked_attention.shape:
+        raise ValueError("clean_attention and masked_attention must share a shape.")
+    if clean_attention.ndim < 2 or not clean_attention.is_floating_point():
+        raise TypeError("attention tensors must be floating point with at least 2 dims.")
+    if not masked_attention.is_floating_point():
+        raise TypeError("attention tensors must be floating point.")
+    if clean_attention.device != masked_attention.device:
+        raise ValueError("attention tensors must share a device.")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be finite and positive.")
+
+    def broadcast_key_mask(mask: torch.Tensor, name: str) -> torch.Tensor:
+        if mask.ndim < 1:
+            raise ValueError(f"{name} must have a key dimension.")
+        if mask.device != clean_attention.device:
+            raise ValueError(f"{name} and attention tensors must share a device.")
+        if mask.shape[-1] != clean_attention.shape[-1]:
+            raise ValueError(f"{name} must match the attention key dimension.")
+        result = mask.to(dtype=torch.bool)
+        while result.ndim < clean_attention.ndim:
+            result = result.unsqueeze(-2)
+        try:
+            return torch.broadcast_to(result, clean_attention.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"{name} leading dimensions are not broadcastable to attention."
+            ) from error
+
+    selected = broadcast_key_mask(selected_mask, "selected_mask")
+    eligible = (
+        torch.ones_like(selected)
+        if eligible_mask is None
+        else broadcast_key_mask(eligible_mask, "eligible_mask")
+    )
+    selected = selected & eligible
+    unselected = ~selected & eligible
+    selected_count = selected.sum(dim=-1)
+    unselected_count = unselected.sum(dim=-1)
+    valid_rows = (selected_count > 0) & (unselected_count > 0)
+    if not bool(valid_rows.any()):
+        raise ValueError("No attention row contains selected and unselected eligible keys.")
+
+    clean_fp32 = clean_attention.float()
+    masked_fp32 = masked_attention.float()
+    selected_denominator = selected_count.clamp_min(1).float()
+    unselected_denominator = unselected_count.clamp_min(1).float()
+    clean_selected_per_row = (
+        clean_fp32.masked_fill(~selected, 0.0).sum(dim=-1) / selected_denominator
+    )
+    masked_selected_per_row = (
+        masked_fp32.masked_fill(~selected, 0.0).sum(dim=-1) / selected_denominator
+    )
+    clean_selected_mean = clean_selected_per_row.masked_select(valid_rows).mean()
+    masked_selected_mean = masked_selected_per_row.masked_select(valid_rows).mean()
+
+    clean_unselected_mean = (
+        clean_fp32.masked_fill(~unselected, 0.0).sum(dim=-1)
+        / unselected_denominator
+    )
+    masked_unselected_mean = (
+        masked_fp32.masked_fill(~unselected, 0.0).sum(dim=-1)
+        / unselected_denominator
+    )
+    clean_squared_error = (clean_fp32 - clean_unselected_mean.unsqueeze(-1)).square()
+    masked_squared_error = (masked_fp32 - masked_unselected_mean.unsqueeze(-1)).square()
+    clean_variance_per_row = (
+        clean_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1)
+        / unselected_denominator
+    )
+    masked_variance_per_row = (
+        masked_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1)
+        / unselected_denominator
+    )
+    clean_variance = clean_variance_per_row.masked_select(valid_rows).mean()
+    masked_variance = masked_variance_per_row.masked_select(valid_rows).mean()
+
+    return {
+        "masked_attention_score_decay": clean_selected_mean - masked_selected_mean,
+        "masked_attention_relative_decay": (
+            clean_selected_mean - masked_selected_mean
+        )
+        / clean_selected_mean.abs().clamp_min(eps),
+        "unmasked_attention_variance_change": masked_variance - clean_variance,
+        "unmasked_attention_variance_relative_change": (
+            masked_variance - clean_variance
+        )
+        / clean_variance.abs().clamp_min(eps),
+    }
+
+
+def apply_meap_embedding_override(
+    input_ids: torch.Tensor,
+    embeddings: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+) -> torch.Tensor:
+    """Replace MEAP positions after the complete input-embedding pipeline.
+
+    Apply this function after dense or compositional token embeddings and after
+    optional token-level augmentations such as Spelling Bee.  The final
+    override keeps the mask representation independent from padding rows,
+    Leviathan codebooks, and shared byte embeddings.
+
+    ``input_ids`` must contain a dedicated mask ID that is absent from clean
+    training data.  Labels and attention masks are intentionally not accepted.
+    """
+    if input_ids.ndim + 1 != embeddings.ndim:
+        raise ValueError(
+            "embeddings must have one trailing hidden dimension beyond input_ids, got "
+            f"{input_ids.shape} and {embeddings.shape}."
+        )
+    if input_ids.shape != embeddings.shape[:-1]:
+        raise ValueError(
+            "input_ids shape must match the leading embedding dimensions, got "
+            f"{input_ids.shape} and {embeddings.shape}."
+        )
+    if input_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"input_ids must be int32 or int64, got {input_ids.dtype}.")
+    if not embeddings.is_floating_point():
+        raise TypeError(f"embeddings must be floating point, got {embeddings.dtype}.")
+    if mask_embedding.ndim != 1 or mask_embedding.shape[0] != embeddings.shape[-1]:
+        raise ValueError(
+            "mask_embedding must be a vector matching the hidden size, got "
+            f"{mask_embedding.shape} and hidden size {embeddings.shape[-1]}."
+        )
+    if input_ids.device != embeddings.device or mask_embedding.device != embeddings.device:
+        raise ValueError("input_ids, embeddings, and mask_embedding must share a device.")
+    if not isinstance(mask_token_id, int) or mask_token_id < 0:
+        raise ValueError("mask_token_id must be a non-negative integer.")
+
+    selected = input_ids.eq(mask_token_id).unsqueeze(-1)
+    broadcast_shape = (1,) * input_ids.ndim + (embeddings.shape[-1],)
+    mask_value = mask_embedding.to(dtype=embeddings.dtype).view(broadcast_shape)
+    return torch.where(selected, mask_value, embeddings)
+
+
+class MEAPEmbeddingOverride(nn.Module):
+    """Own a dedicated trainable representation for MEAP-masked positions.
+
+    The module is intentionally backend agnostic.  Call it on the final token
+    representations, after a dense embedding, Leviathan, Spelling Bee, or any
+    combination of those paths.  Its single vector is saved in the model state
+    dict and receives gradients only from MEAP-selected positions.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        mask_token_id: int,
+        *,
+        initializer_range: float = 0.02,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if not isinstance(hidden_size, int) or hidden_size <= 0:
+            raise ValueError("hidden_size must be a positive integer.")
+        if not isinstance(mask_token_id, int) or mask_token_id < 0:
+            raise ValueError("mask_token_id must be a non-negative integer.")
+        if not math.isfinite(initializer_range) or initializer_range < 0.0:
+            raise ValueError("initializer_range must be finite and non-negative.")
+
+        self.hidden_size = hidden_size
+        self.mask_token_id = mask_token_id
+        self.initializer_range = float(initializer_range)
+        self.weight = nn.Parameter(torch.empty(hidden_size, device=device, dtype=dtype))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight, mean=0.0, std=self.initializer_range)
+
+    @torch.no_grad()
+    def initialize_from(self, embedding: torch.Tensor) -> None:
+        """Initialize from one existing *final* token representation.
+
+        This supports a continuous checkpoint migration: compute the old PAD
+        representation after every active embedding augmentation, then copy it
+        here before changing MEAP to a dedicated reserved token ID.
+        """
+        if embedding.shape != self.weight.shape:
+            raise ValueError(
+                f"Expected an embedding with shape {self.weight.shape}, got {embedding.shape}."
+            )
+        self.weight.copy_(embedding.to(device=self.weight.device, dtype=self.weight.dtype))
+
+    def forward(self, input_ids: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
+        return apply_meap_embedding_override(
+            input_ids,
+            embeddings,
+            self.weight,
+            self.mask_token_id,
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden_size={self.hidden_size}, mask_token_id={self.mask_token_id}, "
+            f"initializer_range={self.initializer_range}"
+        )
 
 
 @triton.jit
@@ -385,4 +606,9 @@ def meap_mask_inputs(
     return tuple(outputs) if len(outputs) > 1 else output
 
 
-__all__ = ["meap_mask_inputs"]
+__all__ = [
+    "MEAPEmbeddingOverride",
+    "apply_meap_embedding_override",
+    "meap_attention_diagnostics",
+    "meap_mask_inputs",
+]

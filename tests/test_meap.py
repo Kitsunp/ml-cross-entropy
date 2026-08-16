@@ -2,7 +2,206 @@
 import pytest
 import torch
 
-from cut_cross_entropy import linear_cross_entropy, meap_mask_inputs
+from cut_cross_entropy import (
+    MEAPEmbeddingOverride,
+    apply_meap_embedding_override,
+    linear_cross_entropy,
+    meap_attention_diagnostics,
+    meap_mask_inputs,
+)
+from cut_cross_entropy.leviathan import LeviathanConfig, LeviathanGenerator
+
+
+def test_meap_embedding_override_replaces_only_dedicated_positions() -> None:
+    input_ids = torch.tensor([[4, 16, 8], [16, 3, 2]])
+    embeddings = torch.arange(2 * 3 * 5, dtype=torch.float32).view(2, 3, 5)
+    mask_embedding = torch.tensor([101.0, 102.0, 103.0, 104.0, 105.0])
+
+    actual = apply_meap_embedding_override(
+        input_ids,
+        embeddings,
+        mask_embedding,
+        mask_token_id=16,
+    )
+    selected = input_ids == 16
+    assert torch.equal(actual[selected], mask_embedding.expand(int(selected.sum()), -1))
+    assert torch.equal(actual[~selected], embeddings[~selected])
+
+
+def test_meap_embedding_override_isolates_shared_upstream_gradients() -> None:
+    input_ids = torch.full((3, 7), 16, dtype=torch.long)
+    # This tensor represents any already-composed upstream path, including
+    # Leviathan codebooks followed by a Spelling Bee byte contribution.
+    shared_upstream = torch.randn(3, 7, 11, requires_grad=True)
+    override = MEAPEmbeddingOverride(11, 16, initializer_range=0.0)
+    override.weight.data.copy_(torch.linspace(-0.5, 0.5, 11))
+
+    output = override(input_ids, shared_upstream)
+    output.sum().backward()
+
+    assert torch.count_nonzero(shared_upstream.grad) == 0
+    torch.testing.assert_close(
+        override.weight.grad,
+        torch.full_like(override.weight, input_ids.numel()),
+    )
+
+
+def test_meap_embedding_override_preserves_clean_path_and_dtype() -> None:
+    input_ids = torch.tensor([[2, 3, 4], [5, 6, 7]])
+    embeddings = torch.randn(2, 3, 9, dtype=torch.bfloat16, requires_grad=True)
+    override = MEAPEmbeddingOverride(9, 16, dtype=torch.float32)
+
+    output = override(input_ids, embeddings)
+    assert output.dtype == torch.bfloat16
+    assert torch.equal(output, embeddings)
+    output.float().sum().backward()
+    assert torch.equal(embeddings.grad, torch.ones_like(embeddings))
+    assert override.weight.grad is not None
+    assert torch.count_nonzero(override.weight.grad) == 0
+
+
+def test_meap_embedding_override_checkpoint_migration_initializer() -> None:
+    override = MEAPEmbeddingOverride(7, 16)
+    old_final_pad_embedding = torch.linspace(-1.0, 1.0, 7, dtype=torch.float64)
+    override.initialize_from(old_final_pad_embedding)
+    torch.testing.assert_close(override.weight, old_final_pad_embedding.float())
+
+
+@pytest.mark.parametrize("use_leviathan", [False, True])
+@pytest.mark.parametrize("use_spelling_bee", [False, True])
+def test_meap_embedding_override_covers_every_embedding_route(
+    use_leviathan: bool,
+    use_spelling_bee: bool,
+) -> None:
+    """The final override must isolate dense/LEV and optional SBE parameters."""
+    torch.manual_seed(7)
+    vocab_size = 32
+    hidden_size = 8
+    mask_token_id = 16
+    input_ids = torch.tensor([[2, mask_token_id, 5], [mask_token_id, 7, 9]])
+
+    if use_leviathan:
+        upstream = LeviathanGenerator(
+            LeviathanConfig(
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                generator_d_seed=4,
+                generator_num_modes=2,
+                generator_num_knots=4,
+                generator_k=2,
+                generator_krank=3,
+                dtype=torch.float32,
+            )
+        )
+    else:
+        upstream = torch.nn.Embedding(vocab_size, hidden_size)
+
+    spelling_bee = (
+        torch.nn.Embedding(vocab_size, hidden_size) if use_spelling_bee else None
+    )
+    override = MEAPEmbeddingOverride(hidden_size, mask_token_id)
+
+    base = upstream(input_ids)
+    if spelling_bee is not None:
+        base = base + spelling_bee(input_ids)
+    expected_unmasked = base.detach().clone()
+    actual = override(input_ids, base)
+    selected = input_ids == mask_token_id
+
+    torch.testing.assert_close(
+        actual[selected],
+        override.weight.detach().expand(int(selected.sum()), -1),
+    )
+    torch.testing.assert_close(actual[~selected], expected_unmasked[~selected])
+
+    # Backpropagating through selected positions must update only the dedicated
+    # MEAP vector.  Dense rows, LEV codebooks, and SBE rows stay untouched.
+    actual[selected].sum().backward()
+    for parameter in upstream.parameters():
+        assert parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+    if spelling_bee is not None:
+        for parameter in spelling_bee.parameters():
+            assert parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+    torch.testing.assert_close(
+        override.weight.grad,
+        torch.full_like(override.weight, int(selected.sum())),
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "embedding_shape", "mask_shape"),
+    [
+        ((2, 3), (2, 4, 5), (5,)),
+        ((2, 3), (2, 3), (3,)),
+        ((2, 3), (2, 3, 5), (4,)),
+    ],
+)
+def test_meap_embedding_override_rejects_incompatible_shapes(
+    input_shape: tuple[int, ...],
+    embedding_shape: tuple[int, ...],
+    mask_shape: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        apply_meap_embedding_override(
+            torch.zeros(input_shape, dtype=torch.long),
+            torch.zeros(embedding_shape),
+            torch.zeros(mask_shape),
+            16,
+        )
+
+
+def test_meap_attention_diagnostics_matches_paired_definition() -> None:
+    clean = torch.tensor([[[[0.10, 0.20, 0.30, 0.40]]]])
+    masked = torch.tensor([[[[0.05, 0.10, 0.25, 0.60]]]])
+    selected = torch.tensor([[True, True, False, False]])
+
+    metrics = meap_attention_diagnostics(clean, masked, selected)
+
+    # Mean attention at selected keys: 0.15 -> 0.075.
+    torch.testing.assert_close(
+        metrics["masked_attention_score_decay"], torch.tensor(0.075)
+    )
+    torch.testing.assert_close(
+        metrics["masked_attention_relative_decay"], torch.tensor(0.5)
+    )
+    # Population variance at remaining keys: 0.0025 -> 0.030625.
+    torch.testing.assert_close(
+        metrics["unmasked_attention_variance_change"], torch.tensor(0.028125)
+    )
+    torch.testing.assert_close(
+        metrics["unmasked_attention_variance_relative_change"], torch.tensor(11.25)
+    )
+
+
+def test_meap_attention_diagnostics_rejects_degenerate_mask() -> None:
+    attention = torch.full((1, 2, 3, 4), 0.25)
+    with pytest.raises(ValueError, match="selected and unselected eligible"):
+        meap_attention_diagnostics(
+            attention,
+            attention,
+            torch.ones((1, 4), dtype=torch.bool),
+        )
+
+
+def test_meap_attention_diagnostics_excludes_padding_keys() -> None:
+    clean = torch.tensor([[[[0.2, 0.3, 0.5, 99.0]]]])
+    masked = torch.tensor([[[[0.1, 0.4, 0.5, -99.0]]]])
+    selected = torch.tensor([[True, False, False, False]])
+    eligible = torch.tensor([[True, True, True, False]])
+
+    metrics = meap_attention_diagnostics(
+        clean,
+        masked,
+        selected,
+        eligible_mask=eligible,
+    )
+    torch.testing.assert_close(
+        metrics["masked_attention_relative_decay"], torch.tensor(0.5)
+    )
+    # The extreme padded values must not enter the visible-key variance.
+    torch.testing.assert_close(
+        metrics["unmasked_attention_variance_change"], torch.tensor(-0.0075)
+    )
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 
