@@ -390,7 +390,9 @@ def _lev_fused_dot(
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_B_CONFIGS, key=["N", "D_OUT"])
 @triton.jit
-def _lev_gemm_auto(modes_ptr, w_out_ptr, e_ptr, N, HK, D_OUT,
+def _lev_gemm_auto(ids_ptr, modes_ptr, w_out_ptr, mask_embedding_ptr, e_ptr,
+                   N, HK, D_OUT, MASK_TOKEN_ID: tl.constexpr,
+                   HAS_MEAP: tl.constexpr,
                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                    BLOCK_K: tl.constexpr):
     pid_m = tl.program_id(0)
@@ -407,6 +409,14 @@ def _lev_gemm_auto(modes_ptr, w_out_ptr, e_ptr, N, HK, D_OUT,
                     mask=kmask[:, None] & (rn[None, :] < D_OUT), other=0.0)
         acc += tl.dot(a, b)
     e = acc.to(tl.bfloat16)
+    if HAS_MEAP:
+        is_meap = tl.load(ids_ptr + rm, mask=rm < N, other=-1) == MASK_TOKEN_ID
+        mask_embedding = tl.load(
+            mask_embedding_ptr + rn,
+            mask=rn < D_OUT,
+            other=0.0,
+        ).to(tl.bfloat16)
+        e = tl.where(is_meap[:, None], mask_embedding[None, :], e)
     tl.store(e_ptr + rm[:, None] * D_OUT + rn[None, :], e,
              mask=(rm[:, None] < N) & (rn[None, :] < D_OUT))
 
@@ -518,7 +528,8 @@ def _auto_split_head(device, num_heads: int) -> bool:
 
 
 def leviathan_forward(ids, params, cfg, save_intermediates=False,
-                      variant="exact"):
+                      variant="exact", mask_embedding=None,
+                      mask_token_id=None):
     """Kernel forward: (embeds, saved).
 
     ids:       int tensor [*shape] (any integral dtype)
@@ -557,6 +568,28 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
     k = cfg.generator_k
     b = math.ceil(cfg.vocab_size ** (1.0 / k))
     hk = h * krank
+    has_meap = mask_embedding is not None or mask_token_id is not None
+    if has_meap:
+        if mask_embedding is None or mask_token_id is None:
+            raise ValueError(
+                "mask_embedding and mask_token_id must be provided together"
+            )
+        if mask_embedding.ndim != 1 or mask_embedding.numel() != D:
+            raise ValueError(
+                f"mask_embedding must have shape ({D},), got "
+                f"{tuple(mask_embedding.shape)}"
+            )
+        if mask_embedding.device != device:
+            raise ValueError("mask_embedding must be on the Leviathan device")
+        if not mask_embedding.is_floating_point():
+            raise TypeError("mask_embedding must be floating point")
+        mask_embedding_kernel = mask_embedding.contiguous()
+        mask_token_id_kernel = int(mask_token_id)
+    else:
+        # Zero-length view: no allocation and no load in the HAS_MEAP=False
+        # specialization.
+        mask_embedding_kernel = prep["knot_grid"].reshape(-1)[:0]
+        mask_token_id_kernel = -1
 
     # Every element is written by A0/A before any consumer reads it; avoid
     # device-wide memset work and leave the launch ordering to the kernels.
@@ -672,12 +705,18 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
     if _use_raw_launch():
         c = _B_CONFIGS[0]
         _lev_gemm_auto.fn[grid_b](
-            modes, prep["w_out_cat"], embeds, N, hk, D,
+            ids, modes, prep["w_out_cat"], mask_embedding_kernel, embeds,
+            N, hk, D, MASK_TOKEN_ID=mask_token_id_kernel,
+            HAS_MEAP=has_meap,
             BLOCK_M=c.kwargs["BLOCK_M"], BLOCK_N=c.kwargs["BLOCK_N"],
             BLOCK_K=c.kwargs["BLOCK_K"],
             num_warps=c.num_warps, num_stages=c.num_stages)
     else:
-        _lev_gemm_auto[grid_b](modes, prep["w_out_cat"], embeds, N, hk, D)
+        _lev_gemm_auto[grid_b](
+            ids, modes, prep["w_out_cat"], mask_embedding_kernel, embeds,
+            N, hk, D, MASK_TOKEN_ID=mask_token_id_kernel,
+            HAS_MEAP=has_meap,
+        )
 
     saved = None
     if save_intermediates:

@@ -219,12 +219,26 @@ forward, not from inside CCE: CCE receives hidden states after MEAP has changed
 their causal context. Labels and the causal/padding attention masks remain
 unchanged.
 
-Reserve the mask token before model initialization so its input and output rows
-use the model's normal vocabulary initialization. For this repository's padding
-convention, `padding_mask=True` means that a position cannot be replaced.
+Reserve a dedicated mask token before model initialization. It must differ from
+PAD/BOS/EOS and must not occur in clean examples. Do not reuse the padding row:
+padding-aware embeddings suppress its gradient, while Leviathan and Spelling
+Bee give that same ID shared representations. The model should instead own one
+trainable MEAP vector and apply it after its complete input-embedding pipeline.
+For this repository's padding convention, `padding_mask=True` means that a
+position cannot be replaced.
 
 ```python
-from cut_cross_entropy import linear_cross_entropy, meap_mask_inputs
+from cut_cross_entropy import (
+    MEAPEmbeddingOverride,
+    linear_cross_entropy,
+    meap_mask_inputs,
+)
+
+model.meap_embedding = MEAPEmbeddingOverride(
+    model.config.hidden_size,
+    tokenizer.mask_token_id,
+    initializer_range=model.config.initializer_range,
+).to(device=model.device, dtype=model.dtype)
 
 # Keep clean_input_ids/labels unchanged for targets and evaluation.
 model_input_ids = meap_mask_inputs(
@@ -236,7 +250,11 @@ model_input_ids = meap_mask_inputs(
     seed=global_step,
 )
 
-hidden = model(model_input_ids, padding_mask)
+# `compose_input_embeddings` denotes the model's existing dense/Leviathan plus
+# optional Spelling Bee path; place the override immediately after that path.
+final_input_embeddings = compose_input_embeddings(model_input_ids)
+final_input_embeddings = model.meap_embedding(model_input_ids, final_input_embeddings)
+hidden = model(inputs_embeds=final_input_embeddings, attention_mask=padding_mask)
 loss = linear_cross_entropy(
     hidden,
     model.get_output_embeddings().weight,
@@ -269,6 +287,12 @@ For int64 device seeds, the kernel folds the high and low halves into the
 With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.
+
+The MEAP masking API is required only while MEAP corruption is active. A model
+that owns the dedicated vector can perform clean training, evaluation, and
+inference without that API; other configured loss backends may still require
+the CCE package. The final override is valid for all four embedding routes:
+dense, dense+Spelling Bee, Leviathan, and Leviathan+Spelling Bee.
 
 ### Patch-level training
 

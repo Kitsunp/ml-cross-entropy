@@ -4,7 +4,12 @@ from cut_cross_entropy.linear_cross_entropy import (
     LinearCrossEntropy,
     linear_cross_entropy,
 )
-from cut_cross_entropy.meap import meap_mask_inputs
+from cut_cross_entropy.meap import (
+    MEAPEmbeddingOverride,
+    apply_meap_embedding_override,
+    meap_attention_diagnostics,
+    meap_mask_inputs,
+)
 from cut_cross_entropy.mile import linear_mile_loss
 from cut_cross_entropy.patch import PatchTrainingPhase, PatchTrainingSchedule
 from cut_cross_entropy.vocab_parallel import VocabParallelOptions
@@ -14,6 +19,9 @@ __all__ = [
     "LinearCrossEntropyImpl",
     "linear_cross_entropy",
     "linear_mile_loss",
+    "MEAPEmbeddingOverride",
+    "apply_meap_embedding_override",
+    "meap_attention_diagnostics",
     "meap_mask_inputs",
     "PatchTrainingPhase",
     "PatchTrainingSchedule",

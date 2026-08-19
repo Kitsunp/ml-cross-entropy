@@ -65,11 +65,84 @@ occupancy, so it would require a separate multi-block design and benchmark.
 2. Reuse the existing padding mask directly. Build an eligibility mask only
    when BOS, EOS, or other protected positions also need to be excluded.
 3. Call `meap_mask_inputs` once, before the model forward.
-4. Run the ordinary causal model with the original causal and padding masks.
-5. Pass its hidden states and the clean labels to `linear_cross_entropy`.
+4. Compose dense or Leviathan embeddings and optional Spelling Bee features.
+5. Select the independent trainable MEAP vector in the epilogue that owns the
+   final embedding write. This is Leviathan's output GEMM when Leviathan is the
+   last producer, or the Spelling Bee epilogue when byte features follow it.
+6. Run the ordinary causal model with the original causal and padding masks.
+7. Pass its hidden states and the clean labels to `linear_cross_entropy`.
 
 MEAP is not part of the CCE loss kernel. Calling it after the model or from
 inside CCE would be too late to change the contextual hidden states.
+
+## Dedicated embedding contract
+
+The mask ID must be a reserved vocabulary ID that is absent from clean data and
+different from PAD, BOS, and EOS. Reusing PAD is incorrect for three separate
+reasons: a dense embedding commonly has `padding_idx=pad_token_id` and therefore
+does not learn that row; Leviathan derives the ID through shared codebooks; and
+Spelling Bee adds shared byte parameters. A final independent override avoids
+all three couplings without changing clean tokens.
+
+```python
+from cut_cross_entropy import MEAPEmbeddingOverride
+
+self.meap_embedding = MEAPEmbeddingOverride(hidden_size, mask_token_id)
+
+# `composed` is already the result of either dense or Leviathan embedding and
+# any optional Spelling Bee augmentation.
+composed = self.meap_embedding(masked_input_ids, composed)
+```
+
+For a continuous migration from a legacy PAD-based checkpoint, compute the old
+PAD representation after every active embedding augmentation and call
+`meap_embedding.initialize_from(old_final_pad_embedding)` once. New training can
+use the normal model initializer.
+
+### Optional backend requirements
+
+| Execution case | MEAP masking API | Triton/CUDA | Dedicated vector |
+| --- | --- | --- | --- |
+| Active MEAP training, `implementation="triton"` | Required | Required | Required |
+| Active MEAP training, `implementation="torch"` | Required | Optional | Required |
+| Clean training with MEAP disabled | Optional | Optional | Harmless/optional |
+| Evaluation or inference | Not required by MEAP | Optional | Loaded from checkpoint when present |
+
+The model must defer its backend availability check until active MEAP training.
+Merely loading a checkpoint with `use_meap=True` must not make inference depend
+on the corruption kernel. Other configured loss backends can retain their own
+requirements. Labels and attention masks always remain clean.
+
+The semantic override is deliberately owned by the last active producer, so the
+same contract covers dense, dense+Spelling Bee, Leviathan, and
+Leviathan+Spelling Bee without allowing an earlier producer to modify the mask
+vector afterward.
+
+### Leviathan epilogue fusion
+
+`leviathan_embedding_compiler_safe` accepts the optional pair
+`mask_embedding=` and `mask_token_id=`. Both must be supplied together. On the
+CUDA path, Leviathan's final `modes @ W_out` Triton kernel loads the mask vector
+and selects it in the same store that writes the BF16 embedding. There is no
+second `[tokens, hidden]` read/modify/write pass.
+
+The backward contract is equally important: rows whose ID equals
+`mask_token_id` are zeroed before Leviathan's `dM`, `dW_out`, spline, projection,
+and codebook gradients. Their original `grad_output` is reduced only into the
+dedicated mask parameter. The normal `HAS_MEAP=False` Triton specialization
+contains neither the ID load nor the mask-vector load.
+
+| Embedding route | Owner of the final MEAP selection | Reason |
+| --- | --- | --- |
+| Dense only | model embedding epilogue | No custom Leviathan kernel is active. |
+| Dense + Spelling Bee | Spelling Bee epilogue | Byte features are composed last. |
+| Leviathan only | Leviathan output-GEMM store | This is the true Triton-fused route. |
+| Leviathan + Spelling Bee | Spelling Bee epilogue | Selecting inside Leviathan alone would let Spelling Bee corrupt the dedicated vector afterward. |
+
+The CPU/reference fallback remains a differentiable `torch.where` with the same
+mathematics. This keeps checkpoints and inference usable when the optional
+Triton package is absent; physical kernel fusion is a CUDA optimization, not a
+different model definition.
 
 ## Kernel contract
 
@@ -194,3 +267,79 @@ MEAP positions are sampled.
 Validation and inference should use clean inputs (`enabled=False`). A corrupted
 validation pass may be reported separately as a robustness diagnostic, but it
 is not the clean language-model NLL.
+
+## Metrics
+
+`masked_count / eligible_count` is the correct per-step **implementation
+metric**. It verifies the requested ratio and catches padding/exclusion errors,
+but it does not demonstrate that MEAP improves retrieval.
+
+The paper's mechanistic metric is a paired evaluation on the same examples and
+checkpoint: run clean inputs and a copy with fixed selected positions, retain
+attention probabilities, then report (1) relative attention-score decay at the
+selected keys and (2) relative attention-variance change at unselected keys.
+`meap_attention_diagnostics` implements those paired calculations. Run them at
+evaluation cadence rather than every training step because retaining attention
+matrices changes the memory and latency profile. Pass the original eligibility
+mask so padding keys do not bias either statistic. Track the dedicated vector RMS
+as a cheap health metric, and use Needle-in-a-Haystack or multi-document QA as
+the outcome metric; training loss alone cannot measure MEAP's retrieval effect.
+
+## Reproducing compile latency and memory
+
+The isolated runner below uses `torch.compile(..., mode="max-autotune")` only
+inside the benchmark, checks eager/compiled outputs and gradients, measures five
+steps, clears warmup gradients before the memory baseline, and enforces a 10 GiB
+total allocated-peak ceiling:
+
+```bash
+python benchmark/meap_embedding_profile.py \
+  --batch 64 --sequence 512 --hidden 512 --dtype bfloat16 --steps 5
+```
+
+For the Leviathan-specific comparison, use:
+
+```bash
+python -m benchmark.leviathan_meap_profile --tokens 4096 --steps 100
+```
+
+MXFP8 weight training still presents BF16 (or the configured activation dtype)
+at this embedding boundary, so benchmark that activation dtype rather than
+passing an FP8 storage tensor directly to the override.
+
+Reference measurements on an RTX 5070 Ti with PyTorch 2.12.1+cu130 are below.
+They measure only the override plus a synthetic reduction/backward, not a full
+training step. Every row uses five measured steps and passes eager/compiled
+output and gradient checks.
+
+| Shape `[B,S,D]` | Dtype | Eager mean | max-autotune mean | Compiled peak allocated |
+| --- | --- | ---: | ---: | ---: |
+| `[1,512,512]` | BF16 | 0.1869 ms | 0.1090 ms | 2.02 MiB |
+| `[8,512,512]` | BF16 | 0.2343 ms | 0.1070 ms | 16.04 MiB |
+| `[8,2048,512]` | BF16 | 0.7118 ms | 0.1640 ms | 64.14 MiB |
+| `[64,512,512]` | BF16 | 1.6446 ms | 0.1801 ms | 128.26 MiB |
+| `[64,512,512]` | FP16 | 1.5880 ms | 0.2300 ms | 128.26 MiB |
+| `[64,512,512]` | FP32 | 1.6549 ms | 0.4306 ms | 256.26 MiB |
+
+The FP16 compiled reduction differed from eager by at most `1.41e-4` in the
+FP32 mask-vector gradient; BF16 passed its dtype tolerance, and FP32's maximum
+absolute difference was `9.32e-10`. The compiled steady-state incremental peak
+was zero because Inductor reused its live allocation pool; the table therefore
+reports total peak allocated memory as the non-misleading bound.
+
+The Leviathan epilogue comparison used its model geometry (`hidden=512`,
+`d_seed=128`, eight heads, rank 64), BF16, and max-autotune on the same RTX 5070
+Ti. The runner alternates both paths to reduce clock and thermal bias. Over 100
+paired measurements at 4096 token rows, forward mean changed from `5.6025 ms`
+with the separate override to `5.5224 ms` with the fused store (`1.45%` faster;
+median `5.5844 -> 5.4217 ms`). A complete forward+backward synthetic step
+changed from `26.6944 ms` to `26.4465 ms` (`0.94%` faster), while the medians
+were effectively tied (`26.1767` and `26.1841 ms`). At 512 rows, forward means
+were tied (`2.2613` and `2.2610 ms`) and the full step improved by `0.72%`.
+
+Both 4096-row paths reported the same total allocated training peak (`101.58
+MiB`) because Inductor reused the eliminated override buffer. The fusion
+therefore removes a launch/activation traversal and guarantees the correct
+producer boundary, but it does not claim a material end-to-end speedup or a
+persistent-memory reduction. Backward still needs the mask-gradient reduction,
+which bounds the full-step gain.

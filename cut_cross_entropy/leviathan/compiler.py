@@ -63,6 +63,8 @@ def _saved_or_reference(
     cfg: LeviathanConfig,
     *,
     save_intermediates: bool = True,
+    mask_embedding: torch.Tensor | None = None,
+    mask_token_id: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Run LEV and optionally return the lean tensors required for backward."""
     if _leviathan_forward is not None:
@@ -73,6 +75,8 @@ def _saved_or_reference(
                     params,
                     cfg,
                     save_intermediates=save_intermediates,
+                    mask_embedding=mask_embedding,
+                    mask_token_id=mask_token_id,
                 )
             if not save_intermediates:
                 return embeds, {}
@@ -92,6 +96,13 @@ def _saved_or_reference(
             cfg,
             save_intermediates=save_intermediates,
         )
+        if mask_embedding is not None:
+            positions = ids.eq(int(mask_token_id)).unsqueeze(-1)
+            embeds = torch.where(
+                positions,
+                mask_embedding.to(device=embeds.device, dtype=embeds.dtype),
+                embeds,
+            )
     if not save_intermediates:
         return embeds, {}
     if saved is None:  # pragma: no cover - the reference always saves here
@@ -114,6 +125,8 @@ def _leviathan_forward_op(
     head_spline_delta: torch.Tensor,
     head_out_weight: torch.Tensor,
     knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -151,7 +164,14 @@ def _leviathan_forward_op(
         krank,
         codebooks.dtype,
     )
-    embeds, saved = _saved_or_reference(ids.detach(), params, cfg)
+    has_meap = mask_embedding.numel() != 0
+    embeds, saved = _saved_or_reference(
+        ids.detach(),
+        params,
+        cfg,
+        mask_embedding=mask_embedding.detach() if has_meap else None,
+        mask_token_id=mask_token_id if has_meap else None,
+    )
 
     z = saved["z"].contiguous()
     xhat = saved["x_hat_por_head"].contiguous()
@@ -180,6 +200,8 @@ def _leviathan_forward_fake(
     head_spline_delta: torch.Tensor,
     head_out_weight: torch.Tensor,
     knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -204,6 +226,8 @@ def _leviathan_forward_fake(
         head_spline_delta,
         head_out_weight,
         knot_grid,
+        mask_embedding,
+        mask_token_id,
         vocab_size,
         spline_degree,
         generator_k,
@@ -248,6 +272,8 @@ def _leviathan_inference_op(
     head_spline_delta: torch.Tensor,
     head_out_weight: torch.Tensor,
     knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -283,6 +309,10 @@ def _leviathan_inference_op(
         params,
         cfg,
         save_intermediates=False,
+        mask_embedding=(
+            mask_embedding.detach() if mask_embedding.numel() != 0 else None
+        ),
+        mask_token_id=(mask_token_id if mask_embedding.numel() != 0 else None),
     )
     return embeds
 
@@ -297,6 +327,8 @@ def _leviathan_inference_fake(
     head_spline_delta: torch.Tensor,
     head_out_weight: torch.Tensor,
     knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -313,6 +345,8 @@ def _leviathan_inference_fake(
         head_spline_delta,
         head_out_weight,
         knot_grid,
+        mask_embedding,
+        mask_token_id,
         vocab_size,
         d_seed,
         num_modes,
@@ -501,6 +535,8 @@ def _leviathan_setup_context(ctx, inputs, output) -> None:
         head_spline_delta,
         head_out_weight,
         knot_grid,
+        mask_embedding,
+        mask_token_id,
         vocab_size,
         hidden_size,
         d_seed,
@@ -520,6 +556,7 @@ def _leviathan_setup_context(ctx, inputs, output) -> None:
         head_spline_delta,
         head_out_weight,
         knot_grid,
+        mask_embedding,
         z,
         xhat,
         mean,
@@ -528,6 +565,7 @@ def _leviathan_setup_context(ctx, inputs, output) -> None:
         mode_flag,
     )
     ctx.config_values = (
+        mask_token_id,
         vocab_size,
         hidden_size,
         d_seed,
@@ -551,6 +589,7 @@ def _leviathan_backward(ctx, *grads):
         head_spline_delta,
         head_out_weight,
         knot_grid,
+        mask_embedding,
         z,
         xhat,
         mean,
@@ -559,6 +598,7 @@ def _leviathan_backward(ctx, *grads):
         mode_flag,
     ) = ctx.saved_tensors
     (
+        mask_token_id,
         vocab_size,
         hidden_size,
         d_seed,
@@ -568,8 +608,25 @@ def _leviathan_backward(ctx, *grads):
         generator_k,
         krank,
     ) = ctx.config_values
+    has_meap = mask_embedding.numel() != 0
+    if has_meap:
+        meap_positions = ids.eq(mask_token_id).unsqueeze(-1)
+        grad_mask = torch.where(
+            meap_positions,
+            grad_out,
+            torch.zeros((), dtype=grad_out.dtype, device=grad_out.device),
+        ).reshape(-1, hidden_size).sum(dim=0).to(mask_embedding.dtype)
+        grad_out_leviathan = torch.where(
+            meap_positions,
+            torch.zeros((), dtype=grad_out.dtype, device=grad_out.device),
+            grad_out,
+        )
+    else:
+        grad_mask = None
+        grad_out_leviathan = grad_out
+
     d_codebooks, d_proj, d_norm_w, d_norm_b, d_delta, d_out = _leviathan_backward_op(
-        grad_out,
+        grad_out_leviathan,
         ids,
         codebooks,
         head_proj_weight,
@@ -602,6 +659,8 @@ def _leviathan_backward(ctx, *grads):
         d_delta,
         d_out,
         None,
+        grad_mask,
+        None,
         None,
         None,
         None,
@@ -625,21 +684,55 @@ def leviathan_embedding_compiler_safe(
     params: dict[str, torch.Tensor],
     cfg: Any,
     knot_grid: torch.Tensor,
+    *,
+    mask_embedding: torch.Tensor | None = None,
+    mask_token_id: int | None = None,
 ) -> torch.Tensor:
-    """Run LEV through the opaque CUDA boundary or the model fallback."""
+    """Run LEV through the opaque CUDA boundary or the model fallback.
+
+    When both MEAP arguments are present, the CUDA path selects the dedicated
+    vector in Leviathan's final GEMM epilogue. The backward sends masked rows
+    only to ``mask_embedding`` and zeroes them before the LEV parameter path.
+    """
+    has_meap = mask_embedding is not None or mask_token_id is not None
+    if has_meap:
+        if mask_embedding is None or mask_token_id is None:
+            raise ValueError(
+                "mask_embedding and mask_token_id must be provided together"
+            )
+        if mask_embedding.ndim != 1 or mask_embedding.numel() != int(cfg.hidden_size):
+            raise ValueError(
+                "mask_embedding must be a vector with cfg.hidden_size elements"
+            )
+        if mask_embedding.device != params["codebooks"].device:
+            raise ValueError("mask_embedding must be on the Leviathan device")
+        if not mask_embedding.is_floating_point():
+            raise TypeError("mask_embedding must be floating point")
     if not ids.is_cuda or not params["codebooks"].is_cuda:
         from .autograd_fn import leviathan_apply
 
         fallback_params = dict(params)
         fallback_params["knot_grid"] = knot_grid
-        return leviathan_apply(ids, fallback_params, cfg)
+        embeds = leviathan_apply(ids, fallback_params, cfg)
+        if not has_meap:
+            return embeds
+        return torch.where(
+            ids.eq(int(mask_token_id)).unsqueeze(-1),
+            mask_embedding.to(device=embeds.device, dtype=embeds.dtype),
+            embeds,
+        )
 
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad
         for name, tensor in params.items()
         if name != "knot_grid"
     )
+    if has_meap and mask_embedding.requires_grad:
+        needs_backward = True
     op = _leviathan_forward_op if needs_backward else _leviathan_inference_op
+    kernel_mask_embedding = (
+        mask_embedding if has_meap else knot_grid.reshape(-1)[:0]
+    )
 
     result = op(
         ids,
@@ -650,6 +743,8 @@ def leviathan_embedding_compiler_safe(
         params["head_spline_delta"],
         params["head_out_weight"],
         knot_grid,
+        kernel_mask_embedding,
+        int(mask_token_id) if has_meap else -1,
         int(cfg.vocab_size),
         int(cfg.hidden_size),
         int(cfg.generator_d_seed),
