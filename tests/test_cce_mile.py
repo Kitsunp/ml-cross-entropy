@@ -3,7 +3,10 @@ import torch
 
 from cut_cross_entropy import linear_cross_entropy
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
-from cut_cross_entropy.cce_mile import cce_mile_forward_kernel
+from cut_cross_entropy.cce_mile import (
+    cce_mile_forward_kernel,
+    normalize_mile_weight_groups,
+)
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.utils import softcapping
 
@@ -26,10 +29,13 @@ def _dense_mile(
     softcap: float | None,
     shift: int,
     reduction: str,
+    group_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if shift:
         e = e[..., :-shift, :]
         targets = targets[..., shift:]
+        if group_mask is not None:
+            group_mask = group_mask[..., :-shift]
     output_shape = targets.shape
     logits = e.reshape(-1, e.size(-1)) @ c.T
     if bias is not None:
@@ -45,7 +51,14 @@ def _dense_mile(
     entropy = -(probabilities * log_probs).sum(dim=-1)
     nll = -log_probs.gather(1, safe_targets[:, None]).squeeze(1)
     weights = (1.0 + entropy).pow(gamma).detach()
-    weights = weights * weights[valid].mean().reciprocal()
+    if group_mask is None:
+        weights = weights * weights[valid].mean().reciprocal()
+    else:
+        flat_group = group_mask.reshape(-1)
+        for population in (False, True):
+            members = valid & (flat_group == population)
+            if bool(members.any()):
+                weights[members] *= weights[members].mean().reciprocal()
     losses = weights * nll
     losses = losses.masked_fill(~valid, 0.0)
     lse = logits.logsumexp(dim=-1).masked_fill(~valid, 0.0)
@@ -77,9 +90,7 @@ def test_mean_logit(
         logits = softcapping(logits, softcap)
     logits = logits.float()
     expected = (logits.softmax(dim=-1) * logits).sum(dim=-1)
-    actual = cce_lse_forward_kernel(
-        e, c, bias, softcap=softcap, return_mean_logit=True
-    ).mean_logit
+    actual = cce_lse_forward_kernel(e, c, bias, softcap=softcap, return_mean_logit=True).mean_logit
     assert actual is not None
     torch.testing.assert_close(actual, expected, rtol=error_tol, atol=error_tol)
 
@@ -118,6 +129,96 @@ def test_cce_mile_forward_kernel_matches_torch(size: int, gamma: float) -> None:
 
 
 @skip_no_cuda
+def test_mile_group_normalization_preserves_each_population_mass() -> None:
+    torch.manual_seed(37)
+    size = 4097
+    entropy = torch.rand(size, device="cuda", dtype=torch.float32) * 5
+    lse = torch.rand(size, device="cuda", dtype=torch.float32) * 8
+    mean_logit = lse - entropy
+    nll = torch.rand(size, device="cuda", dtype=torch.float32) * 10
+    group_mask = torch.arange(size, device="cuda") % 7 == 0
+    weight, _loss, _ = cce_mile_forward_kernel(lse, mean_logit, nll, 1.0)
+    weight, loss = normalize_mile_weight_groups(weight, nll, group_mask, mean_reduction=True)
+
+    torch.testing.assert_close(weight[group_mask].mean(), torch.ones((), device="cuda"))
+    torch.testing.assert_close(weight[~group_mask].mean(), torch.ones((), device="cuda"))
+    torch.testing.assert_close(loss, nll * weight / size)
+
+
+@pytest.mark.parametrize("size", [257, 16385])
+@pytest.mark.parametrize("population", ["clean", "masked", "sparse"])
+@skip_no_cuda
+def test_fused_mile_group_normalization_handles_population_edges(
+    size: int,
+    population: str,
+) -> None:
+    torch.manual_seed(38)
+    entropy = torch.rand(size, device="cuda", dtype=torch.float32) * 7
+    lse = torch.rand(size, device="cuda", dtype=torch.float32) * 8
+    mean_logit = lse - entropy
+    nll = torch.rand(size, device="cuda", dtype=torch.float32) * 10
+    if population == "clean":
+        group_mask = torch.zeros(size, device="cuda", dtype=torch.bool)
+    elif population == "masked":
+        group_mask = torch.ones(size, device="cuda", dtype=torch.bool)
+    else:
+        group_mask = torch.arange(size, device="cuda") % 127 == 0
+
+    weight, loss, _ = cce_mile_forward_kernel(
+        lse,
+        mean_logit,
+        nll,
+        1.0,
+        mean_reduction=True,
+        group_mask=group_mask,
+    )
+    assert torch.isfinite(weight).all()
+    assert torch.isfinite(loss).all()
+    for members in (group_mask, ~group_mask):
+        if bool(members.any()):
+            torch.testing.assert_close(
+                weight[members].mean(),
+                torch.ones((), device="cuda"),
+                rtol=2e-4,
+                atol=2e-4,
+            )
+    torch.testing.assert_close(loss, nll * weight / size, rtol=2e-5, atol=2e-5)
+
+
+@skip_no_cuda
+def test_cce_mile_group_mask_matches_dense_with_shift_and_ignored_targets() -> None:
+    torch.manual_seed(39)
+    e_data = torch.randn(3, 17, 64, device="cuda", dtype=torch.bfloat16) / 8
+    c_data = torch.randn(257, 64, device="cuda", dtype=torch.bfloat16)
+    targets = torch.randint(0, 257, (3, 17), device="cuda")
+    targets[1, 9:] = IGNORE_INDEX
+    group_mask = torch.zeros_like(targets, dtype=torch.bool)
+    group_mask[:, 1::5] = True
+
+    e_ref = e_data.clone().requires_grad_(True)
+    c_ref = c_data.clone().requires_grad_(True)
+    expected, _ = _dense_mile(e_ref, c_ref, targets, None, 1.0, None, 1, "mean", group_mask)
+    e_actual = e_data.clone().requires_grad_(True)
+    c_actual = c_data.clone().requires_grad_(True)
+    actual = linear_cross_entropy(
+        e_actual,
+        c_actual,
+        targets,
+        shift=1,
+        impl="cce_kahan_full_c",
+        mile_enabled=True,
+        mile_gamma=1.0,
+        mile_group_mask=group_mask,
+    )
+    expected.backward()
+    actual.backward()
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    _assert_relative_gradient(e_actual.grad, e_ref.grad)
+    _assert_relative_gradient(c_actual.grad, c_ref.grad)
+
+
+@skip_no_cuda
 def test_cce_loss_metrics_reconcile_without_materializing_logits() -> None:
     torch.manual_seed(41)
     e = torch.randn(4, 16, 64, device="cuda", dtype=torch.bfloat16) / 8
@@ -141,9 +242,7 @@ def test_cce_loss_metrics_reconcile_without_materializing_logits() -> None:
     )
 
     reconstructed = (
-        metrics["ntp_ce_unweighted"]
-        + metrics["mile_reweighting_delta"]
-        + metrics["mu_loss"]
+        metrics["ntp_ce_unweighted"] + metrics["mile_reweighting_delta"] + metrics["mu_loss"]
     )
     torch.testing.assert_close(reconstructed, loss.detach(), rtol=2e-5, atol=2e-5)
     assert not any(metric.requires_grad for metric in metrics.values())
@@ -187,9 +286,7 @@ def test_cce_mile_matches_dense(
     torch.manual_seed(5)
     e_data = torch.randn(4, 16, 64, device="cuda", dtype=torch.bfloat16) / 64**0.5
     c_data = torch.randn(137, 64, device="cuda", dtype=torch.bfloat16)
-    bias_data = (
-        torch.randn(137, device="cuda", dtype=torch.bfloat16) * 0.02 if has_bias else None
-    )
+    bias_data = torch.randn(137, device="cuda", dtype=torch.bfloat16) * 0.02 if has_bias else None
     targets = torch.randint(0, 137, (4, 16), device="cuda")
     if invalids:
         targets[0, 3] = IGNORE_INDEX
@@ -249,9 +346,7 @@ def test_cce_mile_return_lse_gradient() -> None:
 
     e_ref = e_data.detach().clone().requires_grad_(True)
     c_ref = c_data.detach().clone().requires_grad_(True)
-    expected_loss, expected_lse = _dense_mile(
-        e_ref, c_ref, targets, None, 1.0, 20.0, 1, "none"
-    )
+    expected_loss, expected_lse = _dense_mile(e_ref, c_ref, targets, None, 1.0, 20.0, 1, "none")
     expected = expected_loss.mean() + 0.01 * expected_lse.square().mean()
 
     e_test = e_data.detach().clone().requires_grad_(True)
@@ -335,6 +430,14 @@ def test_mile_rejects_unsupported_options() -> None:
         linear_cross_entropy(e, c, targets, impl="torch_compile", return_loss_metrics=True)
     with pytest.raises(ValueError, match="mile_gamma"):
         linear_cross_entropy(e, c, targets, impl="cce", mile_enabled=True, mile_gamma=-1.0)
+    with pytest.raises(ValueError, match="mile_enabled"):
+        linear_cross_entropy(
+            e,
+            c,
+            targets,
+            impl="cce",
+            mile_group_mask=torch.zeros_like(targets, dtype=torch.bool),
+        )
     with pytest.raises(ValueError, match="return_loss_metrics"):
         linear_cross_entropy(
             e,

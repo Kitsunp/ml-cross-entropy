@@ -241,13 +241,14 @@ model.meap_embedding = MEAPEmbeddingOverride(
 ).to(device=model.device, dtype=model.dtype)
 
 # Keep clean_input_ids/labels unchanged for targets and evaluation.
-model_input_ids = meap_mask_inputs(
+model_input_ids, meap_selected = meap_mask_inputs(
     clean_input_ids,
     mask_token_id=tokenizer.mask_token_id,
     enabled=True,                 # explicit on/off switch
     mask_ratio=0.15,
     padding_mask=padding_mask,    # no boolean inverse allocation
     seed=global_step,
+    return_mask=True,             # needed only for MEAP + MiLe
 )
 
 # `compose_input_embeddings` denotes the model's existing dense/Leviathan plus
@@ -263,6 +264,7 @@ loss = linear_cross_entropy(
     impl="cce_kahan_full_c",
     mile_enabled=True,
     mile_gamma=1.0,
+    mile_group_mask=meap_selected,
     mu_loss_enabled=True,
     mu_loss_lambda=1e-4,
 )
@@ -287,6 +289,14 @@ For int64 device seeds, the kernel folds the high and low halves into the
 With `return_metrics=True`, the kernel additionally returns the two scalar
 counters `[eligible_count, masked_count]` without allocating the boolean token
 mask required by `return_mask=True`.
+
+When MEAP and MiLe are enabled together, pass that optional selected-position
+mask as `mile_group_mask`. CCE aligns it with `shift` and ignored labels, then
+mean-normalizes detached MiLe weights independently for corrupted and clean
+inputs. MiLe still prioritizes difficult tokens within both populations, while
+the configured corruption ratio retains control of their aggregate loss mass.
+Do not request the token mask when MiLe is disabled; the ordinary MEAP path then
+keeps its output-only allocation contract.
 
 The MEAP masking API is required only while MEAP corruption is active. A model
 that owns the dedicated vector can perform clean training, evaluation, and

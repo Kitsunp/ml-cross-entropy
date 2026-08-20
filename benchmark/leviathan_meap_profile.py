@@ -59,6 +59,20 @@ def _paired_events(
     return summary(timings["separate"]), summary(timings["fused"])
 
 
+def _allocated_peak(function, *, clear=None) -> tuple[int, int]:
+    if clear is not None:
+        clear()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = function()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    del result
+    return baseline, peak
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=4096)
@@ -179,15 +193,15 @@ def main() -> None:
         steps=args.steps,
     )
 
-    clear_grads()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    fused_step()
-    torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated()
-    if peak > int(args.vram_limit_gib * 1024**3):
+    forward_baseline, forward_peak = _allocated_peak(
+        fused_inference,
+        clear=clear_grads,
+    )
+    train_baseline, train_peak = _allocated_peak(
+        fused_step,
+        clear=clear_grads,
+    )
+    if max(forward_peak, train_peak) > int(args.vram_limit_gib * 1024**3):
         raise RuntimeError("allocated-memory peak exceeded the validation ceiling")
 
     def row(name: str, values: tuple[float, float, float, float]) -> None:
@@ -206,8 +220,12 @@ def main() -> None:
     row("train separate", training_separate)
     row("train fused", training_fused)
     print(
-        f"fused_baseline_mib={baseline / 2**20:.2f} "
-        f"fused_peak_mib={peak / 2**20:.2f}"
+        f"fused_forward_baseline_mib={forward_baseline / 2**20:.2f} "
+        f"fused_forward_peak_mib={forward_peak / 2**20:.2f}"
+    )
+    print(
+        f"fused_train_baseline_mib={train_baseline / 2**20:.2f} "
+        f"fused_train_peak_mib={train_peak / 2**20:.2f}"
     )
 
 
