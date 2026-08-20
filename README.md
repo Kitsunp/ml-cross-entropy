@@ -29,6 +29,10 @@ validation are documented in [docs/torch-compile.md](docs/torch-compile.md).
 The optional CuTe PolyNorm kernel, fused stateless dropout, TorchAO FP8
 boundary, and RTX 5090 measurements are documented in
 [docs/polynorm-cute.md](docs/polynorm-cute.md).
+The independent fused Triton REPO-GRAPE operator, its IHA `P=2` contract,
+precision policy, RTX 5090 training/inference matrix, and reproducible stability
+checks are documented in
+[docs/repo-grape-triton.md](docs/repo-grape-triton.md).
 The conservative FP32 rationale and the bounded Blackwell CC10.x/CC12.x FP16
 path for MiLe, μ-loss, and MEAP are described in its
 [mixed-accumulation section](docs/cce-modernization.md#mixed-fp16-accumulation-with-mile-and-loss).
