@@ -45,6 +45,7 @@ class CCEParams:
     return_loss_metrics: bool
     auto_mixed_grad_accum: bool
     mile_gamma: float | None
+    mile_group_mask: torch.Tensor | None
     mu_loss_lambda: float | None
     patch_training_enabled: bool
 
@@ -66,6 +67,7 @@ def _validate_cce_inputs(
     mu_loss_enabled: bool,
     mu_loss_lambda: float,
     patch_training_enabled: bool,
+    mile_group_mask: torch.Tensor | None = None,
 ) -> None:
     """Keep eager and compiler-boundary input validation identical."""
     if patch_training_enabled:
@@ -84,10 +86,19 @@ def _validate_cce_inputs(
     assert e.size(-1) == c.size(1)
     if mile_enabled and (not math.isfinite(mile_gamma) or mile_gamma < 0):
         raise ValueError(f"mile_gamma must be finite and non-negative, got {mile_gamma}.")
+    if mile_group_mask is not None:
+        if not mile_enabled:
+            raise ValueError("mile_group_mask requires mile_enabled=True.")
+        if patch_training_enabled:
+            raise ValueError("mile_group_mask is not supported by patch training.")
+        if mile_group_mask.shape != targets.shape:
+            raise ValueError("mile_group_mask must match the targets shape.")
+        if mile_group_mask.dtype != torch.bool:
+            raise TypeError("mile_group_mask must be boolean.")
+        if mile_group_mask.device != targets.device:
+            raise ValueError("mile_group_mask and targets must share a device.")
     if mu_loss_enabled and (not math.isfinite(mu_loss_lambda) or mu_loss_lambda < 0):
-        raise ValueError(
-            f"mu_loss_lambda must be finite and non-negative, got {mu_loss_lambda}."
-        )
+        raise ValueError(f"mu_loss_lambda must be finite and non-negative, got {mu_loss_lambda}.")
     if mu_loss_enabled and reduction != "mean":
         raise ValueError("mu_loss_enabled requires reduction='mean'.")
     if return_loss_metrics and reduction != "mean":
@@ -217,6 +228,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                     params.mile_gamma,
                     return_unweighted_nll_mean=params.return_loss_metrics,
                     mean_reduction=params.reduction == "mean",
+                    group_mask=params.mile_group_mask,
                     max_entropy=math.log(
                         c.size(0)
                         * (
@@ -279,9 +291,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                 unweighted_ce = objective_loss
             else:
                 unweighted_ce = unweighted_nll_mean
-            mu_loss_metric = (
-                mu_loss if mu_loss is not None else objective_loss.new_zeros(())
-            )
+            mu_loss_metric = mu_loss if mu_loss is not None else objective_loss.new_zeros(())
             loss_metrics = torch.stack(
                 (
                     unweighted_ce,
@@ -432,6 +442,7 @@ def cce_linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -447,6 +458,7 @@ def cce_linear_cross_entropy(
         mu_loss_enabled,
         mu_loss_lambda,
         patch_training_enabled,
+        mile_group_mask,
     )
 
     if patch_training_enabled:
@@ -480,6 +492,11 @@ def cce_linear_cross_entropy(
             else torch.distributed.get_world_size(vocab_parallel_options.group)
         )
         valids = _build_flat_valids(targets, ignore_index, shift, global_vocab_size)
+        if mile_group_mask is not None:
+            group_mask = mile_group_mask.contiguous().flatten()
+            if valids is not None:
+                group_mask = group_mask.index_select(0, valids.to(torch.long))
+            mile_group_mask = group_mask
         e = e.flatten(0, -2)
         targets = targets.flatten()
         if (targets.data_ptr() % 16) != 0:
@@ -504,6 +521,7 @@ def cce_linear_cross_entropy(
         return_loss_metrics=return_loss_metrics,
         auto_mixed_grad_accum=_auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
+        mile_group_mask=mile_group_mask,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
         patch_training_enabled=patch_training_enabled,
     )

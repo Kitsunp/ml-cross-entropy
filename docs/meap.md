@@ -144,6 +144,13 @@ mathematics. This keeps checkpoints and inference usable when the optional
 Triton package is absent; physical kernel fusion is a CUDA optimization, not a
 different model definition.
 
+`torch.no_grad()` always selects the checkpoint-free Leviathan inference op,
+even when the mask vector is stored as a trainable `Parameter`. If every
+Leviathan parameter is frozen and only the mask vector trains, the same
+inference op supplies the forward values and a final differentiable selection
+supplies only the mask-vector gradient. That mask-only route neither saves LEV
+checkpoints nor launches the codebook/spline/projection backward.
+
 ## Kernel contract
 
 ```python
@@ -255,7 +262,7 @@ The initial supported experiment keeps the mechanisms independent and explicit:
 
 - CCE implementation: `cce_kahan_full_c`
 - MEAP ratio: `0.15`
-- MiLe: enabled, `gamma=1.0`, detached and mean-normalized weights
+- MiLe: enabled, `gamma=1.0`, detached and population-normalized weights
 - mu loss: enabled, `mu_loss_lambda=1e-4`
 
 MEAP changes the context before the Transformer. MiLe then reweights the clean
@@ -263,6 +270,40 @@ next-token losses using detached predictive entropy. Mu loss adds
 $10^{-4}\lVert\mathrm{mean}(C,\mathrm{dim}=0)\rVert_2^2$. Neither MiLe
 nor mu loss changes how
 MEAP positions are sampled.
+
+When MEAP and MiLe are active together, CCE receives the selected-input mask as
+`mile_group_mask`. For `shift=1`, input position $t$ is aligned with the hidden
+row at $t$ that predicts clean label $t+1$; the mask is flattened with exactly
+the same valid-row mapping as CCE, including ignored labels. Let
+
+$$w_i=(1+H_i)^\gamma,\qquad G=\{i:\text{input }i\text{ was replaced}\}.$$
+
+The detached weights are normalized independently:
+
+$$
+\hat w_i =
+\begin{cases}
+|G|w_i / \sum_{j\in G}w_j, & i\in G,\\
+|\bar G|w_i / \sum_{j\in \bar G}w_j, & i\notin G.
+\end{cases}
+$$
+
+MiLe therefore still ranks examples by entropy *within* both populations, but
+the configured MEAP ratio controls their aggregate objective mass. A single
+global normalization can unintentionally defeat that ratio: in the 5,000-step
+causal probe below, 15% corrupted positions reached mean weight `3.5933` while
+clean positions reached `0.6158`, assigning approximately 50.7% of all NTP
+gradient mass to the synthetic population. Population normalization held both
+means at `1.0` and reduced peak mask-vector gradient RMS from `0.006185` to
+`0.001633` (-73.6%). No NaN or Inf occurred in either 5,000-step run; the result
+isolates and removes this amplification mechanism rather than claiming that a
+short synthetic test proves indefinite training stability.
+
+This conditional normalization is inactive when either MEAP or MiLe is off.
+It does not change token selection, clean labels, entropy, CCE arithmetic,
+mu loss, evaluation, or inference. The large-vector Triton path folds the
+population sums and count into MiLe's existing reduction kernels instead of
+launching a separate normalization pass.
 
 Validation and inference should use clean inputs (`enabled=False`). A corrupted
 validation pass may be reported separately as a robustness diagnostic, but it
@@ -280,10 +321,18 @@ attention probabilities, then report (1) relative attention-score decay at the
 selected keys and (2) relative attention-variance change at unselected keys.
 `meap_attention_diagnostics` implements those paired calculations. Run them at
 evaluation cadence rather than every training step because retaining attention
-matrices changes the memory and latency profile. Pass the original eligibility
-mask so padding keys do not bias either statistic. Track the dedicated vector RMS
-as a cheap health metric, and use Needle-in-a-Haystack or multi-document QA as
-the outcome metric; training loss alone cannot measure MEAP's retrieval effect.
+matrices changes the memory and latency profile. The helper applies causal
+query-key visibility by default. Pass the original eligibility mask so padding
+keys are excluded; for square self-attention it also excludes the corresponding
+padded query rows. For cached, packed, sliding-window, or other nonstandard
+attention, pass `query_mask=` and/or the explicit pairwise `visibility_mask=`.
+Track the dedicated vector RMS as a cheap health metric, and use
+`meap_mask_embedding_max_abs` beside it to distinguish broad drift from a
+single-coordinate outlier. The Leviathan mask gradient is reduced in FP32 and
+cast once to the parameter dtype; this matters at long token counts, where a
+native BF16 reduction reached `0.992676` maximum absolute error in the 32,768-row
+stress probe. Use Needle-in-a-Haystack or multi-document QA as the outcome metric; training loss
+alone cannot measure MEAP's retrieval effect.
 
 ## Reproducing compile latency and memory
 
@@ -293,7 +342,7 @@ steps, clears warmup gradients before the memory baseline, and enforces a 10 GiB
 total allocated-peak ceiling:
 
 ```bash
-python benchmark/meap_embedding_profile.py \
+python -m benchmark.meap_embedding_profile \
   --batch 64 --sequence 512 --hidden 512 --dtype bfloat16 --steps 5
 ```
 
@@ -302,6 +351,31 @@ For the Leviathan-specific comparison, use:
 ```bash
 python -m benchmark.leviathan_meap_profile --tokens 4096 --steps 100
 ```
+
+To reproduce the MEAP-conditioned MiLe forward+backward comparison (BF16
+activations and the vocabulary geometry used in development):
+
+```bash
+python -m benchmark.meap_mile_profile \
+  --batch 8 --sequence 513 --hidden 512 --vocab 64402 \
+  --warmup 10 --steps 100 --vram-limit-gib 10
+```
+
+On an RTX 5070 Ti (driver `610.47`) with Python `3.14.4`, PyTorch
+`2.12.1+cu130`, CUDA build `13.0`, and Triton `3.7.1`, paired runs produced:
+
+| Causal rows | Global MiLe | Population-normalized | Change | Allocated peak (both) |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 2.7264 ms | 2.9951 ms | +9.9% | 316.49 MiB |
+| 4,096 | 13.8361 ms | 14.2252 ms | +2.8% | 330.63 MiB |
+| 8,192 | 24.4383 ms | 24.7604 ms | +1.3% | 346.79 MiB |
+
+The 512- and 8,192-row entries use 50 paired measurements; 4,096 uses 100.
+This is the full compiled CCE forward+backward, not just the small MiLe
+reduction. Population statistics add a fixed reduction cost whose relative
+impact falls as classifier work grows. Run-to-run variance remains
+sub-millisecond. The production library does not set a compile mode or alter
+Dynamo/Inductor flags.
 
 MXFP8 weight training still presents BF16 (or the configured activation dtype)
 at this embedding boundary, so benchmark that activation dtype rather than
@@ -343,3 +417,13 @@ therefore removes a launch/activation traversal and guarantees the correct
 producer boundary, but it does not claim a material end-to-end speedup or a
 persistent-memory reduction. Backward still needs the mask-gradient reduction,
 which bounds the full-step gain.
+
+A route-selection regression audit at the same 4096-row geometry found that a
+trainable mask parameter previously made `torch.no_grad()` call the checkpointed
+forward op. Selecting the inference op reduced its incremental allocated peak
+from `41.51 MiB` to `25.26 MiB` while leaving max-autotune inference latency
+effectively unchanged. With every Leviathan parameter frozen and only the mask
+vector trainable, the checkpoint-free route reduced the eager synthetic step
+from `27.43 ms` to `5.55 ms` and its incremental peak from `100.02 MiB` to
+`44.00 MiB`. Normal full-model training still uses the complete forward and
+backward and retains its original gradients.

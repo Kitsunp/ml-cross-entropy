@@ -21,6 +21,9 @@ def meap_attention_diagnostics(
     selected_mask: torch.Tensor,
     *,
     eligible_mask: torch.Tensor | None = None,
+    query_mask: torch.Tensor | None = None,
+    visibility_mask: torch.Tensor | None = None,
+    causal: bool = True,
     eps: float = 1e-12,
 ) -> dict[str, torch.Tensor]:
     """Compute the paired attention diagnostics used to evaluate MEAP.
@@ -31,6 +34,9 @@ def meap_attention_diagnostics(
     identifies the keys replaced in the masked copy and may have leading
     singleton dimensions before its final sequence dimension. ``eligible_mask``
     can exclude padding or other invalid keys from both populations.
+    ``query_mask`` excludes invalid query rows. For square self-attention it
+    defaults to ``eligible_mask``. ``visibility_mask`` can provide an explicit
+    query-key mask, while ``causal=True`` excludes future keys by default.
 
     The returned relative score decay and non-mask variance change distinguish
     MEAP's intended attention effect from the operational masking fraction.
@@ -63,14 +69,68 @@ def meap_attention_diagnostics(
                 f"{name} leading dimensions are not broadcastable to attention."
             ) from error
 
+    def broadcast_query_mask(mask: torch.Tensor, name: str) -> torch.Tensor:
+        if mask.ndim < 1:
+            raise ValueError(f"{name} must have a query dimension.")
+        if mask.device != clean_attention.device:
+            raise ValueError(f"{name} and attention tensors must share a device.")
+        if mask.shape[-1] != clean_attention.shape[-2]:
+            raise ValueError(f"{name} must match the attention query dimension.")
+        result = mask.to(dtype=torch.bool).unsqueeze(-1)
+        while result.ndim < clean_attention.ndim:
+            result = result.unsqueeze(-3)
+        try:
+            return torch.broadcast_to(result, clean_attention.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"{name} leading dimensions are not broadcastable to attention."
+            ) from error
+
+    def broadcast_visibility_mask(mask: torch.Tensor) -> torch.Tensor:
+        if mask.ndim < 2:
+            raise ValueError("visibility_mask must have query and key dimensions.")
+        if mask.device != clean_attention.device:
+            raise ValueError("visibility_mask and attention tensors must share a device.")
+        if mask.shape[-2:] != clean_attention.shape[-2:]:
+            raise ValueError("visibility_mask must match the attention query and key dimensions.")
+        result = mask.to(dtype=torch.bool)
+        while result.ndim < clean_attention.ndim:
+            result = result.unsqueeze(-3)
+        try:
+            return torch.broadcast_to(result, clean_attention.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                "visibility_mask leading dimensions are not broadcastable to attention."
+            ) from error
+
     selected = broadcast_key_mask(selected_mask, "selected_mask")
     eligible = (
         torch.ones_like(selected)
         if eligible_mask is None
         else broadcast_key_mask(eligible_mask, "eligible_mask")
     )
-    selected = selected & eligible
-    unselected = ~selected & eligible
+    if (
+        query_mask is None
+        and eligible_mask is not None
+        and (clean_attention.shape[-2] == clean_attention.shape[-1])
+    ):
+        query_mask = eligible_mask
+    query_valid = (
+        torch.ones_like(selected)
+        if query_mask is None
+        else broadcast_query_mask(query_mask, "query_mask")
+    )
+    visible = eligible & query_valid
+    if causal:
+        query_length, key_length = clean_attention.shape[-2:]
+        query_positions = torch.arange(query_length, device=clean_attention.device).unsqueeze(-1)
+        key_positions = torch.arange(key_length, device=clean_attention.device).unsqueeze(0)
+        visible = visible & (key_positions <= query_positions + max(key_length - query_length, 0))
+    if visibility_mask is not None:
+        visible = visible & broadcast_visibility_mask(visibility_mask)
+
+    selected = selected & visible
+    unselected = ~selected & visible
     selected_count = selected.sum(dim=-1)
     unselected_count = unselected.sum(dim=-1)
     valid_rows = (selected_count > 0) & (unselected_count > 0)
@@ -91,36 +151,28 @@ def meap_attention_diagnostics(
     masked_selected_mean = masked_selected_per_row.masked_select(valid_rows).mean()
 
     clean_unselected_mean = (
-        clean_fp32.masked_fill(~unselected, 0.0).sum(dim=-1)
-        / unselected_denominator
+        clean_fp32.masked_fill(~unselected, 0.0).sum(dim=-1) / unselected_denominator
     )
     masked_unselected_mean = (
-        masked_fp32.masked_fill(~unselected, 0.0).sum(dim=-1)
-        / unselected_denominator
+        masked_fp32.masked_fill(~unselected, 0.0).sum(dim=-1) / unselected_denominator
     )
     clean_squared_error = (clean_fp32 - clean_unselected_mean.unsqueeze(-1)).square()
     masked_squared_error = (masked_fp32 - masked_unselected_mean.unsqueeze(-1)).square()
     clean_variance_per_row = (
-        clean_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1)
-        / unselected_denominator
+        clean_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1) / unselected_denominator
     )
     masked_variance_per_row = (
-        masked_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1)
-        / unselected_denominator
+        masked_squared_error.masked_fill(~unselected, 0.0).sum(dim=-1) / unselected_denominator
     )
     clean_variance = clean_variance_per_row.masked_select(valid_rows).mean()
     masked_variance = masked_variance_per_row.masked_select(valid_rows).mean()
 
     return {
         "masked_attention_score_decay": clean_selected_mean - masked_selected_mean,
-        "masked_attention_relative_decay": (
-            clean_selected_mean - masked_selected_mean
-        )
+        "masked_attention_relative_decay": (clean_selected_mean - masked_selected_mean)
         / clean_selected_mean.abs().clamp_min(eps),
         "unmasked_attention_variance_change": masked_variance - clean_variance,
-        "unmasked_attention_variance_relative_change": (
-            masked_variance - clean_variance
-        )
+        "unmasked_attention_variance_relative_change": (masked_variance - clean_variance)
         / clean_variance.abs().clamp_min(eps),
     }
 
@@ -377,9 +429,7 @@ def _validate_meap_inputs(
         raise TypeError("mask_token_id must be an integer.")
     dtype_limits = torch.iinfo(input_ids.dtype)
     if not 0 <= mask_token_id <= dtype_limits.max:
-        raise ValueError(
-            f"mask_token_id must be in [0, {dtype_limits.max}] for {input_ids.dtype}."
-        )
+        raise ValueError(f"mask_token_id must be in [0, {dtype_limits.max}] for {input_ids.dtype}.")
     if not math.isfinite(mask_ratio) or not 0.0 <= mask_ratio <= 1.0:
         raise ValueError(f"mask_ratio must be finite and in [0, 1], got {mask_ratio}.")
     if isinstance(seed, torch.Tensor):
@@ -466,14 +516,10 @@ def _triton_meap_mask_inputs(
     sequence_length = input_ids.size(1)
     block_t = triton.next_power_of_2(sequence_length)
     if block_t > 4096:
-        raise ValueError(
-            "The fixed-count Triton MEAP kernel supports sequence lengths up to 4096."
-        )
+        raise ValueError("The fixed-count Triton MEAP kernel supports sequence lengths up to 4096.")
     output = torch.empty_like(input_ids)
     selected = torch.empty_like(input_ids, dtype=torch.bool) if return_mask else input_ids
-    metrics = (
-        torch.zeros(2, device=input_ids.device, dtype=torch.int32) if return_metrics else None
-    )
+    metrics = torch.zeros(2, device=input_ids.device, dtype=torch.int32) if return_metrics else None
     metrics_arg = metrics if metrics is not None else input_ids
     selection_mask = padding_mask if padding_mask is not None else eligible_mask
     eligible_arg = selection_mask if selection_mask is not None else input_ids
@@ -536,9 +582,7 @@ def meap_mask_inputs(
     With ``return_metrics=True``, the final tuple item is a two-element device
     tensor ``[eligible_count, masked_count]`` reduced by the masking kernel.
     """
-    _validate_meap_inputs(
-        input_ids, mask_token_id, mask_ratio, eligible_mask, padding_mask, seed
-    )
+    _validate_meap_inputs(input_ids, mask_token_id, mask_ratio, eligible_mask, padding_mask, seed)
     if implementation not in {"triton", "torch"}:
         raise ValueError(f"Unknown MEAP implementation {implementation!r}.")
     if not enabled:

@@ -75,6 +75,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -102,6 +103,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -129,6 +131,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -156,6 +159,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -183,6 +187,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -218,6 +223,7 @@ def linear_cross_entropy(
     vocab_parallel_options: VocabParallelOptions | None = None,
     mile_enabled: bool = False,
     mile_gamma: float = 1.0,
+    mile_group_mask: torch.Tensor | None = None,
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
@@ -290,11 +296,7 @@ def linear_cross_entropy(
         # exposes the data-dependent valid-index compaction and Triton launch
         # code to Dynamo, specializing the graph once per valid-token count.
         cuda_autocast_enabled = torch.is_autocast_enabled("cuda")
-        compute_dtype = (
-            torch.get_autocast_dtype("cuda")
-            if cuda_autocast_enabled
-            else e.dtype
-        )
+        compute_dtype = torch.get_autocast_dtype("cuda") if cuda_autocast_enabled else e.dtype
         use_compiler_boundary = (
             torch.compiler.is_compiling()
             and vocab_parallel_options is None
@@ -317,18 +319,16 @@ def linear_cross_entropy(
                 mu_loss_enabled,
                 mu_loss_lambda,
                 patch_training_enabled,
+                mile_group_mask,
             )
             resolved_filter_eps = _handle_eps(cce_opts["filter_eps"], compute_dtype)
-            filter_e_grad = (
-                cce_opts["filter_e_grad"] and resolved_filter_eps is not None
-            )
-            filter_c_grad = (
-                cce_opts["filter_c_grad"] and resolved_filter_eps is not None
-            )
+            filter_e_grad = cce_opts["filter_e_grad"] and resolved_filter_eps is not None
+            filter_c_grad = cce_opts["filter_c_grad"] and resolved_filter_eps is not None
             loss, loss_metrics = compiler_cce_linear_cross_entropy(
                 e,
                 c,
                 targets,
+                mile_group_mask,
                 bias,
                 ignore_index,
                 softcap,
@@ -367,6 +367,7 @@ def linear_cross_entropy(
                 _auto_mixed_grad_accum=impl == "cce_kahan_full_c",
                 mile_enabled=mile_enabled,
                 mile_gamma=mile_gamma,
+                mile_group_mask=mile_group_mask,
                 mu_loss_enabled=mu_loss_enabled,
                 mu_loss_lambda=mu_loss_lambda,
                 patch_training_enabled=patch_training_enabled,
@@ -376,6 +377,8 @@ def linear_cross_entropy(
             raise ValueError("return_loss_metrics is only supported by CCE implementations.")
         if mile_enabled:
             raise ValueError("mile_enabled is only supported by CCE implementations.")
+        if mile_group_mask is not None:
+            raise ValueError("mile_group_mask is only supported by CCE implementations.")
         if mu_loss_enabled:
             raise ValueError("mu_loss_enabled is only supported by CCE implementations.")
         if patch_training_enabled:
@@ -463,6 +466,7 @@ class LinearCrossEntropy(nn.Module):
         c: torch.Tensor,
         targets: torch.Tensor,
         bias: torch.Tensor | None = None,
+        mile_group_mask: torch.Tensor | None = None,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -488,6 +492,7 @@ class LinearCrossEntropy(nn.Module):
             return_loss_metrics=self.return_loss_metrics,
             mile_enabled=self.mile_enabled,
             mile_gamma=self.mile_gamma,
+            mile_group_mask=mile_group_mask,
             mu_loss_enabled=self.mu_loss_enabled,
             mu_loss_lambda=self.mu_loss_lambda,
             patch_training_enabled=self.patch_training_enabled,

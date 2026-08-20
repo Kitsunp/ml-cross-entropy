@@ -574,6 +574,10 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
             raise ValueError(
                 "mask_embedding and mask_token_id must be provided together"
             )
+        if not isinstance(mask_token_id, int):
+            raise TypeError("mask_token_id must be an integer")
+        if not 0 <= mask_token_id < int(cfg.vocab_size):
+            raise ValueError("mask_token_id must be inside the Leviathan vocabulary")
         if mask_embedding.ndim != 1 or mask_embedding.numel() != D:
             raise ValueError(
                 f"mask_embedding must have shape ({D},), got "

@@ -14,11 +14,11 @@ from cut_cross_entropy.leviathan import (
     LeviathanConfig,
     LeviathanEmbedding,
     LeviathanGenerator,
-    make_triton_leviathan_generator,
-    replace_leviathan_generator,
-    leviathan_forward_ref,
     leviathan_embedding,
     leviathan_embedding_compiler_safe,
+    leviathan_forward_ref,
+    make_triton_leviathan_generator,
+    replace_leviathan_generator,
 )
 
 
@@ -154,6 +154,121 @@ def test_compiler_safe_meap_requires_complete_pair() -> None:
             generator.knot_grid,
             mask_token_id=7,
         )
+    with pytest.raises(TypeError, match="must be an integer"):
+        leviathan_embedding_compiler_safe(
+            ids,
+            params,
+            cfg,
+            generator.knot_grid,
+            mask_embedding=torch.randn(cfg.hidden_size),
+            mask_token_id=7.0,
+        )
+    with pytest.raises(ValueError, match="inside the Leviathan vocabulary"):
+        leviathan_embedding_compiler_safe(
+            ids,
+            params,
+            cfg,
+            generator.knot_grid,
+            mask_embedding=torch.randn(cfg.hidden_size),
+            mask_token_id=cfg.vocab_size,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_no_grad_meap_uses_checkpoint_free_inference_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cut_cross_entropy.leviathan.compiler as compiler
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = _detached_params(generator)
+    params = {name: parameter.cuda() for name, parameter in params.items()}
+    ids = torch.tensor([[7, 13, 7, 99]], device="cuda")
+    mask_embedding = torch.randn(
+        cfg.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    calls = {"forward": 0, "inference": 0}
+    inference_op = compiler._leviathan_inference_op
+
+    def fail_forward(*args, **kwargs):
+        del args, kwargs
+        calls["forward"] += 1
+        raise AssertionError("no-grad MEAP must not use the checkpointed op")
+
+    def counted_inference(*args, **kwargs):
+        calls["inference"] += 1
+        return inference_op(*args, **kwargs)
+
+    monkeypatch.setattr(compiler, "_leviathan_forward_op", fail_forward)
+    monkeypatch.setattr(compiler, "_leviathan_inference_op", counted_inference)
+    with torch.no_grad():
+        output = leviathan_embedding_compiler_safe(
+            ids,
+            params,
+            cfg,
+            generator.knot_grid,
+            mask_embedding=mask_embedding,
+            mask_token_id=7,
+        )
+
+    assert calls == {"forward": 0, "inference": 1}
+    assert output.grad_fn is None
+    torch.testing.assert_close(
+        output[ids.eq(7)],
+        mask_embedding.detach().expand(2, -1),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_mask_only_training_skips_leviathan_checkpoints_and_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cut_cross_entropy.leviathan.compiler as compiler
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = {name: parameter.detach() for name, parameter in _detached_params(generator).items()}
+    ids = torch.tensor([[7, 13, 7, 99]], device="cuda")
+    mask_embedding = torch.randn(
+        cfg.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    calls = {"forward": 0, "inference": 0}
+    inference_op = compiler._leviathan_inference_op
+
+    def fail_forward(*args, **kwargs):
+        del args, kwargs
+        calls["forward"] += 1
+        raise AssertionError("mask-only tuning must not save LEV checkpoints")
+
+    def counted_inference(*args, **kwargs):
+        calls["inference"] += 1
+        return inference_op(*args, **kwargs)
+
+    monkeypatch.setattr(compiler, "_leviathan_forward_op", fail_forward)
+    monkeypatch.setattr(compiler, "_leviathan_inference_op", counted_inference)
+    output = leviathan_embedding_compiler_safe(
+        ids,
+        params,
+        cfg,
+        generator.knot_grid,
+        mask_embedding=mask_embedding,
+        mask_token_id=7,
+    )
+    output.float().sum().backward()
+
+    assert calls == {"forward": 0, "inference": 1}
+    torch.testing.assert_close(
+        mask_embedding.grad,
+        torch.full_like(mask_embedding, 2.0),
+    )
+    assert all(not parameter.requires_grad for parameter in params.values())
 
 
 def test_supported_dispatch_routes_trainable_params_through_autograd(
@@ -224,9 +339,7 @@ def test_neollm_replacement_preserves_grid_and_trainability() -> None:
     cfg = _config(dtype=torch.float32)
     reference = LeviathanGenerator(cfg)
     with torch.no_grad():
-        reference.knot_grid.copy_(
-            torch.linspace(0.0, 1.0, cfg.generator_num_knots).pow(1.7)
-        )
+        reference.knot_grid.copy_(torch.linspace(0.0, 1.0, cfg.generator_num_knots).pow(1.7))
     reference.codebooks.requires_grad_(False)
 
     class Container(torch.nn.Module):
@@ -244,9 +357,7 @@ def test_neollm_replacement_preserves_grid_and_trainability() -> None:
     torch.testing.assert_close(replacement.knot_grid, original_grid)
 
     ids = torch.randint(cfg.vocab_size, (2, 8))
-    torch.testing.assert_close(
-        replacement(ids), reference(ids), rtol=0.0, atol=0.0
-    )
+    torch.testing.assert_close(replacement(ids), reference(ids), rtol=0.0, atol=0.0)
 
 
 def test_forward_split_selector_is_runtime_overridable(
@@ -273,9 +384,7 @@ def test_forward_split_selector_is_runtime_overridable(
 def test_cuda_kernel_is_finite_and_stays_under_vram_budget() -> None:
     cfg = _config(dtype=torch.bfloat16)
     model = LeviathanEmbedding(cfg).cuda()
-    assert {parameter.dtype for parameter in model.generator.parameters()} == {
-        torch.bfloat16
-    }
+    assert {parameter.dtype for parameter in model.generator.parameters()} == {torch.bfloat16}
     ids = torch.randint(cfg.vocab_size, (1, 32), device="cuda")
 
     torch.cuda.reset_peak_memory_stats()
@@ -334,6 +443,71 @@ def test_cuda_meap_is_fused_into_leviathan_output_and_backward() -> None:
     )
     assert all(parameter.grad.float().count_nonzero() == 0 for parameter in params.values())
     assert torch.cuda.max_memory_allocated() / 1e9 <= 10.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_meap_mask_gradient_reduces_in_fp32() -> None:
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = {
+        name: getattr(generator, name)
+        for name in (
+            "codebooks",
+            "head_proj_weight",
+            "head_norm_weight",
+            "head_norm_bias",
+            "head_spline_delta",
+            "head_out_weight",
+        )
+    }
+    mask_token_id = 7
+    ids = torch.full((1, 4096), mask_token_id, device="cuda", dtype=torch.long)
+    mask_embedding = torch.nn.Parameter(
+        torch.randn(cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+    )
+    upstream = torch.randn(1, 4096, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    output = leviathan_embedding_compiler_safe(
+        ids,
+        params,
+        cfg,
+        generator.knot_grid,
+        mask_embedding=mask_embedding,
+        mask_token_id=mask_token_id,
+    )
+    output.backward(upstream)
+
+    expected = upstream.float().reshape(-1, cfg.hidden_size).sum(dim=0).bfloat16()
+    torch.testing.assert_close(mask_embedding.grad, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_frozen_mask_skips_mask_reduction_but_keeps_leviathan_backward() -> None:
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = {name: parameter for name, parameter in generator.named_parameters()}
+    ids = torch.tensor([[7, 13, 7, 99]], device="cuda")
+    mask_embedding = torch.randn(
+        cfg.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    output = leviathan_embedding_compiler_safe(
+        ids,
+        params,
+        cfg,
+        generator.knot_grid,
+        mask_embedding=mask_embedding,
+        mask_token_id=7,
+    )
+    output[ids.eq(7)].float().sum().backward()
+
+    assert mask_embedding.grad is None
+    assert all(
+        parameter.grad is not None and parameter.grad.count_nonzero() == 0
+        for parameter in params.values()
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

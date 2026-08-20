@@ -96,9 +96,7 @@ def test_meap_embedding_override_covers_every_embedding_route(
     else:
         upstream = torch.nn.Embedding(vocab_size, hidden_size)
 
-    spelling_bee = (
-        torch.nn.Embedding(vocab_size, hidden_size) if use_spelling_bee else None
-    )
+    spelling_bee = torch.nn.Embedding(vocab_size, hidden_size) if use_spelling_bee else None
     override = MEAPEmbeddingOverride(hidden_size, mask_token_id)
 
     base = upstream(input_ids)
@@ -158,12 +156,8 @@ def test_meap_attention_diagnostics_matches_paired_definition() -> None:
     metrics = meap_attention_diagnostics(clean, masked, selected)
 
     # Mean attention at selected keys: 0.15 -> 0.075.
-    torch.testing.assert_close(
-        metrics["masked_attention_score_decay"], torch.tensor(0.075)
-    )
-    torch.testing.assert_close(
-        metrics["masked_attention_relative_decay"], torch.tensor(0.5)
-    )
+    torch.testing.assert_close(metrics["masked_attention_score_decay"], torch.tensor(0.075))
+    torch.testing.assert_close(metrics["masked_attention_relative_decay"], torch.tensor(0.5))
     # Population variance at remaining keys: 0.0025 -> 0.030625.
     torch.testing.assert_close(
         metrics["unmasked_attention_variance_change"], torch.tensor(0.028125)
@@ -195,13 +189,55 @@ def test_meap_attention_diagnostics_excludes_padding_keys() -> None:
         selected,
         eligible_mask=eligible,
     )
-    torch.testing.assert_close(
-        metrics["masked_attention_relative_decay"], torch.tensor(0.5)
-    )
+    torch.testing.assert_close(metrics["masked_attention_relative_decay"], torch.tensor(0.5))
     # The extreme padded values must not enter the visible-key variance.
-    torch.testing.assert_close(
-        metrics["unmasked_attention_variance_change"], torch.tensor(-0.0075)
+    torch.testing.assert_close(metrics["unmasked_attention_variance_change"], torch.tensor(-0.0075))
+
+
+def test_meap_attention_diagnostics_excludes_future_keys_and_padded_queries() -> None:
+    clean = torch.tensor(
+        [
+            [
+                [
+                    [1.0, 99.0, 99.0, 99.0],
+                    [0.6, 0.4, 99.0, 99.0],
+                    [0.2, 0.3, 0.5, 99.0],
+                    [77.0, 77.0, 77.0, 77.0],
+                ]
+            ]
+        ]
     )
+    masked = torch.tensor(
+        [
+            [
+                [
+                    [1.0, -99.0, -99.0, -99.0],
+                    [0.8, 0.2, -99.0, -99.0],
+                    [0.1, 0.1, 0.8, -99.0],
+                    [-77.0, -77.0, -77.0, -77.0],
+                ]
+            ]
+        ]
+    )
+    selected = torch.tensor([[False, True, False, False]])
+    eligible = torch.tensor([[True, True, True, False]])
+
+    metrics = meap_attention_diagnostics(
+        clean,
+        masked,
+        selected,
+        eligible_mask=eligible,
+    )
+
+    # Only causal, non-padding rows q=1 and q=2 contain both populations.
+    torch.testing.assert_close(metrics["masked_attention_score_decay"], torch.tensor(0.2))
+    torch.testing.assert_close(metrics["masked_attention_relative_decay"], torch.tensor(4.0 / 7.0))
+    torch.testing.assert_close(metrics["unmasked_attention_variance_change"], torch.tensor(0.05))
+    torch.testing.assert_close(
+        metrics["unmasked_attention_variance_relative_change"],
+        torch.tensor(40.0 / 9.0),
+    )
+
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 
@@ -300,9 +336,9 @@ def test_meap_rejects_invalid_inputs(
 @pytest.mark.parametrize("sequence_length", [17, 64, 127])
 def test_meap_triton_invariants(dtype: torch.dtype, sequence_length: int) -> None:
     batch_size = 7
-    input_ids = torch.arange(
-        batch_size * sequence_length, device="cuda", dtype=dtype
-    ).view(batch_size, sequence_length)
+    input_ids = torch.arange(batch_size * sequence_length, device="cuda", dtype=dtype).view(
+        batch_size, sequence_length
+    )
     lengths = torch.tensor([sequence_length - row for row in range(batch_size)], device="cuda")
     positions = torch.arange(sequence_length, device="cuda")
     eligible = positions.unsqueeze(0) < lengths.unsqueeze(1)
@@ -401,9 +437,7 @@ def test_meap_device_scalar_seed_matches_python_integer(seed: int) -> None:
     input_ids = torch.arange(8 * 64, device="cuda").view(8, 64)
     tensor_seed = torch.tensor(seed, device="cuda", dtype=torch.int64)
     from_integer = meap_mask_inputs(input_ids, 999, seed=seed, return_mask=True)
-    from_tensor = meap_mask_inputs(
-        input_ids, 999, seed=tensor_seed, return_mask=True
-    )
+    from_tensor = meap_mask_inputs(input_ids, 999, seed=tensor_seed, return_mask=True)
     assert torch.equal(from_integer[0], from_tensor[0])
     assert torch.equal(from_integer[1], from_tensor[1])
 
@@ -416,18 +450,14 @@ def test_meap_device_scalar_seed_folds_high_bits() -> None:
     folded_seed = _fold_seed_to_uint32(packed_seed)
     assert folded_seed != low_seed
 
-    _, from_low = meap_mask_inputs(
-        input_ids, 999_999, seed=low_seed, return_mask=True
-    )
+    _, from_low = meap_mask_inputs(input_ids, 999_999, seed=low_seed, return_mask=True)
     _, from_packed = meap_mask_inputs(
         input_ids,
         999_999,
         seed=torch.tensor(packed_seed, device="cuda", dtype=torch.int64),
         return_mask=True,
     )
-    _, from_folded = meap_mask_inputs(
-        input_ids, 999_999, seed=folded_seed, return_mask=True
-    )
+    _, from_folded = meap_mask_inputs(input_ids, 999_999, seed=folded_seed, return_mask=True)
     assert not torch.equal(from_packed, from_low)
     assert torch.equal(from_packed, from_folded)
 
@@ -458,7 +488,10 @@ def test_meap_permutation_has_no_obvious_position_or_adjacency_bias(seed: int) -
 
     adjacent_pairs = (selected[:, :-2] & selected[:, 1:-1]).sum()
     expected_adjacent_pairs = (
-        batch_size * (eligible_count - 1) * selected_count * (selected_count - 1)
+        batch_size
+        * (eligible_count - 1)
+        * selected_count
+        * (selected_count - 1)
         / (eligible_count * (eligible_count - 1))
     )
     relative_error = abs(float(adjacent_pairs) - expected_adjacent_pairs) / expected_adjacent_pairs
@@ -504,9 +537,7 @@ def test_meap_combines_with_cce_mile_and_mu_loss() -> None:
     )
     torch.testing.assert_close(
         loss.detach(),
-        metrics["ntp_ce_unweighted"]
-        + metrics["mile_reweighting_delta"]
-        + metrics["mu_loss"],
+        metrics["ntp_ce_unweighted"] + metrics["mile_reweighting_delta"] + metrics["mu_loss"],
         rtol=2e-5,
         atol=2e-5,
     )

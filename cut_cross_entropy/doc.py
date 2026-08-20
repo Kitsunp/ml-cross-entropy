@@ -46,6 +46,10 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
     :param mile_enabled: Explicitly enable MiLe loss with detached, mean-normalized entropy weights.
         Supported by CCE implementations only.
     :param mile_gamma: Non-negative MiLe entropy-weight exponent, used only when MiLe is enabled.
+    :param mile_group_mask: Optional boolean input-position mask, shaped like ``targets``.
+        When present, detached MiLe weights are mean-normalized independently inside and
+        outside the mask. This preserves MEAP's configured corruption mass instead of
+        treating augmentation-induced uncertainty as intrinsic token difficulty.
     :param mu_loss_enabled: Explicitly add the classifier mean regularizer
         ``mu_loss_lambda * ||mean(c, dim=0)||^2``. Supported by CCE implementations
         with ``reduction="mean"`` only.

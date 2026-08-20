@@ -54,9 +54,7 @@ def _pad_valid_rows(value: torch.Tensor, capacity: int) -> torch.Tensor:
     """Expose a static compiler shape while preserving the compact prefix."""
     padding = capacity - value.size(0)
     if padding < 0:
-        raise RuntimeError(
-            f"CCE produced {value.size(0)} valid rows for a capacity of {capacity}."
-        )
+        raise RuntimeError(f"CCE produced {value.size(0)} valid rows for a capacity of {capacity}.")
     return torch.nn.functional.pad(value, (0, padding)) if padding else value
 
 
@@ -103,6 +101,15 @@ def _prepare_backward_inputs(
     if targets.data_ptr() % 16:
         targets = torch.nn.functional.pad(targets, (0, 1))[:-1]
     return e, targets, batch_shape
+
+
+def _prepare_mile_group_mask(
+    group_mask: torch.Tensor,
+    valids: torch.Tensor,
+) -> torch.Tensor:
+    """Align an input-position mask with CCE's compact valid-row domain."""
+    aligned = group_mask.contiguous().flatten()
+    return aligned.index_select(0, valids.to(torch.long))
 
 
 @torch.library.custom_op(
@@ -187,6 +194,7 @@ def _cce_backward_op(
         return_loss_metrics=return_loss_metrics,
         auto_mixed_grad_accum=auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
+        mile_group_mask=None,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
         patch_training_enabled=patch_training_enabled,
     )
@@ -288,11 +296,7 @@ def _cce_backward_fake(
     # contiguous gradient back to the original shape.
     de = e.new_empty(e.shape) if e_requires_grad else _empty(e)
     dc = torch.empty_like(c) if c_requires_grad else _empty(c)
-    dbias = (
-        torch.empty_like(bias)
-        if bias is not None and bias_requires_grad
-        else _empty(e)
-    )
+    dbias = torch.empty_like(bias) if bias is not None and bias_requires_grad else _empty(e)
     return de, dc, dbias
 
 
@@ -306,6 +310,7 @@ def _cce_forward_op(
     e: torch.Tensor,
     c: torch.Tensor,
     targets: torch.Tensor,
+    mile_group_mask: torch.Tensor,
     bias: torch.Tensor | None,
     e_requires_grad: bool,
     c_requires_grad: bool,
@@ -342,6 +347,11 @@ def _cce_forward_op(
     e, targets, valids, batch_shape = _prepare_forward_inputs(
         e, targets, ignore_index, shift, patch_training_enabled, c.size(0)
     )
+    prepared_mile_group_mask = (
+        _prepare_mile_group_mask(mile_group_mask, valids)
+        if mile_group_mask.numel() != 0
+        else None
+    )
     # Custom-op backend implementations run below Autograd.  Recreate only the
     # metadata used by the existing kernel driver; no input storage is mutated.
     e = e.detach().requires_grad_(e_requires_grad)
@@ -365,6 +375,7 @@ def _cce_forward_op(
         return_loss_metrics=return_loss_metrics,
         auto_mixed_grad_accum=auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
+        mile_group_mask=prepared_mile_group_mask,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
         patch_training_enabled=patch_training_enabled,
     )
@@ -374,9 +385,7 @@ def _cce_forward_op(
     # context that was active while Dynamo captured its caller. Recreate that
     # context explicitly so this backend follows the eager forward's cast
     # order, including evaluating mu-loss before e/c/bias are converted.
-    with torch.autocast(
-        "cuda", dtype=compute_dtype, enabled=forward_used_autocast
-    ):
+    with torch.autocast("cuda", dtype=compute_dtype, enabled=forward_used_autocast):
         loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
             kernel_ctx, e, c, bias, params
         )
@@ -422,6 +431,7 @@ def _cce_forward_fake(
     e: torch.Tensor,
     c: torch.Tensor,
     targets: torch.Tensor,
+    mile_group_mask: torch.Tensor,
     bias: torch.Tensor | None,
     e_requires_grad: bool,
     c_requires_grad: bool,
@@ -456,6 +466,7 @@ def _cce_forward_fake(
 ]:
     del (
         ignore_index,
+        mile_group_mask,
         softcap,
         accum_e_fp32,
         accum_c_fp32,
@@ -494,9 +505,7 @@ def _cce_forward_fake(
         else _empty(e, dtype=torch.float32)
     )
     mu_vocab_size = (
-        e.new_empty((), dtype=torch.float32)
-        if mu_loss_enabled
-        else _empty(e, dtype=torch.float32)
+        e.new_empty((), dtype=torch.float32) if mu_loss_enabled else _empty(e, dtype=torch.float32)
     )
     metrics = (
         e.new_empty((3,), dtype=torch.float32)
@@ -524,6 +533,7 @@ def _setup_context(ctx, inputs, output) -> None:
         e,
         c,
         targets,
+        _mile_group_mask,
         bias,
         e_requires_grad,
         c_requires_grad,
@@ -642,6 +652,7 @@ def _backward(ctx, *grads):
         de,
         dc,
         None,
+        None,
         dbias if ctx.has_bias else None,
         None,
         None,
@@ -673,6 +684,7 @@ def compiler_cce_linear_cross_entropy(
     e: torch.Tensor,
     c: torch.Tensor,
     targets: torch.Tensor,
+    mile_group_mask: torch.Tensor | None,
     bias: torch.Tensor | None,
     ignore_index: int,
     softcap: float | None,
@@ -697,6 +709,7 @@ def compiler_cce_linear_cross_entropy(
         e,
         c,
         targets,
+        _pack_optional(mile_group_mask, e),
         bias,
         e.requires_grad,
         c.requires_grad,

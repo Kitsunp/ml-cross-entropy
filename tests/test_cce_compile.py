@@ -48,6 +48,7 @@ def _call(
     mu_loss_enabled: bool,
     *,
     bias=None,
+    mile_group_mask=None,
     return_loss_metrics: bool = True,
 ):
     return linear_cross_entropy(
@@ -61,6 +62,7 @@ def _call(
         return_loss_metrics=return_loss_metrics,
         mile_enabled=mile_enabled,
         mile_gamma=1.0,
+        mile_group_mask=mile_group_mask,
         mu_loss_enabled=mu_loss_enabled,
         mu_loss_lambda=1e-4,
     )
@@ -84,6 +86,7 @@ def _operator_args(
         e,
         c,
         targets,
+        torch.empty(0, device=e.device, dtype=torch.bool),
         bias,
         e.requires_grad,
         c.requires_grad,
@@ -112,10 +115,11 @@ def _backward_operator_args(forward_args):
     outputs = _cce_forward_op(*forward_args)
     return (
         torch.ones_like(outputs[0]),
-        *forward_args[:4],
+        *forward_args[:3],
+        forward_args[4],
         *outputs[2:9],
         forward_args[-1],
-        *forward_args[4:-2],
+        *forward_args[5:-2],
     )
 
 
@@ -165,6 +169,55 @@ def test_compiler_boundary_matches_eager(mile_enabled: bool, mu_loss_enabled: bo
         assert relative_l2 < 3e-3
 
 
+def test_compiler_boundary_preserves_meap_mile_group_normalization():
+    base_e, base_c, targets = _inputs()
+    group_mask = torch.zeros_like(targets, dtype=torch.bool)
+    group_mask[:, 1::7] = True
+    eager_e = base_e.clone().requires_grad_(True)
+    eager_c = base_c.clone().requires_grad_(True)
+    compiled_e = base_e.clone().requires_grad_(True)
+    compiled_c = base_c.clone().requires_grad_(True)
+
+    eager_loss, eager_metrics = _call(
+        eager_e,
+        eager_c,
+        targets,
+        True,
+        False,
+        mile_group_mask=group_mask,
+    )
+    eager_loss.backward()
+
+    def tail(e, c, labels, groups):
+        return _call(
+            e,
+            c,
+            labels,
+            True,
+            False,
+            mile_group_mask=groups,
+        )
+
+    compiled = torch.compile(tail, fullgraph=True, mode="reduce-overhead")
+    compiled_loss, compiled_metrics = compiled(compiled_e, compiled_c, targets, group_mask)
+    compiled_loss.backward()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=2e-4, atol=2e-4)
+    for name in eager_metrics:
+        torch.testing.assert_close(
+            compiled_metrics[name], eager_metrics[name], rtol=2e-3, atol=1e-4
+        )
+    for compiled_grad, eager_grad in (
+        (compiled_e.grad, eager_e.grad),
+        (compiled_c.grad, eager_c.grad),
+    ):
+        relative_l2 = (
+            compiled_grad.float() - eager_grad.float()
+        ).norm() / eager_grad.float().norm().clamp_min(1e-12)
+        assert relative_l2 < 3e-3
+
+
 def test_compiler_boundary_does_not_specialize_on_valid_label_count():
     base_e, base_c, base_targets = _inputs()
     compile_count = 0
@@ -196,9 +249,7 @@ def test_compiler_boundary_keeps_forward_and_backward_inside_aot_graphs():
     def capture(name):
         def compiler(graph_module, _example_inputs):
             captured[name] = [
-                str(node.target)
-                for node in graph_module.graph.nodes
-                if node.op == "call_function"
+                str(node.target) for node in graph_module.graph.nodes if node.op == "call_function"
             ]
             return make_boxed_func(graph_module.forward)
 
@@ -244,9 +295,7 @@ def test_compiler_boundary_fp32_autocast_matches_eager(
     compiled_c = base_c.clone().requires_grad_(True)
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        eager_loss, eager_metrics = _call(
-            eager_e, eager_c, targets, mile_enabled, mu_loss_enabled
-        )
+        eager_loss, eager_metrics = _call(eager_e, eager_c, targets, mile_enabled, mu_loss_enabled)
     eager_loss.backward()
 
     def tail(e, c, labels):
@@ -396,7 +445,7 @@ def test_compiler_boundary_auto_eps_uses_autocast_dtype(input_dtype, autocast_dt
     def inspect_backend(graph_module, _example_inputs):
         for node in graph_module.graph.nodes:
             if node.op == "call_function" and "cce_forward" in str(node.target):
-                captured_filter_eps.append(node.args[11])
+                captured_filter_eps.append(node.args[12])
         return graph_module.forward
 
     def tail(e, c, labels):
@@ -440,7 +489,7 @@ def test_compiler_boundary_disables_filters_when_eps_is_none():
     def inspect_backend(graph_module, _example_inputs):
         for node in graph_module.graph.nodes:
             if node.op == "call_function" and "cce_forward" in str(node.target):
-                captured_filter_config.append((node.args[11], node.args[14], node.args[15]))
+                captured_filter_config.append((node.args[12], node.args[15], node.args[16]))
         return graph_module.forward
 
     def tail(embeddings, classifier, labels):
