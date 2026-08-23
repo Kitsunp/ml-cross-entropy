@@ -52,6 +52,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .runtime_policy import use_dot_specialization
+
 # ---------------------------------------------------------------------------
 # design constants (not autotuned; numerics-neutral)
 # ---------------------------------------------------------------------------
@@ -633,7 +635,12 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
     # The dot variant pads KAPPA<16 to a 16-wide dot.  Keep the exact chain
     # for those small knot grids until the padded path has a matching
     # numerical validation (the chain is already fast for these configs).
-    dot_phi = os.environ.get("LEV_DOT") == "1" and kappa >= 16
+    dot_phi = use_dot_specialization(
+        device,
+        d_seed=d,
+        num_knots=kappa,
+        krank=krank,
+    )
     dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
     # A full z register tile is safe for the paper default d_seed=128.  Keep
     # the proven two-pass path for d_seed=256 to avoid register spills.
