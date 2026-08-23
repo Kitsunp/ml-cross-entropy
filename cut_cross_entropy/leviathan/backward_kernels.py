@@ -40,6 +40,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .runtime_policy import use_dot_specialization
+
 EPS_LOG = 1e-9
 NORM_EPS = 1e-5
 
@@ -427,14 +429,22 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
     dot_chain_block_m = 128
     exact_chain_block_m = _BWD_CONFIGS[0].kwargs["BLOCK_M"]
 
-    # ---- fast path: per-d dot kernels (LEV_DOT=1, tensor cores) ----
+    # ---- fast path: per-d dot kernels (SM120 tensor cores) ----
     # Match the forward dispatch: the padded dot path is not used for
     # KAPPA<16, where the exact chain is the validated implementation.
-    if os.environ.get("LEV_DOT") == "1" and kappa >= 16:
+    if use_dot_specialization(
+        dev,
+        d_seed=d,
+        num_knots=kappa,
+        krank=krank,
+    ):
         from . import backward_dot_kernels as bdk
 
         dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
-        premul_dmm = os.environ.get("LEV_PREMUL_DMM", "1") != "0"
+        # Keep dM and M independent by default.  Premultiplying them in the
+        # BF16 dM buffer was not measurably faster end-to-end on SM120 and
+        # raised relative gradient error by roughly one order of magnitude.
+        premul_dmm = os.environ.get("LEV_PREMUL_DMM", "0") != "0"
         if premul_dmm:
             # dM*M is independent of the seed dimension.  Keep the product in
             # the existing intermediate so the Triton kernels only load the
