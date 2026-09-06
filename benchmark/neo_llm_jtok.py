@@ -135,6 +135,7 @@ def _make_config(
 ) -> Any:
     """Build a small in-memory NeoLLM config without touching disk state."""
 
+    use_jtok = args.variant in {"jtok", "jtokm"}
     config = config_class(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden,
@@ -179,7 +180,7 @@ def _make_config(
         generator_spline_degree=2,
         generator_k=args.generator_k,
         generator_krank=args.generator_rank,
-        use_jtok=True,
+        use_jtok=use_jtok,
         use_jtokm=args.variant == "jtokm",
         jtok_num_modes=args.jtok_modes,
         jtok_num_experts=args.experts,
@@ -208,6 +209,10 @@ def _make_config(
     # This is an in-memory choice for the benchmark only.  It avoids relying
     # on an attention backend selected by a checkpoint's config.json.
     config._attn_implementation = "eager"
+    # The comparison is only valid when both JTok backends share the same
+    # Triton Leviathan producer.  This is runtime-only benchmark metadata; it
+    # is not serialized into NeoLLM's config.json.
+    config._require_leviathan_triton = True
     return config
 
 
@@ -446,6 +451,19 @@ def _run_backend(
     )
     model = modeling_module.NeoLLMForCausalLM(config).cuda().to(dtype=args.dtype)
     model.train(args.mode == "training")
+    token_generator = getattr(getattr(model, "model", model), "token_generator", None)
+    leviathan_ready = bool(
+        token_generator is not None
+        and getattr(token_generator, "use_leviathan_triton", False)
+        and getattr(modeling_module, "_LEV_KERNEL_AVAILABLE", False)
+        and getattr(modeling_module, "_LEV_GEOMETRY_KERNEL_AVAILABLE", False)
+    )
+    if not leviathan_ready:
+        raise RuntimeError(
+            "The real NeoLLM comparison requires the Triton Leviathan kernel "
+            "and its geometry adapter; refusing to benchmark a reference "
+            "Leviathan fallback."
+        )
     wrapper = _LossOnly(model, training_loss=args.mode == "training").cuda()
     inputs = _make_inputs(args)
     optimizer = (
@@ -516,17 +534,25 @@ def _run_backend(
             output_path=args.profile_dir / f"neo_{args.variant}_{backend}_{args.mode}.json.gz",
         )
 
+    jtok_module = next(
+        (module for module in model.modules() if hasattr(module, "jtok_kernel_backend")),
+        None,
+    )
     return {
         "backend": backend,
         "model_jtok_kernel_backend": getattr(
-            next(
-                module
-                for module in model.modules()
-                if hasattr(module, "jtok_kernel_backend")
-            ),
+            jtok_module,
             "jtok_kernel_backend",
             None,
         ),
+        "leviathan": {
+            "required": True,
+            "kernel_ready": leviathan_ready,
+            "reference_fallback_forbidden": True,
+            "geometry_adapter_available": bool(
+                getattr(modeling_module, "_LEV_GEOMETRY_KERNEL_AVAILABLE", False)
+            ),
+        },
         "compiled": args.compiled,
         "compile_mode": COMPILE_MODE if args.compiled else None,
         "mode": args.mode,
@@ -578,7 +604,12 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/configuration_neollm.py"),
     )
-    parser.add_argument("--variant", choices=("jtok", "jtokm"), default="jtokm")
+    parser.add_argument(
+        "--variant",
+        choices=("baseline", "jtok", "jtokm"),
+        default="jtokm",
+        help="baseline=Leviathan only; jtok/jtokm enable the extension",
+    )
     parser.add_argument("--backend", choices=("torch", "triton", "both"), default="both")
     parser.add_argument("--mode", choices=("inference", "training"), default="training")
     parser.add_argument("--compiled", action=argparse.BooleanOptionalAction, default=False)

@@ -352,6 +352,50 @@ def test_jtokm_triton_backward_reaches_all_trainable_inputs() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_triton_backward_matches_torch_reference() -> None:
+    """Compare the compact Triton backward, not only gradient finiteness."""
+    values = _inputs(device="cuda", dtype=torch.bfloat16, n=11, hidden=13, d_seed=5)
+    valid = torch.ones(11, device="cuda", dtype=torch.bool)
+    valid[[2, 7]] = False
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+
+    def run(backend: str) -> dict[str, torch.Tensor]:
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output, _ = jtokm_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["router_state"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            trainable["router_weight"],
+            values["grid"],
+            top_k=2,
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        return {key: trainable[key].grad.detach().clone() for key in trainable}
+
+    reference = run("torch")
+    actual = run("triton")
+    for key in reference:
+        assert torch.isfinite(actual[key]).all(), key
+        torch.testing.assert_close(
+            actual[key].float(),
+            reference[key].float(),
+            rtol=0.18,
+            atol=0.12,
+            msg=f"gradient mismatch for {key}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_jtok_custom_opcheck_and_compiles() -> None:
     from cut_cross_entropy.leviathan.jtok import _jtok_forward_op
 
