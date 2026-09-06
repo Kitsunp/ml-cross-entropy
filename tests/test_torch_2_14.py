@@ -59,6 +59,30 @@ def test_kernel_region_uses_backward_false(monkeypatch) -> None:
     ]
 
 
+def test_kernel_region_does_not_nest_pool_inside_inductor_graph_tree(monkeypatch) -> None:
+    entered: list[object] = []
+
+    @contextmanager
+    def fake_use_mem_pool(pool, *, device):
+        entered.append((pool, device))
+        yield
+
+    monkeypatch.setattr(torch_2_14, "_indexed_cuda_device", lambda device: device)
+    monkeypatch.setattr(torch_2_14, "_cuda_memory_pool", lambda device: "external-pool")
+    monkeypatch.setattr(torch_2_14, "_use_mem_pool", fake_use_mem_pool)
+    monkeypatch.setattr(
+        torch_2_14,
+        "_inductor_cudagraph_tree_active",
+        lambda device: True,
+    )
+    monkeypatch.setattr(torch_2_14, "_mark_kernels", None)
+
+    with torch_2_14.cuda_kernel_region("test.graph_tree", torch.device("cuda")):
+        pass
+
+    assert entered == []
+
+
 def test_warmup_hook_runs_once_per_geometry(monkeypatch) -> None:
     calls: list[None] = []
     monkeypatch.setattr(

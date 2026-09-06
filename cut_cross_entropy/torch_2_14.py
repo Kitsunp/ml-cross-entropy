@@ -10,6 +10,7 @@ change kernel math, launch geometry, or the global compiler policy.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from contextlib import ExitStack, contextmanager
 from typing import Hashable, Iterator
@@ -78,6 +79,9 @@ _WARMED_GEOMETRIES: set[tuple[str, Hashable]] = set()
 _WARMED_GEOMETRIES_LOCK = threading.Lock()
 _CUDA_MEMORY_POOLS: dict[int, torch.cuda.MemPool] = {}
 _CUDA_MEMORY_POOLS_LOCK = threading.Lock()
+_INDUCTOR_GET_MANAGER_UNSET = object()
+_INDUCTOR_GET_MANAGER: object = _INDUCTOR_GET_MANAGER_UNSET
+_INDUCTOR_GET_MANAGER_LOCK = threading.Lock()
 
 
 def _cuda_memory_pool(device: torch.device) -> torch.cuda.MemPool | None:
@@ -104,6 +108,77 @@ def _indexed_cuda_device(device: torch.device) -> torch.device:
         return torch.device("cuda", torch.cuda.current_device())
 
 
+def _inductor_cudagraph_tree_active(device: torch.device) -> bool:
+    """Return whether Inductor currently owns the device's graph allocations.
+
+    ``torch.cuda.use_mem_pool`` is safe for eager execution, but it must not
+    be nested inside Inductor's private CUDA Graph Trees pool. CUDA Graph
+    Trees validates every returned tensor against its own pool; a custom-op
+    output allocated by our separate pool therefore fails that validation.
+
+    There is no public PyTorch 2.14 predicate for this state. The guarded
+    probe uses the read-only ``get_manager(..., create_if_none_exists=False)``
+    hook shipped with CUDA Graph Trees. Import and API failures are treated
+    conservatively once the module is present: skipping the optional external
+    pool is safer than returning storage that Inductor cannot account for.
+    This helper never creates a graph manager and is a no-op when Inductor's
+    CUDA Graph Trees module is not loaded.
+    """
+    global _INDUCTOR_GET_MANAGER
+
+    if not TORCH_2_14_CUDA_MEMORY_POOL:
+        return False
+
+    get_manager = _INDUCTOR_GET_MANAGER
+    if get_manager is _INDUCTOR_GET_MANAGER_UNSET:
+        with _INDUCTOR_GET_MANAGER_LOCK:
+            get_manager = _INDUCTOR_GET_MANAGER
+            if get_manager is _INDUCTOR_GET_MANAGER_UNSET:
+                # Do not import Inductor from an eager-only process. In a
+                # compiled call the module is loaded before Graph Trees
+                # invokes an opaque custom op; if it is not loaded yet, leave
+                # the sentinel in place so a later compiled call can probe it.
+                graph_trees = sys.modules.get("torch._inductor.cudagraph_trees")
+                if graph_trees is None:
+                    return False
+                get_manager = getattr(graph_trees, "get_manager", None)
+                _INDUCTOR_GET_MANAGER = get_manager
+
+    if get_manager is None:
+        # The module is loaded but the read-only probe is not available. Keep
+        # the external pool disabled until the next process rather than risk
+        # mixing allocator ownership with an unknown Graph Trees implementation.
+        return True
+
+    try:
+        with torch.cuda.device(device):
+            device_index = torch.cuda.current_device()
+        manager = get_manager(
+            device_index=device_index,
+            create_if_none_exists=False,
+        )
+    except Exception:
+        # The private compatibility probe must never break eager execution.
+        # If the installed Inductor changed the probe API, disable the
+        # optional external pool for this invocation rather than risk the
+        # cross-pool storage error this guard is designed to prevent.
+        return True
+
+    if manager is None:
+        return False
+
+    try:
+        return bool(
+            getattr(manager, "in_warmup", False)
+            or getattr(manager, "in_recording", False)
+            or getattr(manager, "current_node", None) is not None
+            or getattr(getattr(manager, "path_state", None), "name", None)
+            in {"WARMUP", "RECORDING", "EXECUTION"}
+        )
+    except Exception:
+        return True
+
+
 def _kernel_annotation(name: str) -> dict[str, str]:
     component, phase = name.split(".", 1)
     return {
@@ -120,9 +195,13 @@ def cuda_kernel_region(name: str, device: torch.device) -> Iterator[None]:
     """Route and attribute one external-kernel region with PyTorch 2.14 APIs."""
     with ExitStack() as stack:
         indexed_device = _indexed_cuda_device(device)
-        pool = _cuda_memory_pool(indexed_device)
-        if pool is not None and _use_mem_pool is not None:
-            stack.enter_context(_use_mem_pool(pool, device=indexed_device))
+        if (
+            _use_mem_pool is not None
+            and not _inductor_cudagraph_tree_active(indexed_device)
+        ):
+            pool = _cuda_memory_pool(indexed_device)
+            if pool is not None:
+                stack.enter_context(_use_mem_pool(pool, device=indexed_device))
         if _mark_kernels is not None:
             stack.enter_context(
                 _mark_kernels(

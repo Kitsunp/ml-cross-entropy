@@ -66,13 +66,25 @@ when CUDA memory-history recording is active. They are off by default because
 they are diagnostic metadata, not a throughput optimization.
 
 By default on Torch 2.14+, allocations made while the three external-kernel
-boundaries execute are routed through `torch.cuda.use_mem_pool()`. The pool is
-created lazily, one per CUDA device, and shared by CCE, Leviathan, and PolyNorm
-so released blocks can be reused across components. It uses
+boundaries execute are routed through `torch.cuda.use_mem_pool()` when the
+caller is eager or uses a CUDA-graph path that does not belong to Inductor.
+The pool is created lazily, one per CUDA device, and shared by CCE, Leviathan,
+and PolyNorm so released blocks can be reused across components. It uses
 `torch.cuda.MemPool(use_on_oom=True)`, allowing the general allocator to use
 its released blocks under memory pressure. Set
 `CUT_CROSS_ENTROPY_TORCH_2_14_MEMORY_POOL=0` before Python starts to disable
 only pool routing while retaining other 2.14 integration features.
+
+The boundary automatically skips this external pool while Inductor CUDA Graph
+Trees owns the current device. In PyTorch 2.14, Inductor validates returned
+storages against its own graph pool; nesting a second `MemPool` around a
+custom-op implementation makes those outputs look foreign to
+`cudagraph_trees.check_memory_pool` and aborts the compiled step. The guard
+uses the read-only private `get_manager(..., create_if_none_exists=False)`
+probe because PyTorch 2.14 does not expose a public predicate for the current
+Graph Trees phase. If that compatibility probe changes or fails, the optional
+external pool is skipped for safety. This does not disable `torch.compile`,
+change CUDA Graph capture policy, or change any kernel.
 
 ## Deliberate exclusions
 
@@ -89,7 +101,22 @@ The pool is intentionally not a hard-coded 10-GiB allocator limit. A benchmark
 may use `--memory-limit-gib 10` as a resource guard, but production memory
 capacity remains controlled by the process and PyTorch allocator. PyTorch 2.14
 builds without both `MemPool` and `use_mem_pool` fail the capability probe and
-automatically leave pool routing disabled.
+automatically leave pool routing disabled. The external pool is also bypassed
+for an active Inductor Graph Tree, even when the environment variable requests
+pool routing.
+
+## Regression fixed: Inductor Graph Trees cross-pool storage
+
+The failure was reproduced on Torch `2.14.0+cu132` with
+`torch.compile(mode="max-autotune")`: a minimal custom CUDA op succeeded on
+the first warmup call and then failed on the next call with
+`These storage data ptrs are not allocated in pool (0, 1) but should be ...`.
+The traceback ended in Inductor's `cudagraph_trees.check_memory_pool`, after
+Triton's `triton_mm` autotune. The failure was allocator ownership bookkeeping,
+not a Triton matmul correctness or autotune failure. With the guard active, the
+same four-call reproduction completes successfully while the shared pool is
+still used by eager calls. The regression test is
+`test_kernel_region_does_not_nest_pool_inside_inductor_graph_tree`.
 
 ## Reproducible comparison
 
