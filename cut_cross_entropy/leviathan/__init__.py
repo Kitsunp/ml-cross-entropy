@@ -14,8 +14,17 @@ from .backward_impl import leviathan_backward, leviathan_forward_ref  # noqa: F4
 from .compiler import leviathan_embedding_compiler_safe  # noqa: F401
 from .core import LeviathanConfig, LeviathanGenerator, build_generator  # noqa: F401
 from .dispatch import leviathan_embedding, supports  # noqa: F401
+from .jtok import (  # noqa: F401
+    jtok_apply,
+    jtok_reference,
+    jtokm_apply,
+    jtokm_auxiliary_loss,
+    jtokm_reference,
+    jtokm_routing_stats,
+)
 from .model import LeviathanEmbedding, LeviathanForCausalLM  # noqa: F401
 from .neollm import (  # noqa: F401
+    apply_neollm_jtok,
     make_triton_leviathan_generator,
     replace_leviathan_generator,
 )
@@ -35,5 +44,12 @@ __all__ = [
     "LeviathanForCausalLM",
     "make_triton_leviathan_generator",
     "replace_leviathan_generator",
+    "apply_neollm_jtok",
+    "jtok_apply",
+    "jtok_reference",
+    "jtokm_apply",
+    "jtokm_auxiliary_loss",
+    "jtokm_reference",
+    "jtokm_routing_stats",
     "_HAS_KERNEL_FORWARD",
 ]

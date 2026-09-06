@@ -107,7 +107,101 @@ def replace_leviathan_generator(
     return model
 
 
+def apply_neollm_jtok(
+    jtok_module: nn.Module,
+    delta_m: torch.Tensor,
+    z_tilde: torch.Tensor,
+    *,
+    router_state: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    compute_aux: bool = False,
+    backend: str = "auto",
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+]:
+    """Dispatch a NeoLLM ``LeviathanJTok`` module to the external kernel.
+
+    The adapter is intentionally structural: it reads the parameters already
+    owned by ``LeviathanJTok`` and creates no persistent parameters or buffers.
+    ``backend='torch'`` is the dense reference used for fair
+    ``torch.compile(max-autotune)`` comparisons; ``backend='triton'`` is strict
+    and raises when the external CUDA path is unavailable.  The default
+    ``backend='auto'`` is capability dispatch for library callers and should be
+    selected explicitly by a model integration.
+
+    This function is never called by legacy Leviathan.  A model must opt into
+    it only when ``use_jtok`` is true, so disabling JTok continues to call the
+    original generator and kernel without constructing router or surface work.
+    """
+    from .jtok import jtok_apply, jtokm_apply
+
+    required = (
+        "spline_coeff",
+        "W_out",
+        "W_res",
+        "scaler",
+        "knot_grid",
+        "norm_eps",
+    )
+    missing = [name for name in required if not hasattr(jtok_module, name)]
+    if missing:
+        raise TypeError(
+            "jtok_module does not expose the NeoLLM JTok parameter contract; "
+            f"missing {', '.join(missing)}"
+        )
+
+    if bool(getattr(jtok_module, "use_mixture", False)):
+        if router_state is None:
+            raise ValueError("JTok-M requires router_state")
+        router = getattr(jtok_module, "router", None)
+        if router is None or not hasattr(router, "weight"):
+            raise TypeError("JTok-M module must expose router.weight")
+        output, stats = jtokm_apply(
+            delta_m,
+            z_tilde,
+            router_state,
+            jtok_module.spline_coeff,
+            jtok_module.W_out,
+            jtok_module.W_res,
+            jtok_module.scaler,
+            router.weight,
+            jtok_module.knot_grid,
+            top_k=int(jtok_module.top_k),
+            valid_mask=valid_mask,
+            norm_eps=float(jtok_module.norm_eps),
+            residual_scale=float(jtok_module.jtokm_residual_scale),
+            compute_aux=compute_aux,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        # NeoLLM's decoder-layer output contract predates the richer kernel
+        # diagnostics and consumes exactly (P_sum, n_sum, T).  Keep that
+        # contract stable; callers that need load CV/entropy/etc. can call
+        # jtokm_apply directly, which returns the complete metrics mapping.
+        compact_stats = (
+            (stats["p_sum"], stats["f_sum"], stats["valid_tokens"])
+            if stats is not None
+            else None
+        )
+        return output, compact_stats
+
+    output = jtok_apply(
+        delta_m,
+        z_tilde,
+        jtok_module.spline_coeff,
+        jtok_module.W_out,
+        jtok_module.W_res,
+        jtok_module.scaler,
+        jtok_module.knot_grid,
+        valid_mask=valid_mask,
+        norm_eps=float(jtok_module.norm_eps),
+        backend=backend,  # type: ignore[arg-type]
+    )
+    return output, None
+
+
 __all__ = [
+    "apply_neollm_jtok",
     "make_triton_leviathan_generator",
     "replace_leviathan_generator",
 ]
