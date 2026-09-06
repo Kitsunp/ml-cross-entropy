@@ -15,12 +15,26 @@ from cut_cross_entropy import linear_cross_entropy
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rows", type=int, default=32_705)
     parser.add_argument("--vocab", type=int, default=151_936)
     parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=20_260_814)
+    parser.add_argument("--memory-limit-gib", type=float)
     args = parser.parse_args()
 
-    generator = torch.Generator(device="cuda").manual_seed(20_260_814)
+    if not torch.cuda.is_available():
+        raise RuntimeError("This benchmark requires CUDA")
+    if args.steps < 1 or args.warmup < 0:
+        raise ValueError("steps must be positive and warmup non-negative")
+    if args.memory_limit_gib is not None:
+        if args.memory_limit_gib <= 0:
+            raise ValueError("memory-limit-gib must be positive")
+        properties = torch.cuda.get_device_properties(0)
+        fraction = min(args.memory_limit_gib * 1024**3 / properties.total_memory, 1.0)
+        torch.cuda.set_per_process_memory_fraction(fraction, 0)
+
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
     e = (
         torch.randn(
             args.rows,
@@ -60,7 +74,7 @@ def main() -> None:
         )
 
     compiled = torch.compile(forward, fullgraph=True, mode="max-autotune")
-    for _ in range(2):
+    for _ in range(args.warmup):
         e.grad = None
         c.grad = None
         warmup_loss, warmup_metrics = compiled(e, c, targets)
@@ -71,6 +85,7 @@ def main() -> None:
     c.grad = None
     torch.cuda.empty_cache()
     baseline_allocated = torch.cuda.memory_allocated()
+    baseline_reserved = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
 
     times_ms: list[float] = []
@@ -94,6 +109,9 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(),
         "compile_mode": "max-autotune",
         "steps": args.steps,
+        "warmup": args.warmup,
+        "seed": args.seed,
+        "test_memory_limit_gib": args.memory_limit_gib,
         "rows": args.rows,
         "effective_tokens": args.rows - 1,
         "vocab": args.vocab,
@@ -105,10 +123,15 @@ def main() -> None:
         "finite_e_grad": bool(torch.isfinite(e.grad).all()),
         "finite_c_grad": bool(torch.isfinite(c.grad).all()),
         "latency_ms_mean": statistics.mean(times_ms),
+        "latency_ms_median": statistics.median(times_ms),
         "latency_ms_min": min(times_ms),
         "latency_ms_max": max(times_ms),
         "incremental_peak_bytes": torch.cuda.max_memory_allocated() - baseline_allocated,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "incremental_peak_reserved_bytes": (
+            torch.cuda.max_memory_reserved() - baseline_reserved
+        ),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
     }
     print(json.dumps(report, indent=2, sort_keys=True))
 

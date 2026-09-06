@@ -1,0 +1,1228 @@
+{
+  "benchmark": "torch_2_14_cuda_integration",
+  "seed": 20260905,
+  "trials": 3,
+  "warmup": 50,
+  "iterations": 200,
+  "memory_limit_gib": 10.0,
+  "summary": {
+    "polynorm": {
+      "forward_ms": {
+        "off": 0.19923200458288193,
+        "on": 0.23544000089168549,
+        "delta_percent": 18.17378507263916
+      },
+      "backward_ms": {
+        "off": 0.22784000635147095,
+        "on": 0.3930079936981201,
+        "delta_percent": 72.49296995359869
+      },
+      "total_ms": {
+        "off": 0.42720000445842743,
+        "on": 0.629391998052597,
+        "delta_percent": 47.32958602153894
+      },
+      "memory": {
+        "incremental_peak_allocated_bytes": {
+          "off": 33818112,
+          "on": 33818112
+        },
+        "incremental_peak_reserved_bytes": {
+          "off": 0,
+          "on": 0
+        },
+        "peak_allocated_bytes": {
+          "off": 84155392,
+          "on": 84155392
+        },
+        "peak_reserved_bytes": {
+          "off": 144703488,
+          "on": 146800640
+        }
+      }
+    },
+    "cce": {
+      "training_step_ms": {
+        "off": 2.4448959827423096,
+        "on": 2.7455999851226807,
+        "delta_percent": 12.299255449022727
+      },
+      "incremental_peak_bytes": {
+        "off": 235930624,
+        "on": 235930624
+      },
+      "peak_allocated_bytes": {
+        "off": 304096256,
+        "on": 304096256
+      },
+      "incremental_peak_reserved_bytes": {
+        "off": 239075328,
+        "on": 169869312
+      },
+      "peak_reserved_bytes": {
+        "off": 308281344,
+        "on": 377487360
+      }
+    },
+    "leviathan": {
+      "1024": {
+        "forward_fused_ms": {
+          "off": 0.3123519867658615,
+          "on": 0.3353919982910156,
+          "delta_percent": 7.376297414885613
+        },
+        "training_fused_ms": {
+          "off": 1.5560640096664429,
+          "on": 1.6099519729614258,
+          "delta_percent": 3.463094253207122
+        },
+        "forward_peak_bytes": {
+          "off": 43309568,
+          "on": 43309568
+        },
+        "training_peak_bytes": {
+          "off": 58316800,
+          "on": 58316800
+        }
+      },
+      "4096": {
+        "forward_fused_ms": {
+          "off": 0.5576640069484711,
+          "on": 0.5699520111083984,
+          "delta_percent": 2.203478081213661
+        },
+        "training_fused_ms": {
+          "off": 3.378448009490967,
+          "on": 3.253727912902832,
+          "delta_percent": -3.691638771345973
+        },
+        "forward_peak_bytes": {
+          "off": 62994944,
+          "on": 62994944
+        },
+        "training_peak_bytes": {
+          "off": 106510336,
+          "on": 106510336
+        }
+      }
+    }
+  },
+  "records": [
+    {
+      "trial": 0,
+      "component": "cce",
+      "state": "off",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 239075328,
+        "latency_ms_max": 2.6003520488739014,
+        "latency_ms_mean": 2.3921788835525515,
+        "latency_ms_median": 2.4448959827423096,
+        "latency_ms_min": 2.211359977722168,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 308281344,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 0,
+      "component": "cce",
+      "state": "on",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 169869312,
+        "latency_ms_max": 2.8301761150360107,
+        "latency_ms_mean": 2.747191512584686,
+        "latency_ms_median": 2.7455999851226807,
+        "latency_ms_min": 2.6835200786590576,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 377487360,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 0,
+      "component": "polynorm",
+      "state": "off",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.8668799996376038,
+          "mean": 0.23268976002931596,
+          "median": 0.22784000635147095,
+          "min": 0.2194560021162033,
+          "p95": 0.23763200640678406
+        },
+        "billion_elements_per_second": 19.636254476716253,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 0.9129599928855896,
+          "mean": 0.20624015972018242,
+          "median": 0.19923200458288193,
+          "min": 0.19040000438690186,
+          "p95": 0.21804800629615784
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 144703488,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 144703488,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 1.7798399925231934,
+          "mean": 0.43892991974949835,
+          "median": 0.42720000445842743,
+          "min": 0.41420799493789673,
+          "p95": 0.45974400639533997
+        }
+      }
+    },
+    {
+      "trial": 0,
+      "component": "polynorm",
+      "state": "on",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.8857600092887878,
+          "mean": 0.23936512015759945,
+          "median": 0.25012800097465515,
+          "min": 0.16947199404239655,
+          "p95": 0.2717759907245636
+        },
+        "billion_elements_per_second": 17.55350251325242,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 0.8072959780693054,
+          "mean": 0.22862079985439776,
+          "median": 0.22737599909305573,
+          "min": 0.18185600638389587,
+          "p95": 0.25113600492477417
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 146800640,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 146800640,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 1.6930559873580933,
+          "mean": 0.46798592001199724,
+          "median": 0.47788798809051514,
+          "min": 0.3528960049152374,
+          "p95": 0.5392000079154968
+        }
+      }
+    },
+    {
+      "trial": 0,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.34483200311660767,
+          "mean": 0.31506607934832576,
+          "median": 0.3150400072336197,
+          "min": 0.2969599962234497
+        },
+        "forward_separate_ms": {
+          "max": 0.39398398995399475,
+          "mean": 0.3258550401031971,
+          "median": 0.3248800039291382,
+          "min": 0.3118079900741577
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 1.8040000200271606,
+          "mean": 1.6143544018268585,
+          "median": 1.6103519797325134,
+          "min": 1.576192021369934
+        },
+        "training_separate_ms": {
+          "max": 8.98639965057373,
+          "mean": 1.6870982432365418,
+          "median": 1.6451199650764465,
+          "min": 1.6117440462112427
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 0,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.36528000235557556,
+          "mean": 0.33587119951844213,
+          "median": 0.33607999980449677,
+          "min": 0.3192639946937561
+        },
+        "forward_separate_ms": {
+          "max": 0.3718400001525879,
+          "mean": 0.3481827206909657,
+          "median": 0.34776000678539276,
+          "min": 0.33238399028778076
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 4.453343868255615,
+          "mean": 1.8204888027906418,
+          "median": 1.7994080185890198,
+          "min": 1.490623950958252
+        },
+        "training_separate_ms": {
+          "max": 2.880959987640381,
+          "mean": 1.8429755210876464,
+          "median": 1.8363199830055237,
+          "min": 1.5080959796905518
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 0,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.6103360056877136,
+          "mean": 0.5588520008325577,
+          "median": 0.5589439868927002,
+          "min": 0.5454400181770325
+        },
+        "forward_separate_ms": {
+          "max": 0.6196479797363281,
+          "mean": 0.5718878424167633,
+          "median": 0.5709440112113953,
+          "min": 0.5595200061798096
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 9.988544464111328,
+          "mean": 3.3633385598659515,
+          "median": 3.389520049095154,
+          "min": 2.984992027282715
+        },
+        "training_separate_ms": {
+          "max": 4.351615905761719,
+          "mean": 3.3646961605548857,
+          "median": 3.416815996170044,
+          "min": 3.1197121143341064
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 0,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.6108160018920898,
+          "mean": 0.5687776014208794,
+          "median": 0.5699520111083984,
+          "min": 0.5527679920196533
+        },
+        "forward_separate_ms": {
+          "max": 0.618943989276886,
+          "mean": 0.5814065608382225,
+          "median": 0.580047994852066,
+          "min": 0.5695679783821106
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 3.853440046310425,
+          "mean": 3.2196196794509886,
+          "median": 3.253727912902832,
+          "min": 2.9821441173553467
+        },
+        "training_separate_ms": {
+          "max": 3.353503942489624,
+          "mean": 3.2494388818740845,
+          "median": 3.2850879430770874,
+          "min": 3.0161280632019043
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "cce",
+      "state": "on",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 169869312,
+        "latency_ms_max": 5.410943984985352,
+        "latency_ms_mean": 2.7348929584026336,
+        "latency_ms_median": 2.720144033432007,
+        "latency_ms_min": 2.6926400661468506,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 377487360,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "cce",
+      "state": "off",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 239075328,
+        "latency_ms_max": 5.043136119842529,
+        "latency_ms_mean": 2.5395900785923002,
+        "latency_ms_median": 2.5682239532470703,
+        "latency_ms_min": 2.3042240142822266,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 308281344,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "polynorm",
+      "state": "on",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.8995519876480103,
+          "mean": 0.39496415987610817,
+          "median": 0.3930079936981201,
+          "min": 0.26259198784828186,
+          "p95": 0.4089600145816803
+        },
+        "billion_elements_per_second": 13.328113522185232,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 0.7903040051460266,
+          "mean": 0.24116704039275647,
+          "median": 0.23544000089168549,
+          "min": 0.22713600099086761,
+          "p95": 0.25257599353790283
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 146800640,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 146800640,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 1.6898559927940369,
+          "mean": 0.6361312002688646,
+          "median": 0.629391998052597,
+          "min": 0.5151679813861847,
+          "p95": 0.6525759845972061
+        }
+      }
+    },
+    {
+      "trial": 1,
+      "component": "polynorm",
+      "state": "off",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.7754560112953186,
+          "mean": 0.23237647987902166,
+          "median": 0.22809599339962006,
+          "min": 0.21887999773025513,
+          "p95": 0.23571200668811798
+        },
+        "billion_elements_per_second": 19.504761721704014,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 0.8574720025062561,
+          "mean": 0.20760255955159665,
+          "median": 0.20071999728679657,
+          "min": 0.19324800372123718,
+          "p95": 0.21984000504016876
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 144703488,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 144703488,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 1.6329280138015747,
+          "mean": 0.4399790394306183,
+          "median": 0.43008000403642654,
+          "min": 0.41548800468444824,
+          "p95": 0.4559039920568466
+        }
+      }
+    },
+    {
+      "trial": 1,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.3529919981956482,
+          "mean": 0.3358705599606037,
+          "median": 0.3353919982910156,
+          "min": 0.3210879862308502
+        },
+        "forward_separate_ms": {
+          "max": 0.3592959940433502,
+          "mean": 0.34593631953001025,
+          "median": 0.34668800234794617,
+          "min": 0.33110401034355164
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 1.6337920427322388,
+          "mean": 1.605472638607025,
+          "median": 1.6047040224075317,
+          "min": 1.5839999914169312
+        },
+        "training_separate_ms": {
+          "max": 1.7047359943389893,
+          "mean": 1.6363187211751937,
+          "median": 1.6360480189323425,
+          "min": 1.614848017692566
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.34803199768066406,
+          "mean": 0.31067551985383035,
+          "median": 0.3110879957675934,
+          "min": 0.2937920093536377
+        },
+        "forward_separate_ms": {
+          "max": 0.35017600655555725,
+          "mean": 0.319524639993906,
+          "median": 0.319583997130394,
+          "min": 0.29369598627090454
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 2.281888008117676,
+          "mean": 1.5404625582695006,
+          "median": 1.5363200306892395,
+          "min": 1.5140479803085327
+        },
+        "training_separate_ms": {
+          "max": 1.6782079935073853,
+          "mean": 1.5679460805654526,
+          "median": 1.5665760040283203,
+          "min": 1.5476160049438477
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.6231359839439392,
+          "mean": 0.5727016016840935,
+          "median": 0.572767972946167,
+          "min": 0.5576320290565491
+        },
+        "forward_separate_ms": {
+          "max": 0.6399359703063965,
+          "mean": 0.5854980793595314,
+          "median": 0.5840640068054199,
+          "min": 0.5716480016708374
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 3.499903917312622,
+          "mean": 3.2470103919506075,
+          "median": 3.2429920434951782,
+          "min": 2.833983898162842
+        },
+        "training_separate_ms": {
+          "max": 3.729055881500244,
+          "mean": 3.281089115142822,
+          "median": 3.269055962562561,
+          "min": 2.864255905151367
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 1,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.5867840051651001,
+          "mean": 0.557509760260582,
+          "median": 0.5576640069484711,
+          "min": 0.5400320291519165
+        },
+        "forward_separate_ms": {
+          "max": 0.6005759835243225,
+          "mean": 0.5711707186698913,
+          "median": 0.5695199966430664,
+          "min": 0.5584959983825684
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 4.809023857116699,
+          "mean": 3.376800321340561,
+          "median": 3.378448009490967,
+          "min": 3.238208055496216
+        },
+        "training_separate_ms": {
+          "max": 3.761728048324585,
+          "mean": 3.399008959531784,
+          "median": 3.408176064491272,
+          "min": 3.2494399547576904
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "cce",
+      "state": "off",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 239075328,
+        "latency_ms_max": 3.306015968322754,
+        "latency_ms_mean": 2.513187037706375,
+        "latency_ms_median": 2.374911904335022,
+        "latency_ms_min": 2.3331520557403564,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 308281344,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "cce",
+      "state": "on",
+      "result": {
+        "compile_mode": "max-autotune",
+        "dim": 512,
+        "effective_tokens": 1023,
+        "finite_c_grad": true,
+        "finite_e_grad": true,
+        "finite_loss": true,
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "incremental_peak_bytes": 235930624,
+        "incremental_peak_reserved_bytes": 169869312,
+        "latency_ms_max": 2.921855926513672,
+        "latency_ms_mean": 2.735760964155197,
+        "latency_ms_median": 2.7587519884109497,
+        "latency_ms_min": 2.3189120292663574,
+        "loss": 11.603523254394531,
+        "mile_delta": -0.0002384185791015625,
+        "peak_allocated_bytes": 304096256,
+        "peak_reserved_bytes": 377487360,
+        "rows": 1024,
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "torch": "2.14.0+cu132",
+        "unweighted_loss": 11.603761672973633,
+        "vocab": 65536,
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "polynorm",
+      "state": "off",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.5685439705848694,
+          "mean": 0.2260555197298527,
+          "median": 0.22099199891090393,
+          "min": 0.2126079946756363,
+          "p95": 0.23158399760723114
+        },
+        "billion_elements_per_second": 19.951594596511335,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 0.7475200295448303,
+          "mean": 0.2036636795848608,
+          "median": 0.19844800233840942,
+          "min": 0.1918720006942749,
+          "p95": 0.21289600431919098
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 144703488,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 144703488,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 1.3160640001296997,
+          "mean": 0.4297191993147135,
+          "median": 0.4204479977488518,
+          "min": 0.4073919951915741,
+          "p95": 0.44838398694992065
+        }
+      }
+    },
+    {
+      "trial": 2,
+      "component": "polynorm",
+      "state": "on",
+      "result": {
+        "autocast": true,
+        "backend": "cute",
+        "backward_ms": {
+          "max": 0.9352959990501404,
+          "mean": 0.4109678401052952,
+          "median": 0.4070719927549362,
+          "min": 0.2935679852962494,
+          "p95": 0.4297280013561249
+        },
+        "billion_elements_per_second": 12.805940260262405,
+        "capability": [
+          12,
+          0
+        ],
+        "compile_cute": true,
+        "compile_mode": "default",
+        "cuda_runtime": "13.2",
+        "device": "NVIDIA GeForce RTX 5090",
+        "dropout_p": 0.0,
+        "dtype": "torch.bfloat16",
+        "exclusive": false,
+        "finite": true,
+        "forward_ms": {
+          "max": 2.619296073913574,
+          "mean": 0.26410160064697263,
+          "median": 0.24691200256347656,
+          "min": 0.2367040067911148,
+          "p95": 0.2670400142669678
+        },
+        "inference": false,
+        "memory": {
+          "incremental_peak_allocated_bytes": 33818112,
+          "incremental_peak_reserved_bytes": 0,
+          "input_allocated_bytes": 50337280,
+          "peak_allocated_bytes": 84155392,
+          "peak_reserved_bytes": 146800640,
+          "resident_allocated_after_warmup_bytes": 50337280,
+          "resident_reserved_after_warmup_bytes": 146800640,
+          "test_memory_limit_gib": 10.0
+        },
+        "multiply_column": false,
+        "multiply_up": false,
+        "output_dtype_policy": "native",
+        "selected_route": "cute",
+        "shape": [
+          4,
+          2048,
+          1024
+        ],
+        "torch": "2.14.0+cu132",
+        "total_ms": {
+          "max": 3.066112071275711,
+          "mean": 0.6750694407522678,
+          "median": 0.6550559997558594,
+          "min": 0.5734719932079315,
+          "p95": 0.6915520131587982
+        }
+      }
+    },
+    {
+      "trial": 2,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.33321601152420044,
+          "mean": 0.3120044806599617,
+          "median": 0.3123519867658615,
+          "min": 0.2962239980697632
+        },
+        "forward_separate_ms": {
+          "max": 0.33635199069976807,
+          "mean": 0.32161759957671165,
+          "median": 0.32123200595378876,
+          "min": 0.30988800525665283
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 1.6354880332946777,
+          "mean": 1.55720927298069,
+          "median": 1.5560640096664429,
+          "min": 1.5324480533599854
+        },
+        "training_separate_ms": {
+          "max": 1.6151039600372314,
+          "mean": 1.590413122177124,
+          "median": 1.5897279977798462,
+          "min": 1.5734399557113647
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.35788801312446594,
+          "mean": 0.3335640001296997,
+          "median": 0.3343839943408966,
+          "min": 0.31731200218200684
+        },
+        "forward_separate_ms": {
+          "max": 0.3619840145111084,
+          "mean": 0.34362576141953466,
+          "median": 0.3441440016031265,
+          "min": 0.3296639919281006
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36483584,
+          "forward_peak_bytes": 43309568,
+          "training_baseline_bytes": 36483584,
+          "training_peak_bytes": 58316800
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 1024,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 1.641759991645813,
+          "mean": 1.611145921945572,
+          "median": 1.6099519729614258,
+          "min": 1.589087963104248
+        },
+        "training_separate_ms": {
+          "max": 1.7066559791564941,
+          "mean": 1.6449872040748597,
+          "median": 1.6442400217056274,
+          "min": 1.6224000453948975
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "leviathan",
+      "state": "off",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.6059839725494385,
+          "mean": 0.5553830426931381,
+          "median": 0.5557439923286438,
+          "min": 0.5386559963226318
+        },
+        "forward_separate_ms": {
+          "max": 0.6000959873199463,
+          "mean": 0.5686531206965446,
+          "median": 0.5673120021820068,
+          "min": 0.5561919808387756
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 3.4486401081085205,
+          "mean": 3.182112478017807,
+          "median": 3.190160036087036,
+          "min": 3.058784008026123
+        },
+        "training_separate_ms": {
+          "max": 3.4235520362854004,
+          "mean": 3.2128598392009735,
+          "median": 3.2222880125045776,
+          "min": 3.081376075744629
+        },
+        "warmup": 50
+      }
+    },
+    {
+      "trial": 2,
+      "component": "leviathan",
+      "state": "on",
+      "result": {
+        "cuda_runtime": "13.2",
+        "forward_fused_ms": {
+          "max": 0.6013759970664978,
+          "mean": 0.5677903997898102,
+          "median": 0.5682560205459595,
+          "min": 0.5537919998168945
+        },
+        "forward_separate_ms": {
+          "max": 0.6183040142059326,
+          "mean": 0.5810460802912712,
+          "median": 0.5799520015716553,
+          "min": 0.5692480206489563
+        },
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "memory": {
+          "forward_baseline_bytes": 36508160,
+          "forward_peak_bytes": 62994944,
+          "training_baseline_bytes": 36508160,
+          "training_peak_bytes": 106510336
+        },
+        "seed": 20260905,
+        "steps": 200,
+        "test_memory_limit_gib": 10.0,
+        "tokens": 4096,
+        "torch": "2.14.0+cu132",
+        "training_fused_ms": {
+          "max": 3.4702401161193848,
+          "mean": 3.2941721642017363,
+          "median": 3.257408022880554,
+          "min": 2.961728096008301
+        },
+        "training_separate_ms": {
+          "max": 3.654848098754883,
+          "mean": 3.337956804037094,
+          "median": 3.2927680015563965,
+          "min": 3.001024007797241
+        },
+        "warmup": 50
+      }
+    }
+  ]
+}

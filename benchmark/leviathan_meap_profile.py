@@ -8,6 +8,7 @@ ceiling defaults to 10 GiB.
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
 
 import torch
@@ -78,12 +79,22 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--vram-limit-gib", type=float, default=10.0)
+    parser.add_argument("--vram-limit-gib", type=float)
+    parser.add_argument("--seed", type=int, default=20260905)
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
     if args.tokens < 1 or args.steps < 1 or args.warmup < 0:
         raise ValueError("tokens/steps must be positive and warmup non-negative")
+    if args.vram_limit_gib is not None and args.vram_limit_gib <= 0:
+        raise ValueError("vram-limit-gib must be positive")
+    if args.vram_limit_gib is not None:
+        properties = torch.cuda.get_device_properties(0)
+        fraction = min(args.vram_limit_gib * 1024**3 / properties.total_memory, 1.0)
+        torch.cuda.set_per_process_memory_fraction(fraction, 0)
+
+    torch.manual_seed(args.seed)
 
     cfg = LeviathanConfig(
         vocab_size=64_402,
@@ -201,8 +212,35 @@ def main() -> None:
         fused_step,
         clear=clear_grads,
     )
-    if max(forward_peak, train_peak) > int(args.vram_limit_gib * 1024**3):
+    if (
+        args.vram_limit_gib is not None
+        and max(forward_peak, train_peak) > int(args.vram_limit_gib * 1024**3)
+    ):
         raise RuntimeError("allocated-memory peak exceeded the validation ceiling")
+
+    report = {
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(),
+        "tokens": args.tokens,
+        "steps": args.steps,
+        "warmup": args.warmup,
+        "seed": args.seed,
+        "test_memory_limit_gib": args.vram_limit_gib,
+        "forward_separate_ms": dict(zip(("mean", "median", "min", "max"), forward_separate)),
+        "forward_fused_ms": dict(zip(("mean", "median", "min", "max"), forward_fused)),
+        "training_separate_ms": dict(zip(("mean", "median", "min", "max"), training_separate)),
+        "training_fused_ms": dict(zip(("mean", "median", "min", "max"), training_fused)),
+        "memory": {
+            "forward_baseline_bytes": forward_baseline,
+            "forward_peak_bytes": forward_peak,
+            "training_baseline_bytes": train_baseline,
+            "training_peak_bytes": train_peak,
+        },
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
 
     def row(name: str, values: tuple[float, float, float, float]) -> None:
         print(

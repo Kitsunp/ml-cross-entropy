@@ -13,6 +13,12 @@ from __future__ import annotations
 import torch
 
 from cut_cross_entropy.cce import CCEParams, LinearCrossEntropyFunction
+from cut_cross_entropy.torch_2_14 import (
+    TORCH_2_14_CUDA_KERNEL_CONTEXT,
+    TORCH_2_14_MEMORY_ANNOTATIONS,
+    annotate_tensors,
+    cuda_kernel_region,
+)
 from cut_cross_entropy.utils import TensorInfo, _build_flat_valids
 
 
@@ -224,7 +230,17 @@ def _cce_backward_op(
     # for FP32 storage inputs even though their saved tensors are FP16/BF16.
     ctx._fwd_used_autocast = forward_used_autocast
     ctx._dtype = compute_dtype
-    de, dc, dbias, _params_grad = LinearCrossEntropyFunction.backward(ctx, grad_loss, None, None)
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("cce.backward", e.device):
+            de, dc, dbias, _params_grad = LinearCrossEntropyFunction.backward(
+                ctx, grad_loss, None, None
+            )
+    else:
+        de, dc, dbias, _params_grad = LinearCrossEntropyFunction.backward(
+            ctx, grad_loss, None, None
+        )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("cce.backward", de=de, dc=dc, dbias=dbias)
     return (
         de.view_as(original_e) if de is not None else _empty(original_e),
         dc if dc is not None else _empty(original_c),
@@ -385,10 +401,17 @@ def _cce_forward_op(
     # context that was active while Dynamo captured its caller. Recreate that
     # context explicitly so this backend follows the eager forward's cast
     # order, including evaluating mu-loss before e/c/bias are converted.
-    with torch.autocast("cuda", dtype=compute_dtype, enabled=forward_used_autocast):
-        loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
-            kernel_ctx, e, c, bias, params
-        )
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("cce.forward", e.device):
+            with torch.autocast("cuda", dtype=compute_dtype, enabled=forward_used_autocast):
+                loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
+                    kernel_ctx, e, c, bias, params
+                )
+    else:
+        with torch.autocast("cuda", dtype=compute_dtype, enabled=forward_used_autocast):
+            loss, _ret_lse, loss_metrics = LinearCrossEntropyFunction.forward(
+                kernel_ctx, e, c, bias, params
+            )
     (
         saved_e,
         _saved_c,
@@ -410,6 +433,18 @@ def _cce_forward_op(
         saved_valids = _pad_valid_rows(saved_valids, valid_capacity)
         if mile_weight is not None:
             mile_weight = _pad_valid_rows(mile_weight, valid_capacity)
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors(
+            "cce.forward",
+            loss=loss,
+            metrics=loss_metrics,
+            lse=lse,
+            valids=saved_valids,
+            mile_weight=mile_weight,
+            patch_target_weight=patch_target_weight,
+            mu=mu,
+            mu_vocab_size=mu_vocab_size,
+        )
     return (
         loss,
         _pack_optional(loss_metrics, loss),

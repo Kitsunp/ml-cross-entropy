@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import torch
 
+from cut_cross_entropy.torch_2_14 import (
+    TORCH_2_14_CUDA_KERNEL_CONTEXT,
+    TORCH_2_14_MEMORY_ANNOTATIONS,
+    annotate_tensors,
+    cuda_kernel_region,
+    mark_warmup_incomplete_once,
+)
+
 from . import _cute
 from .reference import polynorm_reference
 
@@ -102,14 +110,32 @@ def _polynorm_forward_op(
     bias: torch.Tensor,
     dropout_p: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _cute.forward(
-        x,
-        seeds,
-        weight,
-        bias,
-        dropout_p=dropout_p,
-        save_stats=True,
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("polynorm.forward", x.device):
+            output, stats = _cute.forward(
+                x,
+                seeds,
+                weight,
+                bias,
+                dropout_p=dropout_p,
+                save_stats=True,
+            )
+    else:
+        output, stats = _cute.forward(
+            x,
+            seeds,
+            weight,
+            bias,
+            dropout_p=dropout_p,
+            save_stats=True,
+        )
+    mark_warmup_incomplete_once(
+        "polynorm.forward",
+        (x.device.index, x.dtype, tuple(x.shape), dropout_p),
     )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("polynorm.forward", output=output, stats=stats)
+    return output, stats
 
 
 @_polynorm_forward_op.register_fake
@@ -139,14 +165,31 @@ def _polynorm_inference_op(
     bias: torch.Tensor,
     dropout_p: float,
 ) -> torch.Tensor:
-    output, _stats = _cute.forward(
-        x,
-        seeds,
-        weight,
-        bias,
-        dropout_p=dropout_p,
-        save_stats=False,
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("polynorm.inference", x.device):
+            output, _stats = _cute.forward(
+                x,
+                seeds,
+                weight,
+                bias,
+                dropout_p=dropout_p,
+                save_stats=False,
+            )
+    else:
+        output, _stats = _cute.forward(
+            x,
+            seeds,
+            weight,
+            bias,
+            dropout_p=dropout_p,
+            save_stats=False,
+        )
+    mark_warmup_incomplete_once(
+        "polynorm.inference",
+        (x.device.index, x.dtype, tuple(x.shape), dropout_p),
     )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("polynorm.inference", output=output)
     return output
 
 
@@ -175,14 +218,37 @@ def _polynorm_backward_op(
     stats: torch.Tensor,
     dropout_p: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _cute.backward(
-        grad_output,
-        x,
-        seeds,
-        weight,
-        stats,
-        dropout_p=dropout_p,
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("polynorm.backward", x.device):
+            grad_x, grad_weight, grad_bias = _cute.backward(
+                grad_output,
+                x,
+                seeds,
+                weight,
+                stats,
+                dropout_p=dropout_p,
+            )
+    else:
+        grad_x, grad_weight, grad_bias = _cute.backward(
+            grad_output,
+            x,
+            seeds,
+            weight,
+            stats,
+            dropout_p=dropout_p,
+        )
+    mark_warmup_incomplete_once(
+        "polynorm.backward",
+        (x.device.index, x.dtype, tuple(x.shape), dropout_p),
     )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors(
+            "polynorm.backward",
+            grad_x=grad_x,
+            grad_weight=grad_weight,
+            grad_bias=grad_bias,
+        )
+    return grad_x, grad_weight, grad_bias
 
 
 @_polynorm_backward_op.register_fake

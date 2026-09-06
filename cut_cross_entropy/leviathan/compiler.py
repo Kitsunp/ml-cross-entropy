@@ -17,6 +17,13 @@ from typing import Any
 
 import torch
 
+from cut_cross_entropy.torch_2_14 import (
+    TORCH_2_14_CUDA_KERNEL_CONTEXT,
+    TORCH_2_14_MEMORY_ANNOTATIONS,
+    annotate_tensors,
+    cuda_kernel_region,
+)
+
 from .backward_impl import leviathan_backward, leviathan_forward_ref
 from .core import LeviathanConfig
 
@@ -165,13 +172,23 @@ def _leviathan_forward_op(
         codebooks.dtype,
     )
     has_meap = mask_embedding.numel() != 0
-    embeds, saved = _saved_or_reference(
-        ids.detach(),
-        params,
-        cfg,
-        mask_embedding=mask_embedding.detach() if has_meap else None,
-        mask_token_id=mask_token_id if has_meap else None,
-    )
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("leviathan.forward", ids.device):
+            embeds, saved = _saved_or_reference(
+                ids.detach(),
+                params,
+                cfg,
+                mask_embedding=mask_embedding.detach() if has_meap else None,
+                mask_token_id=mask_token_id if has_meap else None,
+            )
+    else:
+        embeds, saved = _saved_or_reference(
+            ids.detach(),
+            params,
+            cfg,
+            mask_embedding=mask_embedding.detach() if has_meap else None,
+            mask_token_id=mask_token_id if has_meap else None,
+        )
 
     z = saved["z"].contiguous()
     xhat = saved["x_hat_por_head"].contiguous()
@@ -187,6 +204,17 @@ def _leviathan_forward_op(
     else:
         modes = modes.contiguous()
     mode_flag = codebooks.new_tensor(1 if has_modes else 0, dtype=torch.int8)
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors(
+            "leviathan.forward",
+            embeds=embeds,
+            z=z,
+            xhat=xhat,
+            mean=mean,
+            rsqrt=rsqrt,
+            modes=modes,
+            mode_flag=mode_flag,
+        )
     return embeds, z, xhat, mean, rsqrt, modes, mode_flag
 
 
@@ -300,14 +328,28 @@ def _leviathan_inference_op(
         krank,
         codebooks.dtype,
     )
-    embeds, _ = _saved_or_reference(
-        ids.detach(),
-        params,
-        cfg,
-        save_intermediates=False,
-        mask_embedding=(mask_embedding.detach() if mask_embedding.numel() != 0 else None),
-        mask_token_id=(mask_token_id if mask_embedding.numel() != 0 else None),
-    )
+    has_meap = mask_embedding.numel() != 0
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("leviathan.inference", ids.device):
+            embeds, _ = _saved_or_reference(
+                ids.detach(),
+                params,
+                cfg,
+                save_intermediates=False,
+                mask_embedding=(mask_embedding.detach() if has_meap else None),
+                mask_token_id=(mask_token_id if has_meap else None),
+            )
+    else:
+        embeds, _ = _saved_or_reference(
+            ids.detach(),
+            params,
+            cfg,
+            save_intermediates=False,
+            mask_embedding=(mask_embedding.detach() if has_meap else None),
+            mask_token_id=(mask_token_id if has_meap else None),
+        )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("leviathan.inference", embeds=embeds)
     return embeds
 
 
@@ -350,6 +392,43 @@ def _leviathan_inference_fake(
         krank,
     )
     return codebooks.new_empty((*ids.shape, hidden_size))
+
+
+def _compute_leviathan_grads(
+    grad_out: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    cfg: LeviathanConfig,
+    saved: dict[str, Any],
+    ids: torch.Tensor,
+    has_modes: bool,
+) -> dict[str, torch.Tensor]:
+    grads = None
+    if has_modes and _leviathan_backward_triton is not None:
+        try:
+            grads = _leviathan_backward_triton(
+                grad_out,
+                params,
+                cfg,
+                saved,
+                ids,
+            )
+        except (TypeError, ValueError, AttributeError):
+            grads = None
+    if grads is None:
+        # Keep the compiler-boundary fallback bounded just like the regular
+        # autograd wrapper. This path is used when the Triton backward is
+        # unavailable or rejects metadata; a long sequence must not make the
+        # reference _head_backward materialize its full-N basis/phi workset.
+        chunk = getattr(cfg, "backward_chunk", None) or 8192
+        grads = leviathan_backward(
+            grad_out,
+            params,
+            cfg,
+            saved=saved,
+            ids=ids,
+            chunk=chunk,
+        )
+    return grads
 
 
 @torch.library.custom_op(
@@ -421,32 +500,17 @@ def _leviathan_backward_op(
     if has_modes:
         saved["modes_por_head"] = modes
 
-    grads = None
-    if has_modes and _leviathan_backward_triton is not None:
-        try:
-            grads = _leviathan_backward_triton(
-                grad_out,
-                params,
-                cfg,
-                saved,
-                ids,
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("leviathan.backward", ids.device):
+            grads = _compute_leviathan_grads(
+                grad_out, params, cfg, saved, ids, has_modes
             )
-        except (TypeError, ValueError, AttributeError):
-            grads = None
-    if grads is None:
-        # Keep the compiler-boundary fallback bounded just like the regular
-        # autograd wrapper. This path is used when the Triton backward is
-        # unavailable or rejects metadata; a long sequence must not make the
-        # reference _head_backward materialize its full-N basis/phi workset.
-        chunk = getattr(cfg, "backward_chunk", None) or 8192
-        grads = leviathan_backward(
-            grad_out,
-            params,
-            cfg,
-            saved=saved,
-            ids=ids,
-            chunk=chunk,
+    else:
+        grads = _compute_leviathan_grads(
+            grad_out, params, cfg, saved, ids, has_modes
         )
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("leviathan.backward", **grads)
     return tuple(
         grads[key]
         for key in (
