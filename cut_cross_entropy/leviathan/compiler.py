@@ -24,7 +24,11 @@ from cut_cross_entropy.torch_2_14 import (
     cuda_kernel_region,
 )
 
-from .backward_impl import leviathan_backward, leviathan_forward_ref
+from .backward_impl import (
+    base_k_decompose,
+    leviathan_backward,
+    leviathan_forward_ref,
+)
 from .core import LeviathanConfig
 
 try:
@@ -847,4 +851,65 @@ def leviathan_embedding_compiler_safe(
     return output
 
 
-__all__ = ["leviathan_embedding_compiler_safe"]
+def _leviathan_seed_from_codebooks(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+) -> torch.Tensor:
+    """Build the differentiable compositional seed used by JTok.
+
+    The legacy Leviathan custom op also materializes this seed internally,
+    but marks it as a saved backward checkpoint. Reusing that tensor as a
+    JTok input would silently cut the JTok -> codebook gradient. This small
+    compiler-visible bridge repeats only the base-b lookup/sum, not the
+    projection, spline, or output stages of Leviathan. Its value matches the
+    kernel's stage-1 accumulation order and remains differentiable with
+    respect to ``codebooks``.
+    """
+    flat_ids = ids.reshape(-1).long()
+    num_codebooks, base, d_seed = codebooks.shape
+    coords = base_k_decompose(flat_ids, base, num_codebooks)
+    seed = torch.zeros(
+        (flat_ids.numel(), d_seed),
+        dtype=codebooks.dtype,
+        device=codebooks.device,
+    )
+    for component in range(num_codebooks):
+        seed = seed + codebooks[component].index_select(
+            0, coords[:, component]
+        )
+    return seed.reshape(*ids.shape, d_seed)
+
+
+def leviathan_embedding_with_seed_compiler_safe(
+    ids: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    cfg: Any,
+    knot_grid: torch.Tensor,
+    *,
+    mask_embedding: torch.Tensor | None = None,
+    mask_token_id: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run legacy LEV and expose a differentiable seed for JTok/JTok-M.
+
+    The original ``leviathan_embedding_compiler_safe`` contract and custom-op
+    graph remain unchanged. The additional seed bridge is intentionally
+    limited to the compositional codebook stage so JTok can train the shared
+    codebooks without forcing the full reference Leviathan graph into the
+    model.
+    """
+    embedding = leviathan_embedding_compiler_safe(
+        ids,
+        params,
+        cfg,
+        knot_grid,
+        mask_embedding=mask_embedding,
+        mask_token_id=mask_token_id,
+    )
+    seed = _leviathan_seed_from_codebooks(ids, params["codebooks"])
+    return embedding, seed
+
+
+__all__ = [
+    "leviathan_embedding_compiler_safe",
+    "leviathan_embedding_with_seed_compiler_safe",
+]

@@ -16,6 +16,7 @@ from cut_cross_entropy.leviathan import (
     LeviathanGenerator,
     leviathan_embedding,
     leviathan_embedding_compiler_safe,
+    leviathan_embedding_with_seed_compiler_safe,
     leviathan_forward_ref,
     make_triton_leviathan_generator,
     replace_leviathan_generator,
@@ -100,6 +101,33 @@ def test_reference_dispatch_preserves_grads_and_custom_knot_grid() -> None:
         for name in params
         if name != "knot_grid"
     )
+
+
+def test_seed_bridge_matches_leviathan_stage_one_and_keeps_gradient() -> None:
+    cfg = _config(dtype=torch.float32)
+    generator = LeviathanGenerator(cfg)
+    params = _detached_params(generator)
+    ids = torch.tensor([[7, 13, 99, 2048]])
+
+    expected_embedding, saved = leviathan_forward_ref(
+        ids,
+        {**params, "knot_grid": generator.knot_grid},
+        cfg,
+        save_intermediates=True,
+    )
+    embedding, seed = leviathan_embedding_with_seed_compiler_safe(
+        ids,
+        params,
+        cfg,
+        generator.knot_grid,
+    )
+
+    torch.testing.assert_close(embedding, expected_embedding, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(seed, saved["z"].reshape_as(seed), rtol=0.0, atol=0.0)
+    assert seed.requires_grad
+    seed.float().square().mean().backward()
+    assert params["codebooks"].grad is not None
+    assert torch.isfinite(params["codebooks"].grad).all()
 
 
 def test_compiler_safe_meap_fallback_isolates_leviathan_gradients() -> None:

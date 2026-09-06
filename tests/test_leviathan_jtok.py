@@ -266,6 +266,52 @@ def test_jtokm_triton_matches_torch_reference_on_odd_geometry(dtype: torch.dtype
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_triton_general_path_handles_hidden_above_single_tile() -> None:
+    """Keep the two-stage reduction correct when hidden needs two tiles."""
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=9,
+        hidden=257,
+        d_seed=4,
+        knots=5,
+        modes=2,
+    )
+    valid = torch.ones(9, device="cuda", dtype=torch.bool)
+    valid[::3] = False
+    reference, _ = jtokm_apply(
+        values["delta"],
+        values["z"],
+        values["router_state"],
+        values["coeff"],
+        values["spline_out"],
+        values["residual_out"],
+        values["scaler"],
+        values["router_weight"],
+        values["grid"],
+        top_k=2,
+        valid_mask=valid,
+        backend="torch",
+    )
+    actual, _ = jtokm_apply(
+        values["delta"],
+        values["z"],
+        values["router_state"],
+        values["coeff"],
+        values["spline_out"],
+        values["residual_out"],
+        values["scaler"],
+        values["router_weight"],
+        values["grid"],
+        top_k=2,
+        valid_mask=valid,
+        backend="triton",
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_jtokm_triton_backward_reaches_all_trainable_inputs() -> None:
     values = _inputs(device="cuda", dtype=torch.bfloat16, n=17, hidden=13, d_seed=5)
     trainable = {

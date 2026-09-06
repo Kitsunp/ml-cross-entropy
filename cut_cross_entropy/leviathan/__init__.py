@@ -11,7 +11,10 @@ from .autograd_fn import (  # noqa: F401
     leviathan_apply,
 )
 from .backward_impl import leviathan_backward, leviathan_forward_ref  # noqa: F401
-from .compiler import leviathan_embedding_compiler_safe  # noqa: F401
+from .compiler import (  # noqa: F401
+    leviathan_embedding_compiler_safe,
+    leviathan_embedding_with_seed_compiler_safe,
+)
 from .core import LeviathanConfig, LeviathanGenerator, build_generator  # noqa: F401
 from .dispatch import leviathan_embedding, supports  # noqa: F401
 from .jtok import (  # noqa: F401
@@ -36,6 +39,7 @@ __all__ = [
     "leviathan_forward_ref",
     "leviathan_embedding",
     "leviathan_embedding_compiler_safe",
+    "leviathan_embedding_with_seed_compiler_safe",
     "supports",
     "LeviathanConfig",
     "LeviathanGenerator",

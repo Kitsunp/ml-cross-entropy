@@ -12,18 +12,21 @@ The implementation has two layers:
 * ``*_reference`` functions are the semantic oracle and the training
   backward.  They use the same B-spline/product equations as the NeoLLM
   Torch implementation, but JTok-M evaluates only the selected experts.
-* The CUDA path uses three small Triton stages: selected surface modes,
-  selected-mode/output projection, and final normalization/modulation.  It
-  never materializes ``[tokens, experts, modes, hidden]``.  The intermediate
-  mode table is ``[tokens, selected_experts, modes]`` and is discarded before
-  the caller receives the result.
+* The CUDA path uses a fused selected-mode/output projection and a general
+  final normalization/modulation stage.  When one hidden tile is sufficient,
+  the latter is folded into the same Triton launch.  It never materializes
+  ``[tokens, experts, modes, hidden]`` or the former ``[tokens, K, modes]``
+  mode workspace.  The mode product is accumulated inside each output tile.
 
-The custom-op boundary follows the PyTorch 2.14 integration contract: fake
-implementations describe output metadata and registered autograd recomputes
-the compact reference path.  The ``backend="triton"`` mode is strict and
-raises when the kernel cannot be used; ``backend="torch"`` is the explicit
-reference baseline; ``backend="auto"`` is intended only for library callers
-that deliberately want capability dispatch.
+On Torch 2.14 the operation is registered with ``torch.library.triton_op`` so
+the wrapped Triton launches are visible to ``torch.compile`` at the explicit
+JTok boundary; this lets Inductor optimize the surrounding router and model
+operations without replacing the surface kernel.  Older Torch versions use
+the ``custom_op`` compatibility registration.  Fake metadata and registered
+autograd are provided for both registrations.  The
+``backend="triton"`` mode is strict and raises when the kernel cannot be used;
+``backend="torch"`` is the explicit reference baseline; ``backend="auto"`` is
+intended only for library callers that deliberately want capability dispatch.
 
 The backward currently prioritizes a bounded, auditable reference formula over
 a second experimental Triton backward.  It saves only the operation inputs in
@@ -39,6 +42,16 @@ from typing import Any, Literal, Optional
 
 import torch
 import torch.nn.functional as F
+
+try:
+    from torch.library import triton_op as _torch_triton_op
+    from torch.library import wrap_triton as _torch_wrap_triton
+
+    _TRITON_OP_AVAILABLE = True
+except (ImportError, AttributeError):  # pragma: no cover - older Torch
+    _torch_triton_op = None
+    _torch_wrap_triton = None
+    _TRITON_OP_AVAILABLE = False
 
 from cut_cross_entropy.torch_2_14 import (
     TORCH_2_14_CUDA_KERNEL_CONTEXT,
@@ -63,6 +76,44 @@ _SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 _BASIS_EPS = 1e-12
 _PRODUCT_LOG_EPS = 1e-9
 _DEFAULT_NORM_EPS = 1e-6
+
+
+def _jtok_op_decorator(name: str):
+    """Select the composable Torch 2.14 registration when available."""
+    if _TRITON_OP_AVAILABLE:
+        return _torch_triton_op(name, mutates_args={})
+    return torch.library.custom_op(
+        name,
+        mutates_args=(),
+        device_types="cuda",
+        tags=(torch.Tag.cudagraph_unsafe,),
+    )
+
+
+def _jtok_fake_registration(op):
+    """Keep fake registration for opaque custom-op compatibility only."""
+    if _TRITON_OP_AVAILABLE:
+        return lambda function: function
+    return op.register_fake
+
+
+def _jtok_register_autograd(op, backward, *, setup_context):
+    """Register the same reference backward with either operator API."""
+    if _TRITON_OP_AVAILABLE:
+        op.register_autograd(backward, setup_context=setup_context)
+    else:
+        torch.library.register_autograd(
+            op,
+            backward,
+            setup_context=setup_context,
+        )
+
+
+def _jtok_wrap_kernel(kernel):
+    """Expose Triton launches to ``triton_op`` without breaking old Torch."""
+    if not _TRITON_OP_AVAILABLE or _torch_wrap_triton is None:
+        return kernel
+    return _torch_wrap_triton(kernel)
 
 
 def _flatten_inputs(
@@ -663,6 +714,283 @@ if _TRITON_AVAILABLE:
         value = tl.where(valid & mask, value, delta)
         tl.store(output_ptr + row * HIDDEN + cols, value.to(output_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _jtok_project_fused_kernel(
+        z_ptr,
+        coeff_ptr,
+        grid_ptr,
+        spline_out_ptr,
+        residual_out_ptr,
+        expert_idx_ptr,
+        selected_weights_ptr,
+        valid_ptr,
+        surface_ptr,
+        norm_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Evaluate selected modes and project them in one row tile.
+
+        The old path wrote a temporary ``[N, K, M]`` activation and launched a
+        second kernel to consume it.  This kernel computes the same mode
+        product in FP32 inside each hidden tile, then immediately accumulates
+        the selected output and residual projections.  A tile may recompute
+        the inexpensive mode product when ``HIDDEN > BLOCK_N``; the caller
+        chooses a larger tile for this fused path to keep that duplication
+        bounded.  The output and norm contracts are unchanged.
+        """
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = row < N
+        col_mask = cols < HIDDEN
+        active_mask = row_mask & col_mask
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_offsets < NUM_KNOTS,
+            other=0.0,
+        ).to(tl.float32)
+        scale = float(max(int(NUM_KNOTS) - 1, 0))
+        mixed = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for slot in tl.range(0, TOP_K):
+            expert = tl.load(
+                expert_idx_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int32)
+            weight = tl.load(
+                selected_weights_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            values = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for mode in tl.range(0, NUM_MODES):
+                log_acc = 0.0
+                neg_acc = 0
+                for d in tl.range(0, D_SEED):
+                    x = tl.load(
+                        z_ptr + row * D_SEED + d,
+                        mask=row_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    distance = tl.abs(x - grid) * scale
+                    basis = tl.where(
+                        distance < 0.5,
+                        0.75 - distance * distance,
+                        tl.where(
+                            distance < 1.5,
+                            0.5 * (1.5 - distance) * (1.5 - distance),
+                            0.0,
+                        ),
+                    )
+                    basis = tl.where(
+                        knot_offsets < NUM_KNOTS,
+                        basis,
+                        0.0,
+                    )
+                    basis = basis / tl.maximum(tl.sum(basis, axis=0), 1e-12)
+                    coeff = tl.load(
+                        coeff_ptr
+                        + (((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS)
+                        + knot_offsets,
+                        mask=knot_offsets < NUM_KNOTS,
+                        other=0.0,
+                    ).to(tl.float32)
+                    phi = tl.sum(basis * coeff, axis=0)
+                    log_acc += tl.log(tl.abs(phi) + 1e-9)
+                    neg_acc += (phi < 0).to(tl.int32)
+                mode_value = (
+                    1.0 - 2.0 * (neg_acc & 1).to(tl.float32)
+                ) * tl.exp(log_acc)
+                # Preserve the old three-stage path's activation-dtype
+                # boundary: modes were stored as BF16/FP16 before projection.
+                mode_value = mode_value.to(spline_out_ptr.dtype.element_ty).to(
+                    tl.float32
+                )
+                out_weight = tl.load(
+                    spline_out_ptr
+                    + (expert * NUM_MODES + mode) * HIDDEN
+                    + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                values += mode_value * out_weight
+
+            residual = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for d in tl.range(0, D_SEED):
+                z_value = tl.load(
+                    z_ptr + row * D_SEED + d,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_weight = tl.load(
+                    residual_out_ptr + (expert * D_SEED + d) * HIDDEN + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual += z_value * residual_weight
+            mixed += weight * (values + residual)
+
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0)
+            mixed = tl.where(row_valid, mixed, 0.0)
+        mixed = tl.where(active_mask, mixed, 0.0)
+        tl.store(
+            surface_ptr + row * HIDDEN + cols,
+            mixed.to(surface_ptr.dtype.element_ty),
+            mask=active_mask,
+        )
+        tl.atomic_add(norm_ptr + row, tl.sum(mixed * mixed, axis=0), mask=row_mask)
+
+    @triton.jit
+    def _jtok_project_finalize_fused_kernel(
+        delta_ptr,
+        z_ptr,
+        coeff_ptr,
+        grid_ptr,
+        spline_out_ptr,
+        residual_out_ptr,
+        expert_idx_ptr,
+        selected_weights_ptr,
+        scaler_ptr,
+        valid_ptr,
+        output_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        NORM_EPS: tl.constexpr,
+        RESIDUAL_SCALE: tl.constexpr,
+        MIXTURE: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Fuse selected surface, norm, and modulation for one hidden tile.
+
+        The reduction is valid only when one program owns the complete hidden
+        row.  The Python dispatcher therefore selects this kernel only for
+        ``hidden <= 256``; wider rows use the general surface/norm/finalize
+        sequence above.  Keeping this condition explicit avoids a hidden
+        cross-tile reduction and preserves the odd-geometry contract.
+        """
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_N)
+        row_mask = row < N
+        col_mask = cols < HIDDEN
+        active_mask = row_mask & col_mask
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_offsets < NUM_KNOTS,
+            other=0.0,
+        ).to(tl.float32)
+        scale = float(max(int(NUM_KNOTS) - 1, 0))
+        mixed = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for slot in tl.range(0, TOP_K):
+            expert = tl.load(
+                expert_idx_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int32)
+            weight = tl.load(
+                selected_weights_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            values = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for mode in tl.range(0, NUM_MODES):
+                log_acc = 0.0
+                neg_acc = 0
+                for d in tl.range(0, D_SEED):
+                    x = tl.load(
+                        z_ptr + row * D_SEED + d,
+                        mask=row_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    distance = tl.abs(x - grid) * scale
+                    basis = tl.where(
+                        distance < 0.5,
+                        0.75 - distance * distance,
+                        tl.where(
+                            distance < 1.5,
+                            0.5 * (1.5 - distance) * (1.5 - distance),
+                            0.0,
+                        ),
+                    )
+                    basis = tl.where(knot_offsets < NUM_KNOTS, basis, 0.0)
+                    basis = basis / tl.maximum(tl.sum(basis, axis=0), 1e-12)
+                    coeff = tl.load(
+                        coeff_ptr
+                        + (((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS)
+                        + knot_offsets,
+                        mask=knot_offsets < NUM_KNOTS,
+                        other=0.0,
+                    ).to(tl.float32)
+                    phi = tl.sum(basis * coeff, axis=0)
+                    log_acc += tl.log(tl.abs(phi) + 1e-9)
+                    neg_acc += (phi < 0).to(tl.int32)
+                mode_value = (
+                    1.0 - 2.0 * (neg_acc & 1).to(tl.float32)
+                ) * tl.exp(log_acc)
+                mode_value = mode_value.to(spline_out_ptr.dtype.element_ty).to(
+                    tl.float32
+                )
+                out_weight = tl.load(
+                    spline_out_ptr
+                    + (expert * NUM_MODES + mode) * HIDDEN
+                    + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                values += mode_value * out_weight
+
+            residual = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for d in tl.range(0, D_SEED):
+                z_value = tl.load(
+                    z_ptr + row * D_SEED + d,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_weight = tl.load(
+                    residual_out_ptr + (expert * D_SEED + d) * HIDDEN + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual += z_value * residual_weight
+            mixed += weight * (values + residual)
+
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0)
+        else:
+            row_valid = row_mask
+        mixed = tl.where(row_valid, mixed, 0.0)
+        norm = tl.sqrt(tl.sum(mixed * mixed, axis=0)) + NORM_EPS
+        surface = mixed.to(output_ptr.dtype.element_ty).to(tl.float32)
+        scaler = tl.load(scaler_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+        direction = surface / norm
+        delta = tl.load(delta_ptr + row * HIDDEN + cols, mask=active_mask, other=0.0).to(
+            tl.float32
+        )
+        if MIXTURE:
+            value = delta + RESIDUAL_SCALE * scaler * direction
+        else:
+            value = delta * (1.0 + scaler * direction)
+        value = tl.where(row_valid & col_mask, value, delta)
+        tl.store(output_ptr + row * HIDDEN + cols, value.to(output_ptr.dtype.element_ty), mask=active_mask)
+
 
 def _run_jtok_triton(
     delta: torch.Tensor,
@@ -696,73 +1024,79 @@ def _run_jtok_triton(
     if has_mask and valid_mask.numel() != n_tokens:
         raise ValueError("valid_mask has the wrong number of elements")
 
-    # Mode values are intentionally stored in the activation dtype.  They are
-    # transient kernel workspace, not an autograd checkpoint.
-    mode_workspace = torch.empty(
-        n_tokens,
-        top_k,
-        modes,
-        device=delta.device,
-        dtype=delta.dtype,
-    )
+    knot_pad = triton.next_power_of_2(knots)
+    single_tile = hidden <= 256
+    if single_tile:
+        output = torch.empty_like(delta)
+        block_n = triton.next_power_of_2(hidden)
+        _jtok_wrap_kernel(_jtok_project_finalize_fused_kernel)[(n_tokens,)](
+            delta,
+            z,
+            spline_coeff,
+            knot_grid,
+            spline_out,
+            residual_out,
+            expert_idx,
+            selected_weights,
+            scaler,
+            valid_mask,
+            output,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            HIDDEN=hidden,
+            BLOCK_N=block_n,
+            KNOT_PAD=knot_pad,
+            NORM_EPS=float(norm_eps),
+            RESIDUAL_SCALE=float(residual_scale),
+            MIXTURE=bool(mixture),
+            HAS_MASK=has_mask,
+            num_warps=4,
+            num_stages=1,
+        )
+        if TORCH_2_14_MEMORY_ANNOTATIONS:
+            annotate_tensors(
+                "jtok.mixture" if mixture else "jtok.forward",
+                output=output,
+            )
+        return output
+
     surface = torch.empty_like(delta)
     norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
     output = torch.empty_like(delta)
-    knot_pad = triton.next_power_of_2(knots)
-    if has_mask:
-        mode_grid = (n_tokens * top_k * modes,)
-        _jtok_modes_kernel_masked[mode_grid](
-            z,
-            spline_coeff,
-            knot_grid,
-            expert_idx,
-            valid_mask,
-            mode_workspace,
-            n_tokens,
-            D_SEED=d_seed,
-            NUM_KNOTS=knots,
-            NUM_MODES=modes,
-            TOP_K=top_k,
-            KNOT_PAD=knot_pad,
-        )
-    else:
-        mode_grid = (n_tokens * top_k * modes,)
-        _jtok_modes_kernel_unmasked[mode_grid](
-            z,
-            spline_coeff,
-            knot_grid,
-            expert_idx,
-            mode_workspace,
-            n_tokens,
-            D_SEED=d_seed,
-            NUM_KNOTS=knots,
-            NUM_MODES=modes,
-            TOP_K=top_k,
-            KNOT_PAD=knot_pad,
-        )
-    block_n = min(128, triton.next_power_of_2(hidden))
+    # The general fused path removes the transient [tokens, top_k, modes]
+    # activation and keeps the mode product inside the output tile.  The
+    # single-tile path above additionally folds final normalization/modulation
+    # into that same Triton boundary when the full hidden row fits safely.
+    block_n = min(256, triton.next_power_of_2(hidden))
     project_grid = (n_tokens, triton.cdiv(hidden, block_n))
-    _jtok_project_kernel[project_grid](
+    _jtok_wrap_kernel(_jtok_project_fused_kernel)[project_grid](
         z,
-        mode_workspace,
+        spline_coeff,
+        knot_grid,
         spline_out,
         residual_out,
         expert_idx,
         selected_weights,
+        valid_mask,
         surface,
         norm,
         n_tokens,
         D_SEED=d_seed,
-        HIDDEN=hidden,
+        NUM_KNOTS=knots,
         NUM_MODES=modes,
         TOP_K=top_k,
+        HIDDEN=hidden,
         BLOCK_N=block_n,
+        KNOT_PAD=knot_pad,
         HAS_MASK=has_mask,
         num_warps=4,
         num_stages=1,
     )
     final_grid = (n_tokens, triton.cdiv(hidden, block_n))
-    _jtok_finalize_kernel[final_grid](
+    _jtok_wrap_kernel(_jtok_finalize_kernel)[final_grid](
         delta,
         surface,
         scaler,
@@ -782,7 +1116,6 @@ def _run_jtok_triton(
     if TORCH_2_14_MEMORY_ANNOTATIONS:
         annotate_tensors(
             "jtok.mixture" if mixture else "jtok.forward",
-            modes=mode_workspace,
             surface=surface,
             norm=norm,
             output=output,
@@ -791,19 +1124,21 @@ def _run_jtok_triton(
 
 
 def _kernel_region(name: str, device: torch.device):
-    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+    # ``triton_op`` traces this body under ``torch.compile``. The optional
+    # 2.14 allocator/profiler context is eager-runtime scaffolding and must not
+    # become Python control flow or a nested allocator context in the traced
+    # graph. The custom-op compatibility path still receives it at runtime.
+    is_compiling = getattr(
+        getattr(torch, "compiler", None), "is_compiling", lambda: False
+    )
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT and not is_compiling():
         return cuda_kernel_region(name, device)
     from contextlib import nullcontext
 
     return nullcontext()
 
 
-@torch.library.custom_op(
-    "cut_cross_entropy::jtok_forward",
-    mutates_args=(),
-    device_types="cuda",
-    tags=(torch.Tag.cudagraph_unsafe,),
-)
+@_jtok_op_decorator("cut_cross_entropy::jtok_forward")
 def _jtok_forward_op(
     delta: torch.Tensor,
     z: torch.Tensor,
@@ -835,7 +1170,7 @@ def _jtok_forward_op(
         )
 
 
-@_jtok_forward_op.register_fake
+@_jtok_fake_registration(_jtok_forward_op)
 def _jtok_forward_fake(
     delta: torch.Tensor,
     z: torch.Tensor,
@@ -946,19 +1281,14 @@ def _jtok_backward(ctx: Any, grad_out: torch.Tensor):
     return (*grads, None, None, None, None, None)
 
 
-torch.library.register_autograd(
+_jtok_register_autograd(
     _jtok_forward_op,
     _jtok_backward,
     setup_context=_jtok_setup_context,
 )
 
 
-@torch.library.custom_op(
-    "cut_cross_entropy::jtokm_forward",
-    mutates_args=(),
-    device_types="cuda",
-    tags=(torch.Tag.cudagraph_unsafe,),
-)
+@_jtok_op_decorator("cut_cross_entropy::jtokm_forward")
 def _jtokm_forward_op(
     delta: torch.Tensor,
     z: torch.Tensor,
@@ -991,7 +1321,7 @@ def _jtokm_forward_op(
         )
 
 
-@_jtokm_forward_op.register_fake
+@_jtok_fake_registration(_jtokm_forward_op)
 def _jtokm_forward_fake(
     delta: torch.Tensor,
     z: torch.Tensor,
@@ -1099,7 +1429,7 @@ def _jtokm_backward(ctx: Any, grad_out: torch.Tensor):
     )
 
 
-torch.library.register_autograd(
+_jtok_register_autograd(
     _jtokm_forward_op,
     _jtokm_backward,
     setup_context=_jtokm_setup_context,
