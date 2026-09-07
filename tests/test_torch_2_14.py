@@ -25,7 +25,6 @@ def test_torch_2_14_boolean_matches_installed_version() -> None:
 
 def test_kernel_region_is_noop_when_annotations_are_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(torch_2_14, "_mark_kernels", None)
-    monkeypatch.setattr(torch_2_14, "_MemPool", None)
 
     with torch_2_14.cuda_kernel_region("test.region", torch.device("cuda")):
         value = 7
@@ -41,7 +40,6 @@ def test_kernel_region_uses_backward_false(monkeypatch) -> None:
         yield
 
     monkeypatch.setattr(torch_2_14, "_mark_kernels", fake_mark)
-    monkeypatch.setattr(torch_2_14, "_MemPool", None)
     with torch_2_14.cuda_kernel_region("test.region", torch.device("cuda")):
         pass
 
@@ -57,30 +55,6 @@ def test_kernel_region_uses_backward_false(monkeypatch) -> None:
             False,
         )
     ]
-
-
-def test_kernel_region_does_not_nest_pool_inside_inductor_graph_tree(monkeypatch) -> None:
-    entered: list[object] = []
-
-    @contextmanager
-    def fake_use_mem_pool(pool, *, device):
-        entered.append((pool, device))
-        yield
-
-    monkeypatch.setattr(torch_2_14, "_indexed_cuda_device", lambda device: device)
-    monkeypatch.setattr(torch_2_14, "_cuda_memory_pool", lambda device: "external-pool")
-    monkeypatch.setattr(torch_2_14, "_use_mem_pool", fake_use_mem_pool)
-    monkeypatch.setattr(
-        torch_2_14,
-        "_inductor_cudagraph_tree_active",
-        lambda device: True,
-    )
-    monkeypatch.setattr(torch_2_14, "_mark_kernels", None)
-
-    with torch_2_14.cuda_kernel_region("test.graph_tree", torch.device("cuda")):
-        pass
-
-    assert entered == []
 
 
 def test_warmup_hook_runs_once_per_geometry(monkeypatch) -> None:
@@ -119,25 +93,6 @@ def test_memory_annotations_register_component_and_role(monkeypatch) -> None:
     torch_2_14.annotate_tensors("cce.forward", lse=tensor)  # type: ignore[arg-type]
 
     assert calls == [(tensor, "cut_cross_entropy::cce.forward.lse")]
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch_2_14.TORCH_2_14_CUDA_MEMORY_POOL,
-    reason="PyTorch 2.14 CUDA memory-pool integration is required",
-)
-def test_cuda_kernel_regions_share_one_pool_per_device() -> None:
-    device = torch.device("cuda")
-    first = torch_2_14._cuda_memory_pool(device)
-    second = torch_2_14._cuda_memory_pool(device)
-    assert first is second
-
-    with torch_2_14.cuda_kernel_region("test.pool", device):
-        allocation = torch.empty(4096, device=device)
-    torch.cuda.synchronize()
-
-    assert allocation.is_cuda
-    assert first is not None
-    assert first.snapshot()
 
 
 @pytest.mark.skipif(

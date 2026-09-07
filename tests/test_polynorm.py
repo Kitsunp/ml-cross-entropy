@@ -10,6 +10,7 @@ from cut_cross_entropy.polynorm import (
     polynorm_uses_cute,
 )
 from cut_cross_entropy.polynorm import compiler as polynorm_compiler
+from cut_cross_entropy.torch_2_14 import TORCH_2_14_OR_NEWER
 
 
 def test_polynorm_cpu_fallback_without_dropout_matches_reference() -> None:
@@ -286,3 +287,64 @@ def test_cuda_rescaling_boundary_selects_expected_path() -> None:
     torch.testing.assert_close(
         output[0], output[1], rtol=2.0e-5, atol=2.0e-5
     )
+
+
+@pytest.mark.skipif(
+    not TORCH_2_14_OR_NEWER
+    or not torch.cuda.is_available()
+    or not _cute.is_available()
+    or not hasattr(torch.compiler, "cudagraph_mark_step_begin"),
+    reason="Torch 2.14+, CUDA, CuTe, and CUDA Graph Trees are required",
+)
+def test_compiled_polynorm_graph_tree_allocator_safe() -> None:
+    """Keep CuTe outputs compatible with Graph Trees while recording.
+
+    The former 2.14 integration wrapped external kernels in a separate eager
+    ``MemPool``.  CUDA Graph Trees owns the capture pool and rejects output
+    storage allocated from that separate pool.  This is the smallest
+    training-shaped geometry that selects the CuTe custom op (rather than the
+    compiler-fusion reference expression) and reproduces the failure seen in
+    the full NeoLLM run.
+    """
+    torch.manual_seed(1729)
+    rows, hidden = 8192, 1536
+    x = torch.randn(
+        (rows, hidden),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    weight = torch.full(
+        (3,), 1.0 / 3.0, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    bias = torch.zeros((1,), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn_like(x)
+
+    def function(
+        input_: torch.Tensor,
+        weight_: torch.Tensor,
+        bias_: torch.Tensor,
+    ) -> torch.Tensor:
+        return polynorm(input_, weight_, bias_, dropout_p=0.1)
+
+    # Compile after one eager reference call, matching the real training
+    # harness and ensuring both the forward and registered backward are used.
+    eager_output = function(x, weight, bias)
+    torch.autograd.grad(eager_output, (x, weight, bias), grad_output)
+    del eager_output
+
+    compiled = torch.compile(function, mode="max-autotune", fullgraph=True)
+    checksums: list[float] = []
+    for _ in range(3):
+        torch.compiler.cudagraph_mark_step_begin()
+        output = compiled(x, weight, bias)
+        gradients = torch.autograd.grad(
+            output, (x, weight, bias), grad_output
+        )
+        assert torch.isfinite(output).all()
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        checksums.append(output.float().sum().item())
+        del output, gradients
+
+    torch.cuda.synchronize()
+    assert len(set(checksums)) == 3

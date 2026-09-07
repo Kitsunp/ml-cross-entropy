@@ -9,9 +9,10 @@ original Leviathan kernel remains the only embedding path.
 
 The implementation has two layers:
 
-* ``*_reference`` functions are the semantic oracle and the training
-  backward.  They use the same B-spline/product equations as the NeoLLM
-  Torch implementation, but JTok-M evaluates only the selected experts.
+* ``*_reference`` functions are an explicit semantic oracle for A/B tests.
+  They use the same B-spline/product equations as the NeoLLM Torch
+  implementation, but JTok-M evaluates only the selected experts.  They are
+  never selected implicitly by the external-kernel route.
 * The CUDA path uses a fused selected-mode/output projection and a general
   final normalization/modulation stage.  When one hidden tile is sufficient,
   the latter is folded into the same Triton launch.  It never materializes
@@ -28,17 +29,17 @@ autograd are provided for both registrations.  The
 ``backend="torch"`` is the explicit reference baseline; ``backend="auto"`` is
 intended only for library callers that deliberately want capability dispatch.
 
-The backward currently prioritizes a bounded, auditable reference formula over
-a second experimental Triton backward.  It saves only the operation inputs in
-the custom-op context and recomputes selected surfaces, so no forward surface
-or dense expert expansion is retained by autograd.  A future fused backward
-can replace ``_jtok*_backward`` without changing the public contract.
+The registered external-kernel backward is strict: it launches the Triton
+single-tile or multi-tile implementation and raises when CUDA/Triton is not
+available.  It saves only the operation inputs in the custom-op context and
+recomputes cheap selected products, so no dense expert expansion is retained
+by autograd.  The Torch implementation remains available only through the
+explicit ``backend="torch"`` oracle for comparison.
 """
 
 from __future__ import annotations
 
 import math
-import os
 from typing import Any, Literal, Optional
 
 import torch
@@ -77,19 +78,7 @@ _SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 _BASIS_EPS = 1e-12
 _PRODUCT_LOG_EPS = 1e-9
 _DEFAULT_NORM_EPS = 1e-6
-# Temporary experiment switch used only to attribute benchmark latency.  It is
-# deliberately not part of the public API and will be removed after the
-# controlled comparison; normal operation keeps the compact Triton backward.
-_EXPERIMENT_COMPACT_BACKWARD = os.environ.get(
-    "CCE_JTOK_EXPERIMENT_COMPACT_BACKWARD", "1"
-).strip().lower() not in {"0", "false", "no"}
-_EXPERIMENT_FORMULA_BACKWARD = os.environ.get(
-    "CCE_JTOK_EXPERIMENT_FORMULA_BACKWARD", "0"
-).strip().lower() not in {"0", "false", "no"}
-_EXPERIMENT_OPAQUE_OP = os.environ.get(
-    "CCE_JTOK_EXPERIMENT_OPAQUE_OP", "0"
-).strip().lower() not in {"0", "false", "no"}
-_USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE and not _EXPERIMENT_OPAQUE_OP
+_USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
 
 
 def _jtok_op_decorator(name: str):
@@ -105,14 +94,14 @@ def _jtok_op_decorator(name: str):
 
 
 def _jtok_fake_registration(op):
-    """Keep fake registration for opaque custom-op compatibility only."""
+    """Register fake metadata for the Torch 2.14/legacy op APIs."""
     if _USE_COMPOSABLE_TRITON_OP:
         return lambda function: function
     return op.register_fake
 
 
 def _jtok_register_autograd(op, backward, *, setup_context):
-    """Register the same reference backward with either operator API."""
+    """Register the external Triton backward with either operator API."""
     if _USE_COMPOSABLE_TRITON_OP:
         op.register_autograd(backward, setup_context=setup_context)
     else:
@@ -1037,15 +1026,16 @@ if _TRITON_AVAILABLE:
         RESIDUAL_SCALE: tl.constexpr,
         MIXTURE: tl.constexpr,
         HAS_MASK: tl.constexpr,
+        PARAM_GRADS: tl.constexpr,
     ):
         """Recompute one complete row and accumulate its backward gradients.
 
         This kernel intentionally handles only one hidden tile per token.  It
         is used when ``HIDDEN <= 256`` so the norm reduction is local and no
         ``[tokens, top_k, modes, hidden]`` or per-token parameter-gradient
-        workspace is needed.  Wider rows use the audited reference backward
-        until a multi-tile reduction with the same numerical contract is
-        available.
+        workspace is needed.  Wider rows use the multi-tile Triton reduction
+        below, so the registered external path remains kernel-only for every
+        supported hidden size.
 
         The forward casts the surface to the activation dtype before dividing
         by the FP32 norm.  The backward mirrors that boundary: ``surface`` is
@@ -1260,12 +1250,13 @@ if _TRITON_AVAILABLE:
 
                 grad_value = weight * grad_surface
                 grad_mode = tl.sum(grad_value * out_weight, axis=0)
-                tl.atomic_add(
-                    grad_spline_out_ptr
-                    + (expert * NUM_MODES + mode) * HIDDEN
-                    + safe_cols,
-                    mode_value * grad_value,
-                )
+                if PARAM_GRADS:
+                    tl.atomic_add(
+                        grad_spline_out_ptr
+                        + (expert * NUM_MODES + mode) * HIDDEN
+                        + safe_cols,
+                        mode_value * grad_value,
+                    )
 
                 for d in tl.range(0, D_SEED):
                     x = tl.load(
@@ -1374,17 +1365,751 @@ if _TRITON_AVAILABLE:
                     tl.sum(grad_value * residual_weight, axis=0),
                     mask=row_valid,
                 )
-                tl.atomic_add(
-                    grad_residual_out_ptr
-                    + (expert * D_SEED + d) * HIDDEN
-                    + safe_cols,
-                    z_value * grad_value,
-                )
+                if PARAM_GRADS:
+                    tl.atomic_add(
+                        grad_residual_out_ptr
+                        + (expert * D_SEED + d) * HIDDEN
+                        + safe_cols,
+                        z_value * grad_value,
+                    )
             slot_values += residual_value
             tl.store(
                 grad_weights_ptr + row * TOP_K + slot,
                 tl.sum(grad_surface * slot_values, axis=0),
                 mask=row_mask,
+            )
+
+    @triton.jit
+    def _jtok_backward_multi_tile_kernel(
+        delta_ptr,
+        z_ptr,
+        spline_coeff_ptr,
+        grid_ptr,
+        spline_out_ptr,
+        residual_out_ptr,
+        expert_idx_ptr,
+        selected_weights_ptr,
+        modes_ptr,
+        scaler_ptr,
+        surface_ptr,
+        norm_ptr,
+        grad_out_ptr,
+        valid_ptr,
+        grad_delta_ptr,
+        grad_z_ptr,
+        grad_coeff_ptr,
+        grad_spline_out_ptr,
+        grad_residual_out_ptr,
+        grad_scaler_ptr,
+        grad_weights_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        NORM_EPS: tl.constexpr,
+        RESIDUAL_SCALE: tl.constexpr,
+        MIXTURE: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+        PARAM_GRADS: tl.constexpr,
+    ):
+        """Backward for rows whose hidden dimension spans multiple tiles.
+
+        ``_jtok_project_kernel`` has already written the pre-cast FP32 surface
+        and the row-wise squared-norm reduction.  This pass consumes
+        one hidden tile at a time and accumulates token-local gradients with
+        atomics.  Projection-parameter gradients are disabled here for the
+        wide path and reduced by ``_jtok_backward_projection_grad_kernel``
+        over token blocks after this pass.  In particular, it never gathers
+        ``[tokens, top_k, d_seed, hidden]`` residual weights or
+        ``[tokens, top_k, modes, hidden]`` selected projections.
+        """
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        cols = block * BLOCK_H + tl.arange(0, BLOCK_H)
+        row_mask = row < N
+        col_mask = cols < HIDDEN
+        active_mask = row_mask & col_mask
+        safe_cols = tl.minimum(cols, HIDDEN - 1)
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_offsets < NUM_KNOTS,
+            other=0.0,
+        ).to(tl.float32)
+        grid_scale = float(max(int(NUM_KNOTS) - 1, 0))
+        mixed = tl.load(
+            surface_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        norm = tl.sqrt(tl.load(norm_ptr + row, mask=row_mask, other=0.0)) + NORM_EPS
+        grad_out = tl.load(
+            grad_out_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        delta_value = tl.load(
+            delta_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scaler_value = tl.load(
+            scaler_ptr + cols,
+            mask=col_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        if MIXTURE:
+            surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
+            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            grad_surface = (
+                surface_grad_factor / norm
+                - mixed * dot / (norm * norm * norm)
+            )
+            grad_delta = grad_out
+            grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
+        else:
+            surface_grad_factor = grad_out * delta_value * scaler_value
+            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            grad_surface = (
+                surface_grad_factor / norm
+                - mixed * dot / (norm * norm * norm)
+            )
+            grad_delta = grad_out * (1.0 + scaler_value * mixed / norm)
+            grad_scaler = grad_out * delta_value * mixed / norm
+
+        valid_active = active_mask & row_valid
+        grad_surface = tl.where(valid_active, grad_surface, 0.0)
+        grad_scaler = tl.where(valid_active, grad_scaler, 0.0)
+        # Reuse the FP32 surface workspace as the hand-off buffer for the
+        # block-reduced projection-gradient pass. Invalid/padded rows are
+        # already zeroed above, so the second pass needs no mask tensor.
+        tl.store(
+            surface_ptr + row * HIDDEN + cols,
+            grad_surface,
+            mask=active_mask,
+        )
+        tl.store(
+            grad_delta_ptr + row * HIDDEN + cols,
+            grad_delta.to(grad_delta_ptr.dtype.element_ty),
+            mask=active_mask,
+        )
+        tl.atomic_add(grad_scaler_ptr + safe_cols, grad_scaler)
+
+        for slot in tl.range(0, TOP_K):
+            expert = tl.load(
+                expert_idx_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int32)
+            weight = tl.load(
+                selected_weights_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            slot_values = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+            for mode in tl.range(0, NUM_MODES):
+                # The compact mode product is evaluated once per token/slot
+                # before this tiled pass.  Recomputing it here for every
+                # hidden tile multiplied the B-spline work by ceil(H/256)
+                # and was the dominant cost on wide NeoLLM rows.
+                mode_value = tl.load(
+                    modes_ptr + (row * TOP_K + slot) * NUM_MODES + mode,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                out_weight = tl.load(
+                    spline_out_ptr
+                    + (expert * NUM_MODES + mode) * HIDDEN
+                    + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                slot_values += mode_value * out_weight
+
+                grad_value = weight * grad_surface
+                grad_mode = tl.sum(grad_value * out_weight, axis=0)
+                if PARAM_GRADS:
+                    tl.atomic_add(
+                        grad_spline_out_ptr
+                        + (expert * NUM_MODES + mode) * HIDDEN
+                        + safe_cols,
+                        mode_value * grad_value,
+                    )
+
+                for d in tl.range(0, D_SEED):
+                    x = tl.load(
+                        z_ptr + row * D_SEED + d,
+                        mask=row_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    diff = x - grid
+                    distance = tl.abs(diff) * grid_scale
+                    basis_raw = tl.where(
+                        distance < 0.5,
+                        0.75 - distance * distance,
+                        tl.where(
+                            distance < 1.5,
+                            0.5 * (1.5 - distance) * (1.5 - distance),
+                            0.0,
+                        ),
+                    )
+                    basis_raw = tl.where(
+                        knot_offsets < NUM_KNOTS,
+                        basis_raw,
+                        0.0,
+                    )
+                    sign_x = tl.where(
+                        diff > 0.0,
+                        1.0,
+                        tl.where(diff < 0.0, -1.0, 0.0),
+                    )
+                    basis_derivative = tl.where(
+                        distance < 0.5,
+                        -2.0 * distance * grid_scale * sign_x,
+                        tl.where(
+                            distance < 1.5,
+                            -(1.5 - distance) * grid_scale * sign_x,
+                            0.0,
+                        ),
+                    )
+                    basis_derivative = tl.where(
+                        knot_offsets < NUM_KNOTS,
+                        basis_derivative,
+                        0.0,
+                    )
+                    raw_sum = tl.sum(basis_raw, axis=0)
+                    safe_sum = tl.maximum(raw_sum, 1e-12)
+                    coeff = tl.load(
+                        spline_coeff_ptr
+                        + (((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS)
+                        + knot_offsets,
+                        mask=knot_offsets < NUM_KNOTS,
+                        other=0.0,
+                    ).to(tl.float32)
+                    weighted = tl.sum(basis_raw * coeff, axis=0)
+                    derivative_sum = tl.sum(basis_derivative, axis=0)
+                    derivative_weighted = tl.sum(
+                        basis_derivative * coeff,
+                        axis=0,
+                    )
+                    phi = weighted / safe_sum
+                    dphi_dz = tl.where(
+                        raw_sum > 1e-12,
+                        (
+                            derivative_weighted * safe_sum
+                            - weighted * derivative_sum
+                        )
+                        / (safe_sum * safe_sum),
+                        0.0,
+                    )
+                    phi_sign = tl.where(phi < 0.0, -1.0, 1.0)
+                    grad_phi = (
+                        grad_mode
+                        * mode_value
+                        * phi_sign
+                        / (tl.abs(phi) + 1e-9)
+                    )
+                    grad_phi = tl.where(row_valid, grad_phi, 0.0)
+                    tl.atomic_add(
+                        grad_coeff_ptr
+                        + ((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS
+                        + tl.minimum(knot_offsets, NUM_KNOTS - 1),
+                        tl.where(
+                            knot_offsets < NUM_KNOTS,
+                            grad_phi * basis_raw / safe_sum,
+                            0.0,
+                        ),
+                    )
+                    tl.atomic_add(
+                        grad_z_ptr + row * D_SEED + d,
+                        grad_phi * dphi_dz,
+                        mask=row_valid,
+                    )
+
+            residual_value = tl.zeros((BLOCK_H,), dtype=tl.float32)
+            for d in tl.range(0, D_SEED):
+                z_value = tl.load(
+                    z_ptr + row * D_SEED + d,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_weight = tl.load(
+                    residual_out_ptr + (expert * D_SEED + d) * HIDDEN + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_value += z_value * residual_weight
+                grad_value = weight * grad_surface
+                tl.atomic_add(
+                    grad_z_ptr + row * D_SEED + d,
+                    tl.sum(grad_value * residual_weight, axis=0),
+                    mask=row_valid,
+                )
+                if PARAM_GRADS:
+                    tl.atomic_add(
+                        grad_residual_out_ptr
+                        + (expert * D_SEED + d) * HIDDEN
+                        + safe_cols,
+                        z_value * grad_value,
+                    )
+            slot_values += residual_value
+            tl.atomic_add(
+                grad_weights_ptr + row * TOP_K + slot,
+                tl.sum(grad_surface * slot_values, axis=0),
+                mask=row_mask,
+            )
+
+    @triton.jit
+    def _jtok_backward_multi_tile_fast_kernel(
+        delta_ptr,
+        z_ptr,
+        spline_out_ptr,
+        residual_out_ptr,
+        expert_idx_ptr,
+        selected_weights_ptr,
+        modes_ptr,
+        grad_mode_ptr,
+        grad_residual_ptr,
+        scaler_ptr,
+        surface_ptr,
+        norm_ptr,
+        grad_out_ptr,
+        valid_ptr,
+        grad_delta_ptr,
+        grad_scaler_ptr,
+        grad_weights_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        NORM_EPS: tl.constexpr,
+        RESIDUAL_SCALE: tl.constexpr,
+        MIXTURE: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Wide backward pass with token-local scalar reductions.
+
+        Each hidden tile contributes only to the compact ``grad_mode`` and
+        ``grad_residual`` workspaces.  The B-spline derivative is evaluated
+        later once per token/slot/seed coordinate, rather than once per
+        hidden tile.  The workspaces are proportional to
+        ``tokens * top_k * (modes + d_seed)`` and never to hidden size.
+        """
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        cols = block * BLOCK_H + tl.arange(0, BLOCK_H)
+        row_mask = row < N
+        col_mask = cols < HIDDEN
+        active_mask = row_mask & col_mask
+        safe_cols = tl.minimum(cols, HIDDEN - 1)
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        mixed = tl.load(
+            surface_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        norm = tl.sqrt(tl.load(norm_ptr + row, mask=row_mask, other=0.0)) + NORM_EPS
+        grad_out = tl.load(
+            grad_out_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        delta_value = tl.load(
+            delta_ptr + row * HIDDEN + cols,
+            mask=active_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scaler_value = tl.load(
+            scaler_ptr + cols,
+            mask=col_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        if MIXTURE:
+            surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
+            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            grad_surface = (
+                surface_grad_factor / norm
+                - mixed * dot / (norm * norm * norm)
+            )
+            grad_delta = grad_out
+            grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
+        else:
+            surface_grad_factor = grad_out * delta_value * scaler_value
+            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            grad_surface = (
+                surface_grad_factor / norm
+                - mixed * dot / (norm * norm * norm)
+            )
+            grad_delta = grad_out * (1.0 + scaler_value * mixed / norm)
+            grad_scaler = grad_out * delta_value * mixed / norm
+
+        valid_active = active_mask & row_valid
+        grad_surface = tl.where(valid_active, grad_surface, 0.0)
+        grad_scaler = tl.where(valid_active, grad_scaler, 0.0)
+        # The projection-gradient pass reuses this FP32 workspace after the
+        # token-local derivative scalars have been accumulated.
+        tl.store(
+            surface_ptr + row * HIDDEN + cols,
+            grad_surface,
+            mask=active_mask,
+        )
+        tl.store(
+            grad_delta_ptr + row * HIDDEN + cols,
+            grad_delta.to(grad_delta_ptr.dtype.element_ty),
+            mask=active_mask,
+        )
+        tl.atomic_add(grad_scaler_ptr + safe_cols, grad_scaler)
+
+        for slot in tl.range(0, TOP_K):
+            expert = tl.load(
+                expert_idx_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int32)
+            weight = tl.load(
+                selected_weights_ptr + row * TOP_K + slot,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            slot_values = tl.zeros((BLOCK_H,), dtype=tl.float32)
+            grad_value = weight * grad_surface
+
+            for mode in tl.range(0, NUM_MODES):
+                mode_value = tl.load(
+                    modes_ptr + (row * TOP_K + slot) * NUM_MODES + mode,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                out_weight = tl.load(
+                    spline_out_ptr
+                    + (expert * NUM_MODES + mode) * HIDDEN
+                    + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                slot_values += mode_value * out_weight
+                tl.atomic_add(
+                    grad_mode_ptr
+                    + (row * TOP_K + slot) * NUM_MODES
+                    + mode,
+                    tl.sum(grad_value * out_weight, axis=0),
+                    mask=row_valid,
+                )
+
+            residual_value = tl.zeros((BLOCK_H,), dtype=tl.float32)
+            for d in tl.range(0, D_SEED):
+                z_value = tl.load(
+                    z_ptr + row * D_SEED + d,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_weight = tl.load(
+                    residual_out_ptr + (expert * D_SEED + d) * HIDDEN + cols,
+                    mask=active_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                residual_value += z_value * residual_weight
+                tl.atomic_add(
+                    grad_residual_ptr
+                    + (row * TOP_K + slot) * D_SEED
+                    + d,
+                    tl.sum(grad_value * residual_weight, axis=0),
+                    mask=row_valid,
+                )
+            slot_values += residual_value
+            tl.atomic_add(
+                grad_weights_ptr + row * TOP_K + slot,
+                tl.sum(grad_surface * slot_values, axis=0),
+                mask=row_mask,
+            )
+
+    @triton.jit
+    def _jtok_backward_token_projection_grad_kernel(
+        z_ptr,
+        spline_coeff_ptr,
+        grid_ptr,
+        expert_idx_ptr,
+        modes_ptr,
+        grad_mode_ptr,
+        grad_residual_ptr,
+        valid_ptr,
+        grad_z_ptr,
+        grad_coeff_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Finish token-local spline and seed gradients once per coordinate."""
+        row = tl.program_id(0)
+        slot = tl.program_id(1)
+        d = tl.program_id(2)
+        row_mask = row < N
+        safe_row = tl.minimum(row, N - 1)
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + safe_row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        expert = tl.load(
+            expert_idx_ptr + safe_row * TOP_K + slot,
+            mask=row_mask,
+            other=0,
+        ).to(tl.int32)
+        x = tl.load(
+            z_ptr + safe_row * D_SEED + d,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_offsets < NUM_KNOTS,
+            other=0.0,
+        ).to(tl.float32)
+        grid_scale = float(max(int(NUM_KNOTS) - 1, 0))
+        diff = x - grid
+        distance = tl.abs(diff) * grid_scale
+        basis_raw = tl.where(
+            distance < 0.5,
+            0.75 - distance * distance,
+            tl.where(
+                distance < 1.5,
+                0.5 * (1.5 - distance) * (1.5 - distance),
+                0.0,
+            ),
+        )
+        basis_raw = tl.where(knot_offsets < NUM_KNOTS, basis_raw, 0.0)
+        sign_x = tl.where(
+            diff > 0.0,
+            1.0,
+            tl.where(diff < 0.0, -1.0, 0.0),
+        )
+        basis_derivative = tl.where(
+            distance < 0.5,
+            -2.0 * distance * grid_scale * sign_x,
+            tl.where(
+                distance < 1.5,
+                -(1.5 - distance) * grid_scale * sign_x,
+                0.0,
+            ),
+        )
+        basis_derivative = tl.where(
+            knot_offsets < NUM_KNOTS,
+            basis_derivative,
+            0.0,
+        )
+        raw_sum = tl.sum(basis_raw, axis=0)
+        safe_sum = tl.maximum(raw_sum, 1e-12)
+        grad_z_value = tl.load(
+            grad_residual_ptr
+            + (safe_row * TOP_K + slot) * D_SEED
+            + d,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        for mode in tl.range(0, NUM_MODES):
+            mode_value = tl.load(
+                modes_ptr + (safe_row * TOP_K + slot) * NUM_MODES + mode,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            grad_mode = tl.load(
+                grad_mode_ptr + (safe_row * TOP_K + slot) * NUM_MODES + mode,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            coeff = tl.load(
+                spline_coeff_ptr
+                + ((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS
+                + knot_offsets,
+                mask=knot_offsets < NUM_KNOTS,
+                other=0.0,
+            ).to(tl.float32)
+            weighted = tl.sum(basis_raw * coeff, axis=0)
+            derivative_sum = tl.sum(basis_derivative, axis=0)
+            derivative_weighted = tl.sum(
+                basis_derivative * coeff,
+                axis=0,
+            )
+            phi = weighted / safe_sum
+            dphi_dz = tl.where(
+                raw_sum > 1e-12,
+                (
+                    derivative_weighted * safe_sum
+                    - weighted * derivative_sum
+                )
+                / (safe_sum * safe_sum),
+                0.0,
+            )
+            phi_sign = tl.where(phi < 0.0, -1.0, 1.0)
+            grad_phi = (
+                grad_mode
+                * mode_value
+                * phi_sign
+                / (tl.abs(phi) + 1e-9)
+            )
+            grad_phi = tl.where(row_valid, grad_phi, 0.0)
+            grad_z_value += grad_phi * dphi_dz
+            tl.atomic_add(
+                grad_coeff_ptr
+                + ((expert * NUM_MODES + mode) * D_SEED + d) * NUM_KNOTS
+                + tl.minimum(knot_offsets, NUM_KNOTS - 1),
+                tl.where(
+                    knot_offsets < NUM_KNOTS,
+                    grad_phi * basis_raw / safe_sum,
+                    0.0,
+                ),
+            )
+
+        tl.atomic_add(
+            grad_z_ptr + safe_row * D_SEED + d,
+            grad_z_value,
+            mask=row_mask & row_valid,
+        )
+
+    @triton.jit
+    def _jtok_backward_projection_grad_kernel(
+        grad_surface_ptr,
+        z_ptr,
+        modes_ptr,
+        expert_idx_ptr,
+        selected_weights_ptr,
+        grad_spline_out_ptr,
+        grad_residual_out_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        NUM_EXPERTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        """Reduce projection gradients by token block instead of by token.
+
+        The wide backward already has the complete ``grad_surface`` in the
+        temporary surface buffer.  The previous implementation launched one
+        token/tile program and atomically added every element of
+        ``grad_spline_out`` and ``grad_residual_out``.  This kernel scans one
+        token block for one expert and performs one vector atomic per output
+        parameter tile.  It deliberately uses a block-local expert match,
+        rather than sorting or compacting routes with Torch, so it remains
+        graph-safe for dynamic top-k routing and does not introduce a second
+        data-dependent execution path.
+
+        The scan is over the small expert dimension and the temporary is
+        bounded by ``BLOCK_M * BLOCK_H`` registers.  No
+        ``[tokens, experts, modes, hidden]`` tensor is formed.
+        """
+        expert = tl.program_id(0)
+        row_block = tl.program_id(1)
+        hidden_block = tl.program_id(2)
+        rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = hidden_block * BLOCK_H + tl.arange(0, BLOCK_H)
+        row_mask = rows < N
+        col_mask = cols < HIDDEN
+        matrix_mask = row_mask[:, None] & col_mask[None, :]
+        grad_surface = tl.load(
+            grad_surface_ptr
+            + rows[:, None] * HIDDEN
+            + cols[None, :],
+            mask=matrix_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        # The same grad_surface tile is reused for all modes.  This keeps the
+        # hidden projection read traffic close to one pass per expert/block.
+        for mode in tl.range(0, NUM_MODES):
+            coefficient = tl.zeros((BLOCK_M,), dtype=tl.float32)
+            for slot in tl.range(0, TOP_K):
+                routed_expert = tl.load(
+                    expert_idx_ptr + rows * TOP_K + slot,
+                    mask=row_mask,
+                    other=0,
+                ).to(tl.int32)
+                weight = tl.load(
+                    selected_weights_ptr + rows * TOP_K + slot,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                mode_value = tl.load(
+                    modes_ptr + (rows * TOP_K + slot) * NUM_MODES + mode,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                coefficient += tl.where(
+                    routed_expert == expert,
+                    weight * mode_value,
+                    0.0,
+                )
+            partial = tl.sum(
+                grad_surface * coefficient[:, None],
+                axis=0,
+            )
+            tl.atomic_add(
+                grad_spline_out_ptr
+                + (expert * NUM_MODES + mode) * HIDDEN
+                + cols,
+                partial,
+                mask=col_mask,
+            )
+
+        for d in tl.range(0, D_SEED):
+            coefficient = tl.zeros((BLOCK_M,), dtype=tl.float32)
+            for slot in tl.range(0, TOP_K):
+                routed_expert = tl.load(
+                    expert_idx_ptr + rows * TOP_K + slot,
+                    mask=row_mask,
+                    other=0,
+                ).to(tl.int32)
+                weight = tl.load(
+                    selected_weights_ptr + rows * TOP_K + slot,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                z_value = tl.load(
+                    z_ptr + rows * D_SEED + d,
+                    mask=row_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                coefficient += tl.where(
+                    routed_expert == expert,
+                    weight * z_value,
+                    0.0,
+                )
+            partial = tl.sum(
+                grad_surface * coefficient[:, None],
+                axis=0,
+            )
+            tl.atomic_add(
+                grad_residual_out_ptr
+                + (expert * D_SEED + d) * HIDDEN
+                + cols,
+                partial,
+                mask=col_mask,
             )
 
 
@@ -1460,34 +2185,78 @@ def _run_jtok_triton(
             )
         return output
 
-    surface = torch.empty_like(delta)
+    # Keep the wide-path surface in FP32.  The forward kernel reduces its
+    # squared norm before the activation-dtype write-back; retaining the
+    # pre-cast surface here lets the tiled backward use the same value for the
+    # normalization derivative without rebuilding a Torch reference graph.
+    # A compact [tokens, top_k, modes] mode buffer is much smaller than the
+    # former dense expert surface and avoids recalculating the B-spline
+    # product for every hidden tile.  It is intentionally scoped to this
+    # invocation rather than retained by the autograd context.
+    modes_buffer = torch.empty(
+        (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
+    )
+    modes_grid = (n_tokens * top_k * modes,)
+    if has_mask:
+        _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+            z,
+            spline_coeff,
+            knot_grid,
+            expert_idx,
+            valid_mask,
+            modes_buffer,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            KNOT_PAD=knot_pad,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
+            z,
+            spline_coeff,
+            knot_grid,
+            expert_idx,
+            modes_buffer,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            KNOT_PAD=knot_pad,
+            num_warps=4,
+            num_stages=1,
+        )
+    surface = torch.empty(
+        (n_tokens, hidden), device=delta.device, dtype=torch.float32
+    )
     norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
     output = torch.empty_like(delta)
-    # The general fused path removes the transient [tokens, top_k, modes]
-    # activation and keeps the mode product inside the output tile.  The
-    # single-tile path above additionally folds final normalization/modulation
-    # into that same Triton boundary when the full hidden row fits safely.
+    # The wide path keeps only the compact [tokens, top_k, modes] mode
+    # activation.  It is negligible relative to a dense expert surface and
+    # prevents the B-spline product from being recomputed for every hidden
+    # tile.  The single-tile path above still folds final
+    # normalization/modulation into one Triton boundary.
     block_n = min(256, triton.next_power_of_2(hidden))
     project_grid = (n_tokens, triton.cdiv(hidden, block_n))
-    _jtok_wrap_kernel(_jtok_project_fused_kernel)[project_grid](
+    _jtok_wrap_kernel(_jtok_project_kernel)[project_grid](
         z,
-        spline_coeff,
-        knot_grid,
+        modes_buffer,
         spline_out,
         residual_out,
         expert_idx,
         selected_weights,
-        valid_mask,
         surface,
         norm,
         n_tokens,
         D_SEED=d_seed,
-        NUM_KNOTS=knots,
+        HIDDEN=hidden,
         NUM_MODES=modes,
         TOP_K=top_k,
-        HIDDEN=hidden,
         BLOCK_N=block_n,
-        KNOT_PAD=knot_pad,
         HAS_MASK=has_mask,
         num_warps=4,
         num_stages=1,
@@ -1545,13 +2314,16 @@ def _run_jtok_backward_triton(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run the compact single-tile backward for common hidden sizes.
+    """Run the Triton backward for both compact and wide hidden rows.
 
     Parameter gradients accumulate into small FP32 workspaces and are cast
     only after the kernel completes.  The workspaces are proportional to the
     trainable surface parameters, not to ``tokens × experts × modes × hidden``.
-    For wider rows the caller deliberately keeps the reference recomputation
-    until a multi-tile norm reduction is validated.
+    Hidden sizes up to 256 use one complete-row program.  Wider rows use a
+    two-pass tiled reduction: the first pass writes the selected FP32 surface
+    and row norm, and the second pass accumulates parameter gradients per
+    hidden tile.  There is deliberately no Torch/autograd fallback in this
+    registered external-kernel path.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is not installed")
@@ -1573,12 +2345,6 @@ def _run_jtok_backward_triton(
         raise ValueError("selected_weights and expert_idx must have the same shape")
     if valid_mask.numel() not in (0, int(delta.shape[0])):
         raise ValueError("valid_mask has the wrong number of elements")
-    if hidden > 256:
-        raise NotImplementedError(
-            "compact JTok backward currently requires hidden <= 256; "
-            "the audited reference backward handles wider rows"
-        )
-
     n_tokens = int(delta.shape[0])
     grad_delta = torch.empty_like(delta)
     # The kernel accumulates all shared gradients in FP32.  This also avoids
@@ -1610,41 +2376,198 @@ def _run_jtok_backward_triton(
             grad_weights,
         )
 
-    block_h = triton.next_power_of_2(hidden)
-    _jtok_wrap_kernel(_jtok_backward_single_tile_kernel)[(n_tokens,)](
-        delta,
-        z,
-        spline_coeff,
-        knot_grid,
-        spline_out,
-        residual_out,
-        expert_idx,
-        selected_weights,
-        scaler,
-        grad_out,
-        valid_mask,
-        grad_delta,
-        grad_z_accum,
-        grad_coeff_accum,
-        grad_spline_out_accum,
-        grad_residual_out_accum,
-        grad_scaler_accum,
-        grad_weights,
-        n_tokens,
-        D_SEED=d_seed,
-        NUM_KNOTS=knots,
-        NUM_MODES=modes,
-        TOP_K=top_k,
-        HIDDEN=hidden,
-        BLOCK_H=block_h,
-        KNOT_PAD=triton.next_power_of_2(knots),
-        NORM_EPS=float(norm_eps),
-        RESIDUAL_SCALE=float(residual_scale),
-        MIXTURE=bool(mixture),
-        HAS_MASK=bool(valid_mask.numel()),
-        num_warps=4,
-        num_stages=1,
-    )
+    if hidden <= 256:
+        block_h = triton.next_power_of_2(hidden)
+        _jtok_wrap_kernel(_jtok_backward_single_tile_kernel)[(n_tokens,)](
+            delta,
+            z,
+            spline_coeff,
+            knot_grid,
+            spline_out,
+            residual_out,
+            expert_idx,
+            selected_weights,
+            scaler,
+            grad_out,
+            valid_mask,
+            grad_delta,
+            grad_z_accum,
+            grad_coeff_accum,
+            grad_spline_out_accum,
+            grad_residual_out_accum,
+            grad_scaler_accum,
+            grad_weights,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            HIDDEN=hidden,
+            BLOCK_H=block_h,
+            KNOT_PAD=triton.next_power_of_2(knots),
+            NORM_EPS=float(norm_eps),
+            RESIDUAL_SCALE=float(residual_scale),
+            MIXTURE=bool(mixture),
+            HAS_MASK=bool(valid_mask.numel()),
+            PARAM_GRADS=True,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        # Every hidden tile contributes to the same token-level gradient
+        # tensors, so the wide path starts the routing-weight gradient at zero
+        # and uses FP32 atomics in the second pass.
+        grad_weights.zero_()
+        modes_buffer = torch.empty(
+            (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
+        )
+        # Wide hidden rows accumulate mode and residual contractions once per
+        # hidden tile, then finish the B-spline derivative once per token.
+        # These FP32 buffers are compact: their size is independent of hidden.
+        grad_mode_buffer = torch.zeros(
+            (n_tokens, top_k, modes), device=delta.device, dtype=torch.float32
+        )
+        grad_residual_buffer = torch.zeros(
+            (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
+        )
+        modes_grid = (n_tokens * top_k * modes,)
+        if valid_mask.numel():
+            _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                valid_mask,
+                modes_buffer,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=triton.next_power_of_2(knots),
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                modes_buffer,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=triton.next_power_of_2(knots),
+                num_warps=4,
+                num_stages=1,
+            )
+        surface = torch.empty(
+            (n_tokens, hidden), device=delta.device, dtype=torch.float32
+        )
+        norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
+        block_h = min(256, triton.next_power_of_2(hidden))
+        project_grid = (n_tokens, triton.cdiv(hidden, block_h))
+        _jtok_wrap_kernel(_jtok_project_kernel)[project_grid](
+            z,
+            modes_buffer,
+            spline_out,
+            residual_out,
+            expert_idx,
+            selected_weights,
+            surface,
+            norm,
+            n_tokens,
+            D_SEED=d_seed,
+            HIDDEN=hidden,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            BLOCK_N=block_h,
+            HAS_MASK=bool(valid_mask.numel()),
+            num_warps=4,
+            num_stages=1,
+        )
+        _jtok_wrap_kernel(_jtok_backward_multi_tile_fast_kernel)[project_grid](
+            delta,
+            z,
+            spline_out,
+            residual_out,
+            expert_idx,
+            selected_weights,
+            modes_buffer,
+            grad_mode_buffer,
+            grad_residual_buffer,
+            scaler,
+            surface,
+            norm,
+            grad_out,
+            valid_mask,
+            grad_delta,
+            grad_scaler_accum,
+            grad_weights,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            HIDDEN=hidden,
+            BLOCK_H=block_h,
+            NORM_EPS=float(norm_eps),
+            RESIDUAL_SCALE=float(residual_scale),
+            MIXTURE=bool(mixture),
+            HAS_MASK=bool(valid_mask.numel()),
+            num_warps=4,
+            num_stages=1,
+        )
+        token_projection_grid = (n_tokens, top_k, d_seed)
+        _jtok_wrap_kernel(_jtok_backward_token_projection_grad_kernel)[
+            token_projection_grid
+        ](
+            z,
+            spline_coeff,
+            knot_grid,
+            expert_idx,
+            modes_buffer,
+            grad_mode_buffer,
+            grad_residual_buffer,
+            valid_mask,
+            grad_z_accum,
+            grad_coeff_accum,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            KNOT_PAD=triton.next_power_of_2(knots),
+            HAS_MASK=bool(valid_mask.numel()),
+            num_warps=4,
+            num_stages=1,
+        )
+        projection_grid = (
+            experts,
+            triton.cdiv(n_tokens, 32),
+            triton.cdiv(hidden, 128),
+        )
+        _jtok_wrap_kernel(_jtok_backward_projection_grad_kernel)[projection_grid](
+            surface,
+            z,
+            modes_buffer,
+            expert_idx,
+            selected_weights,
+            grad_spline_out_accum,
+            grad_residual_out_accum,
+            n_tokens,
+            D_SEED=d_seed,
+            HIDDEN=hidden,
+            NUM_EXPERTS=experts,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            BLOCK_M=32,
+            BLOCK_H=128,
+            num_warps=4,
+            num_stages=1,
+        )
     return (
         grad_delta,
         grad_z_accum.to(z.dtype),
@@ -2051,62 +2974,27 @@ def _jtok_backward(ctx: Any, grad_out: torch.Tensor):
         selected_weights,
         valid_mask,
     ) = ctx.saved_tensors
-    if _EXPERIMENT_FORMULA_BACKWARD and delta.is_cuda:
-        grads = _run_jtok_backward_formula(
-            grad_out,
-            delta,
-            z,
-            spline_coeff,
-            spline_out,
-            residual_out,
-            scaler,
-            expert_idx,
-            selected_weights,
-            knot_grid,
-            valid_mask,
-            norm_eps=float(ctx.norm_eps),
-            residual_scale=0.0,
-            mixture=False,
-        )[:6]
-        return (*grads, None, None, None, None, None)
-    if (
-        _TRITON_AVAILABLE
-        and _EXPERIMENT_COMPACT_BACKWARD
-        and delta.is_cuda
-        and delta.shape[-1] <= 256
-    ):
-        grads = _jtok_backward_op(
-            grad_out,
-            delta,
-            z,
-            spline_coeff,
-            spline_out,
-            residual_out,
-            scaler,
-            expert_idx,
-            selected_weights,
-            knot_grid,
-            valid_mask,
-            float(ctx.norm_eps),
-            0.0,
-            False,
-        )[:6]
-    else:
-        grads = _autograd_recompute(
-            lambda d, zz, c, so, ro, s: jtok_reference(
-                d,
-                zz,
-                c,
-                so,
-                ro,
-                s,
-                knot_grid,
-                valid_mask=(valid_mask if valid_mask.numel() else None),
-                norm_eps=ctx.norm_eps,
-            ),
-            (delta, z, spline_coeff, spline_out, residual_out, scaler),
-            grad_out,
+    if not (_TRITON_AVAILABLE and delta.is_cuda):
+        raise RuntimeError(
+            "The registered JTok kernel backward requires CUDA and Triton; "
+            "the external-kernel path never falls back to the Torch reference."
         )
+    grads = _jtok_backward_op(
+        grad_out,
+        delta,
+        z,
+        spline_coeff,
+        spline_out,
+        residual_out,
+        scaler,
+        expert_idx,
+        selected_weights,
+        knot_grid,
+        valid_mask,
+        float(ctx.norm_eps),
+        0.0,
+        False,
+    )[:6]
     return (*grads, None, None, None, None, None)
 
 
@@ -2216,71 +3104,27 @@ def _jtokm_backward(ctx: Any, grad_out: torch.Tensor):
         valid_mask,
     ) = ctx.saved_tensors
 
-    if _EXPERIMENT_FORMULA_BACKWARD and delta.is_cuda:
-        grads = _run_jtok_backward_formula(
-            grad_out,
-            delta,
-            z,
-            spline_coeff,
-            spline_out,
-            residual_out,
-            scaler,
-            expert_idx,
-            selected_weights,
-            knot_grid,
-            valid_mask,
-            norm_eps=float(ctx.norm_eps),
-            residual_scale=float(ctx.residual_scale),
-            mixture=True,
+    if not (_TRITON_AVAILABLE and delta.is_cuda):
+        raise RuntimeError(
+            "The registered JTok-M kernel backward requires CUDA and Triton; "
+            "the external-kernel path never falls back to the Torch reference."
         )
-    elif (
-        _TRITON_AVAILABLE
-        and _EXPERIMENT_COMPACT_BACKWARD
-        and delta.is_cuda
-        and delta.shape[-1] <= 256
-    ):
-        grads = _jtok_backward_op(
-            grad_out,
-            delta,
-            z,
-            spline_coeff,
-            spline_out,
-            residual_out,
-            scaler,
-            expert_idx,
-            selected_weights,
-            knot_grid,
-            valid_mask,
-            float(ctx.norm_eps),
-            float(ctx.residual_scale),
-            True,
-        )
-    else:
-        def reference(d, zz, c, so, ro, s, w):
-            mixed = _selected_surface_reference(
-                zz,
-                expert_idx,
-                w,
-                c,
-                so,
-                ro,
-                knot_grid,
-                d.dtype,
-            )
-            mask = (
-                _valid_mask(valid_mask, d.shape[0], d.device)
-                if valid_mask.numel()
-                else torch.ones(d.shape[0], device=d.device, dtype=torch.bool)
-            )
-            direction = mixed / (mixed.norm(dim=-1, keepdim=True) + ctx.norm_eps)
-            update = d + ctx.residual_scale * s.to(d.dtype) * direction
-            return torch.where(mask.unsqueeze(-1), update, d)
-
-        grads = _autograd_recompute(
-            reference,
-            (delta, z, spline_coeff, spline_out, residual_out, scaler, selected_weights),
-            grad_out,
-        )
+    grads = _jtok_backward_op(
+        grad_out,
+        delta,
+        z,
+        spline_coeff,
+        spline_out,
+        residual_out,
+        scaler,
+        expert_idx,
+        selected_weights,
+        knot_grid,
+        valid_mask,
+        float(ctx.norm_eps),
+        float(ctx.residual_scale),
+        True,
+    )
     d_delta, d_z, d_coeff, d_spline_out, d_residual_out, d_scaler, d_weights = grads
     return (
         d_delta,
