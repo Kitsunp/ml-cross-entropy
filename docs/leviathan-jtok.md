@@ -884,3 +884,67 @@ model-free CUDA suite for the accepted source passed `43` tests with two
 deselected custom-op checks.  This table is the authoritative baseline for
 the next JTok/JTok-M optimization; no speed claim is made for the rejected
 compact-route candidate.
+
+### Accepted experiment: autotuned route-shared JTok-M mode evaluation (2026-09-08)
+
+The wide JTok-M mode evaluator already had a route-shared kernel,
+`_jtok_modes_kernel_route_vectorized`, but its launch was fixed at
+`num_warps=4, num_stages=1`. That resource choice is not uniformly good: the
+full NeoLLM geometry has two selected routes per token and a small mode tile,
+while other geometries can have a larger route/mode surface. The accepted
+change puts only this kernel behind a small geometry-keyed Triton autotuner:
+
+```text
+num_warps=2, num_stages=1
+num_warps=2, num_stages=2
+num_warps=4, num_stages=1
+num_warps=8, num_stages=1
+```
+
+The key contains `N`, `D_SEED`, `NUM_KNOTS`, `NUM_MODES`, `TOP_K`, the padded
+knot/mode widths, and the mask flag. Triton benchmarks the candidates only on
+the first occurrence of a geometry in that process and reuses the selected
+configuration afterward. No tensor layout, equation, workspace contract,
+backward accumulation, or compile policy changed. The route-shared path is
+selected only for `TOP_K=2`; ordinary JTok in the supplied configuration uses
+`TOP_K=1` and remains on `_jtok_modes_kernel_vectorized`.
+
+The model-free full-geometry CUDA measurement used BF16,
+`N=32768`, `hidden=512`, `D_SEED=128`, `knots=16`, `modes=4`, and `TOP_K=2`.
+Forward plus backward changed from `9.301 ms` with the fixed route launch to
+`8.984 ms` with the autotuned route launch (`-3.4%`). A forced masked-route
+reference was `14.567 ms`; it is a dispatch comparison, not an attribution of
+that entire gap to autotuning. Peak allocated memory stayed at about
+`0.644 GiB`; the process reserved about `0.902 GiB` after the autotune
+compilation cache was populated.
+
+The focused model-free CUDA tests passed `44` tests with two unrelated custom-
+op checks deselected. The new dispatch test does not import NeoLLM or its
+configuration: it exercises the real flattened JTok-M geometry, records the
+launch, and fails if the route-shared kernel silently falls back to the masked
+evaluator.
+
+The complete NeoLLM flow was then run in the same remote environment with seed
+`1729`, BF16, batch `64`, sequence `512`, 12 Transformer layers, CCE,
+AdEMAMix, `torch.compile(mode="max-autotune")`, MXFP8 inactive, Delta
+inactive, 150 training steps, 10 validation steps, and a profile on the final
+step. The stable training result was:
+
+| JTok-M full flow | stable step median | stable p95 | stable steps/s | validation median | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| route-shared autotuned | 324.303 ms | 327.954 ms | 3.0836 | 139.291 ms | 20.424 GiB | 21.760 GiB |
+
+The profile contained 12 `_jtok_modes_kernel_route_vectorized` calls totaling
+`6.68 ms`, and no `jtok_reference` event. The older complete-flow record in
+this document reported `568.981 ms` and `1.7575 steps/s`, but its trace used
+the masked evaluator (`24` calls, `168.127 ms`). Therefore that larger
+difference is recorded as a dispatch/path correction plus the new launch
+autotuning, not as the isolated effect of the four autotune candidates. The
+new run reduced reserved memory relative to that record from `22.273` to
+`21.760 GiB`; allocated memory remained effectively unchanged at about
+`20.424 GiB`.
+
+The implementation does not alter Leviathan, CCE, the tokenizer, model
+configuration, optimizer flags, MXFP8, or the global `torch.compile` policy.
+It also does not add a fallback reference path: the Triton backend remains
+mandatory for the registered JTok/JTok-M CUDA operations.

@@ -141,10 +141,24 @@ if _TRITON_AVAILABLE:
         triton.Config({}, num_warps=8, num_stages=1),
         triton.Config({}, num_warps=4, num_stages=2),
     ]
+    # JTok-M's route-shared mode evaluator has a different resource balance
+    # from the backward reductions.  In the full NeoLLM geometry the fixed
+    # four-warp launch leaves substantial issue width unused; two warps win on
+    # the RTX 5090 while larger route/mode surfaces can prefer four or eight.
+    # Keep this candidate set small because the first occurrence of a new
+    # geometry benchmarks it once and caches the winner in Triton's process
+    # local autotune table.
+    _JTOK_ROUTE_MODE_CONFIGS = [
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ]
 else:  # pragma: no cover - CPU-only installations do not import Triton
     _JTOK_WIDE_BACKWARD_CONFIGS = []
     _JTOK_PROJECTION_GRAD_CONFIGS = []
     _JTOK_TOKEN_PROJECTION_CONFIGS = []
+    _JTOK_ROUTE_MODE_CONFIGS = []
 _USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
 
 
@@ -934,6 +948,19 @@ if _TRITON_AVAILABLE:
             mask=row_mask & mode_mask,
         )
 
+    @triton.autotune(
+        configs=_JTOK_ROUTE_MODE_CONFIGS,
+        key=[
+            "N",
+            "D_SEED",
+            "NUM_KNOTS",
+            "NUM_MODES",
+            "TOP_K",
+            "KNOT_PAD",
+            "MODE_PAD",
+            "HAS_MASK",
+        ],
+    )
     @triton.jit
     def _jtok_modes_kernel_route_vectorized(
         z_ptr,
@@ -2961,8 +2988,6 @@ def _run_jtok_triton(
             KNOT_PAD=knot_pad,
             MODE_PAD=triton.next_power_of_2(modes),
             HAS_MASK=has_mask,
-            num_warps=4,
-            num_stages=1,
         )
     elif _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
         mode_grid = (n_tokens * top_k,)

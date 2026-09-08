@@ -529,6 +529,92 @@ def test_jtokm_route_vectorized_full_geometry_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_full_geometry_dispatches_route_shared_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the real JTok-M launch flow selects the shared-basis kernel.
+
+    This is deliberately model-free: it exercises the same flattened
+    ``N=32768, hidden=512, d_seed=128, knots=16, modes=4, top_k=2`` contract
+    used by NeoLLM, while replacing the launch wrapper with a recorder.  The
+    numerical route test above checks the kernel itself; this test protects
+    the transformation/dispatch boundary from silently returning to the
+    one-program-per-route masked evaluator.
+    """
+    from cut_cross_entropy.leviathan.jtok import _run_jtok_triton
+
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=7,
+        hidden=512,
+        d_seed=128,
+        knots=16,
+        modes=4,
+        experts=5,
+    )
+    expert_idx = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 4], [4, 0], [0, 2], [1, 3]],
+        device="cuda",
+        dtype=torch.long,
+    )
+    selected_weights = torch.full(
+        (7, 2), 0.5, device="cuda", dtype=torch.float32
+    )
+    valid_mask = torch.ones(7, device="cuda", dtype=torch.bool)
+    valid_mask[3] = False
+    launches: list[tuple[str, tuple[int, ...]]] = []
+
+    class _LaunchRecorder:
+        def __init__(self, kernel) -> None:
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs) -> None:
+                del args, kwargs
+                name = getattr(
+                    getattr(self.kernel, "fn", None),
+                    "__name__",
+                    getattr(self.kernel, "__name__", type(self.kernel).__name__),
+                )
+                launches.append((name, tuple(grid) if isinstance(grid, tuple) else ()))
+
+            return launch
+
+    monkeypatch.setattr(
+        jtok_impl,
+        "_jtok_wrap_kernel",
+        lambda kernel: _LaunchRecorder(kernel),
+    )
+
+    output, modes = _run_jtok_triton(
+        values["delta"],
+        values["z"],
+        values["coeff"],
+        values["spline_out"],
+        values["residual_out"],
+        values["scaler"],
+        values["grid"],
+        expert_idx,
+        selected_weights,
+        valid_mask,
+        norm_eps=1e-6,
+        residual_scale=0.1,
+        mixture=True,
+    )
+
+    assert output.shape == values["delta"].shape
+    assert modes.shape == (7, 2, 4)
+    route_launches = [
+        (name, grid)
+        for name, grid in launches
+        if "route_vectorized" in name
+    ]
+    assert route_launches == [("_jtok_modes_kernel_route_vectorized", (7,))]
+    assert not any("modes_kernel_masked" in name for name, _ in launches)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_jtokm_triton_general_path_handles_hidden_above_single_tile() -> None:
     """Check the global normalization reduction on a genuinely wide row.
 
