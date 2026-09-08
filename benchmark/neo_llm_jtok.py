@@ -17,6 +17,10 @@ surface operation.
 The benchmark uses ``torch.compile(mode="max-autotune")`` only when
 ``--compiled`` is requested.  It does not change a process-global compiler
 policy, optimizer configuration, MXFP8 state, tokenizer, or checkpoint.
+Use ``--fullgraph`` or ``--disable-cudagraphs`` only to isolate a compiler
+case.  The latter is not part of the user's training command.  Set
+``--inductor-cache-dir`` to a new directory when a cold-cache failure must be
+reproduced; otherwise a reused generated graph can hide a capture problem.
 
 Example in the existing remote environment::
 
@@ -24,6 +28,16 @@ Example in the existing remote environment::
         --modeling-file /modeling_neollm.py \
         --configuration-file /configuration_neollm.py \
         --variant jtokm --backend both --compiled --optimizer-step
+
+To record a known model-level capture failure without treating it as a kernel
+crash::
+
+    /venv/main/bin/python benchmark/neo_llm_jtok.py \
+        --modeling-file /modeling_neollm.py \
+        --configuration-file /configuration_neollm.py \
+        --variant jtok --backend triton --compiled \
+        --inductor-cache-dir /tmp/neo-jtok-cold \
+        --expected-status error
 
 There is no VRAM limit by default.  ``--memory-limit-gib`` is an optional
 process-level benchmark guard and is never read by the kernel.
@@ -35,9 +49,11 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import statistics
 import sys
 import time
+import traceback
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterable
@@ -305,6 +321,15 @@ def _zero_grad(model: nn.Module) -> None:
         parameter.grad = None
 
 
+def _snapshot_scalar(value: torch.Tensor) -> torch.Tensor:
+    """Keep a benchmark scalar alive across later CUDA-Graph replays."""
+    # ``detach()`` alone still aliases a CUDAGraph output buffer.  A later
+    # replay may recycle that buffer before the report serializes it.  The
+    # clone is deliberately outside the compiled boundary and is not part of
+    # the model's training or inference graph.
+    return value.detach().clone()
+
+
 def _one_step(
     callable_model: Callable[..., torch.Tensor],
     model: nn.Module,
@@ -332,10 +357,10 @@ def _one_step(
         # invocation.  Clone only the benchmark's retained report value,
         # outside the compiled model, instead of inserting a graph-boundary
         # marker into the model's training path.
-        return loss.detach().clone()
+        return _snapshot_scalar(loss)
     with torch.no_grad():
         with torch.profiler.record_function("neo_llm.inference.prefill"):
-            return callable_model(input_ids, attention_mask, labels).detach()
+            return _snapshot_scalar(callable_model(input_ids, attention_mask, labels))
 
 
 def _measure_step(
@@ -380,7 +405,7 @@ def _measure_step(
         start.elapsed_time(forward_done),
         forward_done.elapsed_time(backward_done),
         start.elapsed_time(end),
-        loss.detach(),
+        _snapshot_scalar(loss),
     )
 
 
@@ -473,7 +498,17 @@ def _run_backend(
     )
     callable_model: Callable[..., torch.Tensor] = wrapper
     if args.compiled:
-        callable_model = torch.compile(wrapper, mode=COMPILE_MODE)
+        compile_kwargs: dict[str, Any] = {"fullgraph": args.fullgraph}
+        if args.disable_cudagraphs:
+            # Torch 2.14 does not permit ``mode`` and ``options`` together.
+            # Express max-autotune explicitly for this benchmark call only.
+            compile_kwargs["options"] = {
+                "max_autotune": True,
+                "triton.cudagraphs": False,
+            }
+        else:
+            compile_kwargs["mode"] = COMPILE_MODE
+        callable_model = torch.compile(wrapper, **compile_kwargs)
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -539,6 +574,7 @@ def _run_backend(
         None,
     )
     return {
+        "status": "pass",
         "backend": backend,
         "model_jtok_kernel_backend": getattr(
             jtok_module,
@@ -555,6 +591,8 @@ def _run_backend(
         },
         "compiled": args.compiled,
         "compile_mode": COMPILE_MODE if args.compiled else None,
+        "fullgraph": args.fullgraph if args.compiled else None,
+        "disable_cudagraphs": args.disable_cudagraphs,
         "mode": args.mode,
         "variant": args.variant,
         "shape": [args.batch, args.sequence, args.hidden],
@@ -613,6 +651,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("torch", "triton", "both"), default="both")
     parser.add_argument("--mode", choices=("inference", "training"), default="training")
     parser.add_argument("--compiled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fullgraph", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--disable-cudagraphs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass triton.cudagraphs=False only to this torch.compile call.",
+    )
+    parser.add_argument(
+        "--expected-status",
+        choices=("any", "pass", "error"),
+        default="any",
+        help="Regression expectation for the optional model integration.",
+    )
     parser.add_argument("--optimizer-step", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=128)
@@ -643,6 +694,12 @@ def _parse_args() -> argparse.Namespace:
         default=Path("benchmark/results/neo_jtok_profiles"),
     )
     parser.add_argument("--memory-limit-gib", type=float, default=None)
+    parser.add_argument(
+        "--inductor-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional per-run TORCHINDUCTOR_CACHE_DIR for cold-cache reproduction.",
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
     if args.batch < 1 or args.sequence < 1 or args.layers < 1:
@@ -664,6 +721,8 @@ def _parse_args() -> argparse.Namespace:
     if args.warmup < 0 or args.steps < 1:
         raise ValueError("warmup must be non-negative and steps must be positive")
     args.dtype = _dtype(args.dtype)
+    if args.fullgraph and not args.compiled:
+        raise ValueError("--fullgraph requires --compiled")
     return args
 
 
@@ -672,6 +731,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA; local CPU execution is not supported")
     _set_memory_guard(args.memory_limit_gib)
+    if args.inductor_cache_dir is not None:
+        args.inductor_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(args.inductor_cache_dir)
     _seed_everything(args.seed)
     torch.set_float32_matmul_precision("high")
 
@@ -680,34 +742,63 @@ def main() -> None:
         args.modeling_file,
     )
     backends = ("torch", "triton") if args.backend == "both" else (args.backend,)
-    results = []
+    results: list[dict[str, Any]] = []
     for backend in backends:
-        results.append(
-            _run_backend(
-                args,
-                backend=backend,
-                configuration_module=configuration_module,
-                modeling_module=modeling_module,
+        try:
+            results.append(
+                _run_backend(
+                    args,
+                    backend=backend,
+                    configuration_module=configuration_module,
+                    modeling_module=modeling_module,
+                )
             )
-        )
+        except Exception as exc:
+            results.append(
+                {
+                    "status": "error",
+                    "backend": backend,
+                    "compiled": args.compiled,
+                    "fullgraph": args.fullgraph if args.compiled else None,
+                    "disable_cudagraphs": args.disable_cudagraphs,
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                    "traceback_tail": traceback.format_exc().splitlines()[-32:],
+                }
+            )
+            # A failed CUDA capture can invalidate the process CUDA context;
+            # do not launch the next backend after that failure.
+            break
     report: dict[str, Any] = {
         "seed": args.seed,
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "cuda_runtime": torch.version.cuda,
         "compile_mode": COMPILE_MODE,
+        "expected_status": args.expected_status,
         "memory_limit_gib_benchmark_only": args.memory_limit_gib,
+        "inductor_cache_dir": (
+            str(args.inductor_cache_dir) if args.inductor_cache_dir is not None else None
+        ),
         "source_files": {
             "modeling": str(args.modeling_file),
             "configuration": str(args.configuration_file),
         },
         "results": results,
     }
+    statuses = [item.get("status", "pass") for item in results]
+    report["status"] = "error" if "error" in statuses else "pass"
     encoded = json.dumps(report, indent=2, sort_keys=True)
     print(encoded)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(encoded + "\n", encoding="utf-8")
+    if args.expected_status != "any" and report["status"] != args.expected_status:
+        raise SystemExit(
+            f"Expected status {args.expected_status!r}, received {report['status']!r}."
+        )
+    if args.expected_status == "any" and report["status"] != "pass":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,9 @@ The implementation has two layers:
 * The CUDA path uses a fused selected-mode/output projection and a general
   final normalization/modulation stage.  When one hidden tile is sufficient,
   the latter is folded into the same Triton launch.  It never materializes
-  ``[tokens, experts, modes, hidden]`` or the former ``[tokens, K, modes]``
-  mode workspace.  The mode product is accumulated inside each output tile.
+  ``[tokens, experts, modes, hidden]``; the wide route uses only a compact
+  ``[tokens, top_k, modes]`` mode workspace.  The mode product is accumulated
+  inside each output tile.
 
 On Torch 2.14 the operation is registered with ``torch.library.triton_op`` so
 the wrapped Triton launches are visible to ``torch.compile`` at the explicit
@@ -78,7 +79,33 @@ _SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 _BASIS_EPS = 1e-12
 _PRODUCT_LOG_EPS = 1e-9
 _DEFAULT_NORM_EPS = 1e-6
+# The compact wide path is faster at the boundary itself because it computes
+# the B-spline mode product once per token/route instead of once per hidden
+# lane.  Keep the dispatch boundary in one named constant so forward and
+# backward cannot silently diverge when the tile policy is revisited.
+_SINGLE_TILE_HIDDEN_LIMIT = 256
+# The token-local spline derivative kernel can process all seed coordinates in
+# one program.  Bound its register/work footprint by the padded coefficient
+# tile rather than by a model-specific batch or hidden size.  This admits the
+# real NeoLLM geometry (d_seed=128, knots=16, modes=4) while keeping larger
+# spline surfaces on the established scalar-grid path.
+_TOKEN_PROJECTION_BLOCK_WORK_LIMIT = 8192
 _USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
+
+
+def _can_use_vectorized_token_projection(
+    d_seed: int,
+    knots: int,
+    modes: int,
+) -> bool:
+    """Return whether the compact token-gradient block fits its work budget."""
+    if d_seed < 1 or knots < 1 or modes < 1:
+        return False
+    knot_pad = 1 << (int(knots) - 1).bit_length()
+    return (
+        d_seed <= 128
+        and d_seed * knot_pad * modes <= _TOKEN_PROJECTION_BLOCK_WORK_LIMIT
+    )
 
 
 def _jtok_op_decorator(name: str):
@@ -884,9 +911,10 @@ if _TRITON_AVAILABLE:
 
         The reduction is valid only when one program owns the complete hidden
         row.  The Python dispatcher therefore selects this kernel only for
-        ``hidden <= 256``; wider rows use the general surface/norm/finalize
-        sequence above.  Keeping this condition explicit avoids a hidden
-        cross-tile reduction and preserves the odd-geometry contract.
+        ``hidden < 256``; the boundary itself uses the compact
+        surface/norm/finalize sequence above.  Keeping this condition explicit
+        avoids a hidden cross-tile reduction and preserves the odd-geometry
+        contract.
         """
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK_N)
@@ -1031,7 +1059,7 @@ if _TRITON_AVAILABLE:
         """Recompute one complete row and accumulate its backward gradients.
 
         This kernel intentionally handles only one hidden tile per token.  It
-        is used when ``HIDDEN <= 256`` so the norm reduction is local and no
+        is used when ``HIDDEN < 256`` so the norm reduction is local and no
         ``[tokens, top_k, modes, hidden]`` or per-token parameter-gradient
         workspace is needed.  Wider rows use the multi-tile Triton reduction
         below, so the registered external path remains kernel-only for every
@@ -1699,6 +1727,7 @@ if _TRITON_AVAILABLE:
         RESIDUAL_SCALE: tl.constexpr,
         MIXTURE: tl.constexpr,
         HAS_MASK: tl.constexpr,
+        SINGLE_HIDDEN_TILE: tl.constexpr,
     ):
         """Wide backward pass with token-local scalar reductions.
 
@@ -1806,13 +1835,23 @@ if _TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.float32)
                 slot_values += mode_value * out_weight
-                tl.atomic_add(
-                    grad_mode_ptr
-                    + (row * TOP_K + slot) * NUM_MODES
-                    + mode,
-                    tl.sum(grad_value * out_weight, axis=0),
-                    mask=row_valid,
-                )
+                grad_mode_value = tl.sum(grad_value * out_weight, axis=0)
+                if SINGLE_HIDDEN_TILE:
+                    tl.store(
+                        grad_mode_ptr
+                        + (row * TOP_K + slot) * NUM_MODES
+                        + mode,
+                        tl.where(row_valid, grad_mode_value, 0.0),
+                        mask=row_mask,
+                    )
+                else:
+                    tl.atomic_add(
+                        grad_mode_ptr
+                        + (row * TOP_K + slot) * NUM_MODES
+                        + mode,
+                        grad_mode_value,
+                        mask=row_valid,
+                    )
 
             residual_value = tl.zeros((BLOCK_H,), dtype=tl.float32)
             for d in tl.range(0, D_SEED):
@@ -1827,19 +1866,37 @@ if _TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.float32)
                 residual_value += z_value * residual_weight
-                tl.atomic_add(
-                    grad_residual_ptr
-                    + (row * TOP_K + slot) * D_SEED
-                    + d,
-                    tl.sum(grad_value * residual_weight, axis=0),
-                    mask=row_valid,
-                )
+                grad_residual_value = tl.sum(grad_value * residual_weight, axis=0)
+                if SINGLE_HIDDEN_TILE:
+                    tl.store(
+                        grad_residual_ptr
+                        + (row * TOP_K + slot) * D_SEED
+                        + d,
+                        tl.where(row_valid, grad_residual_value, 0.0),
+                        mask=row_mask,
+                    )
+                else:
+                    tl.atomic_add(
+                        grad_residual_ptr
+                        + (row * TOP_K + slot) * D_SEED
+                        + d,
+                        grad_residual_value,
+                        mask=row_valid,
+                    )
             slot_values += residual_value
-            tl.atomic_add(
-                grad_weights_ptr + row * TOP_K + slot,
-                tl.sum(grad_surface * slot_values, axis=0),
-                mask=row_mask,
-            )
+            grad_weight_value = tl.sum(grad_surface * slot_values, axis=0)
+            if SINGLE_HIDDEN_TILE:
+                tl.store(
+                    grad_weights_ptr + row * TOP_K + slot,
+                    grad_weight_value,
+                    mask=row_mask,
+                )
+            else:
+                tl.atomic_add(
+                    grad_weights_ptr + row * TOP_K + slot,
+                    grad_weight_value,
+                    mask=row_mask,
+                )
 
     @triton.jit
     def _jtok_backward_token_projection_grad_kernel(
@@ -1988,6 +2045,175 @@ if _TRITON_AVAILABLE:
             grad_z_ptr + safe_row * D_SEED + d,
             grad_z_value,
             mask=row_mask & row_valid,
+        )
+
+    @triton.jit
+    def _jtok_backward_token_projection_grad_block_kernel(
+        z_ptr,
+        spline_coeff_ptr,
+        grid_ptr,
+        expert_idx_ptr,
+        modes_ptr,
+        grad_mode_ptr,
+        grad_residual_ptr,
+        valid_ptr,
+        grad_z_ptr,
+        grad_coeff_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Vectorized token-local spline gradients for the compact route.
+
+        The scalar kernel above launches one program for every
+        ``(token, route, seed-coordinate)``.  At the measured ``hidden=256``
+        boundary that creates many tiny programs even though the selected
+        JTok-M geometry has only 32 seed coordinates.  The same issue appears
+        in the full NeoLLM geometry (``d_seed=128, knots=16, modes=4``), where
+        the scalar grid multiplies the program count by 128.  This
+        specialization keeps the same equations but processes a power-of-two
+        seed block per ``(token, route)`` program.  The Python dispatcher
+        restricts it by geometry so larger spline surfaces retain the
+        established scalar-grid path.
+        """
+        row = tl.program_id(0)
+        slot = tl.program_id(1)
+        d = tl.arange(0, BLOCK_D)
+        d_mask = d < D_SEED
+        row_mask = row < N
+        safe_row = tl.minimum(row, N - 1)
+        if HAS_MASK:
+            row_valid = tl.load(
+                valid_ptr + safe_row,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        expert = tl.load(
+            expert_idx_ptr + safe_row * TOP_K + slot,
+            mask=row_mask,
+            other=0,
+        ).to(tl.int32)
+        x = tl.load(
+            z_ptr + safe_row * D_SEED + d,
+            mask=row_mask & d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        knot_mask = knot_offsets < NUM_KNOTS
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_mask,
+            other=0.0,
+        ).to(tl.float32)
+        grid_scale = float(max(int(NUM_KNOTS) - 1, 0))
+        diff = x[:, None] - grid[None, :]
+        distance = tl.abs(diff) * grid_scale
+        basis_raw = tl.where(
+            distance < 0.5,
+            0.75 - distance * distance,
+            tl.where(
+                distance < 1.5,
+                0.5 * (1.5 - distance) * (1.5 - distance),
+                0.0,
+            ),
+        )
+        basis_raw = tl.where(knot_mask[None, :], basis_raw, 0.0)
+        sign_x = tl.where(
+            diff > 0.0,
+            1.0,
+            tl.where(diff < 0.0, -1.0, 0.0),
+        )
+        basis_derivative = tl.where(
+            distance < 0.5,
+            -2.0 * distance * grid_scale * sign_x,
+            tl.where(
+                distance < 1.5,
+                -(1.5 - distance) * grid_scale * sign_x,
+                0.0,
+            ),
+        )
+        basis_derivative = tl.where(
+            knot_mask[None, :], basis_derivative, 0.0
+        )
+        raw_sum = tl.sum(basis_raw, axis=1)
+        safe_sum = tl.maximum(raw_sum, 1e-12)
+        grad_z_value = tl.load(
+            grad_residual_ptr
+            + (safe_row * TOP_K + slot) * D_SEED
+            + d,
+            mask=row_mask & d_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        for mode in tl.range(0, NUM_MODES):
+            mode_value = tl.load(
+                modes_ptr + (safe_row * TOP_K + slot) * NUM_MODES + mode,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            grad_mode = tl.load(
+                grad_mode_ptr + (safe_row * TOP_K + slot) * NUM_MODES + mode,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            coeff = tl.load(
+                spline_coeff_ptr
+                + ((expert * NUM_MODES + mode) * D_SEED) * NUM_KNOTS
+                + d[:, None] * NUM_KNOTS
+                + knot_offsets[None, :],
+                mask=(row_mask & d_mask)[:, None] & knot_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            weighted = tl.sum(basis_raw * coeff, axis=1)
+            derivative_sum = tl.sum(basis_derivative, axis=1)
+            derivative_weighted = tl.sum(
+                basis_derivative * coeff,
+                axis=1,
+            )
+            phi = weighted / safe_sum
+            dphi_dz = tl.where(
+                raw_sum > 1e-12,
+                (
+                    derivative_weighted * safe_sum
+                    - weighted * derivative_sum
+                )
+                / (safe_sum * safe_sum),
+                0.0,
+            )
+            phi_sign = tl.where(phi < 0.0, -1.0, 1.0)
+            grad_phi = (
+                grad_mode
+                * mode_value
+                * phi_sign
+                / (tl.abs(phi) + 1e-9)
+            )
+            grad_phi = tl.where(row_valid, grad_phi, 0.0)
+            grad_z_value += grad_phi * dphi_dz
+            tl.atomic_add(
+                grad_coeff_ptr
+                + ((expert * NUM_MODES + mode) * D_SEED) * NUM_KNOTS
+                + d[:, None] * NUM_KNOTS
+                + tl.minimum(knot_offsets, NUM_KNOTS - 1)[None, :],
+                tl.where(
+                    knot_mask[None, :],
+                    grad_phi[:, None] * basis_raw / safe_sum[:, None],
+                    0.0,
+                ),
+                mask=(row_mask & d_mask)[:, None] & knot_mask[None, :],
+            )
+
+        tl.atomic_add(
+            grad_z_ptr + safe_row * D_SEED + d,
+            grad_z_value,
+            mask=row_mask & row_valid & d_mask,
         )
 
     @triton.jit
@@ -2147,7 +2373,7 @@ def _run_jtok_triton(
         raise ValueError("valid_mask has the wrong number of elements")
 
     knot_pad = triton.next_power_of_2(knots)
-    single_tile = hidden <= 256
+    single_tile = hidden < _SINGLE_TILE_HIDDEN_LIMIT
     if single_tile:
         output = torch.empty_like(delta)
         block_n = triton.next_power_of_2(hidden)
@@ -2319,7 +2545,8 @@ def _run_jtok_backward_triton(
     Parameter gradients accumulate into small FP32 workspaces and are cast
     only after the kernel completes.  The workspaces are proportional to the
     trainable surface parameters, not to ``tokens × experts × modes × hidden``.
-    Hidden sizes up to 256 use one complete-row program.  Wider rows use a
+    Hidden sizes below 256 use one complete-row program.  The boundary and
+    wider rows use a
     two-pass tiled reduction: the first pass writes the selected FP32 surface
     and row norm, and the second pass accumulates parameter gradients per
     hidden tile.  There is deliberately no Torch/autograd fallback in this
@@ -2376,7 +2603,7 @@ def _run_jtok_backward_triton(
             grad_weights,
         )
 
-    if hidden <= 256:
+    if hidden < _SINGLE_TILE_HIDDEN_LIMIT:
         block_h = triton.next_power_of_2(hidden)
         _jtok_wrap_kernel(_jtok_backward_single_tile_kernel)[(n_tokens,)](
             delta,
@@ -2415,21 +2642,33 @@ def _run_jtok_backward_triton(
         )
     else:
         # Every hidden tile contributes to the same token-level gradient
-        # tensors, so the wide path starts the routing-weight gradient at zero
-        # and uses FP32 atomics in the second pass.
-        grad_weights.zero_()
+        # tensors.  At the one-tile boundary the fast kernel writes each
+        # token exactly once, so it can skip the memset and use stores for
+        # those token-local workspaces; wider rows retain FP32 atomics.
+        block_h = min(256, triton.next_power_of_2(hidden))
+        single_hidden_tile = hidden <= block_h
+        if not single_hidden_tile:
+            grad_weights.zero_()
         modes_buffer = torch.empty(
             (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
         )
         # Wide hidden rows accumulate mode and residual contractions once per
         # hidden tile, then finish the B-spline derivative once per token.
         # These FP32 buffers are compact: their size is independent of hidden.
-        grad_mode_buffer = torch.zeros(
-            (n_tokens, top_k, modes), device=delta.device, dtype=torch.float32
-        )
-        grad_residual_buffer = torch.zeros(
-            (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
-        )
+        if single_hidden_tile:
+            grad_mode_buffer = torch.empty(
+                (n_tokens, top_k, modes), device=delta.device, dtype=torch.float32
+            )
+            grad_residual_buffer = torch.empty(
+                (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
+            )
+        else:
+            grad_mode_buffer = torch.zeros(
+                (n_tokens, top_k, modes), device=delta.device, dtype=torch.float32
+            )
+            grad_residual_buffer = torch.zeros(
+                (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
+            )
         modes_grid = (n_tokens * top_k * modes,)
         if valid_mask.numel():
             _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
@@ -2468,7 +2707,6 @@ def _run_jtok_backward_triton(
             (n_tokens, hidden), device=delta.device, dtype=torch.float32
         )
         norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
-        block_h = min(256, triton.next_power_of_2(hidden))
         project_grid = (n_tokens, triton.cdiv(hidden, block_h))
         _jtok_wrap_kernel(_jtok_project_kernel)[project_grid](
             z,
@@ -2517,37 +2755,73 @@ def _run_jtok_backward_triton(
             RESIDUAL_SCALE=float(residual_scale),
             MIXTURE=bool(mixture),
             HAS_MASK=bool(valid_mask.numel()),
+            SINGLE_HIDDEN_TILE=bool(hidden <= block_h),
             num_warps=4,
             num_stages=1,
         )
-        token_projection_grid = (n_tokens, top_k, d_seed)
-        _jtok_wrap_kernel(_jtok_backward_token_projection_grad_kernel)[
-            token_projection_grid
-        ](
-            z,
-            spline_coeff,
-            knot_grid,
-            expert_idx,
-            modes_buffer,
-            grad_mode_buffer,
-            grad_residual_buffer,
-            valid_mask,
-            grad_z_accum,
-            grad_coeff_accum,
-            n_tokens,
-            D_SEED=d_seed,
-            NUM_KNOTS=knots,
-            NUM_MODES=modes,
-            TOP_K=top_k,
-            KNOT_PAD=triton.next_power_of_2(knots),
-            HAS_MASK=bool(valid_mask.numel()),
-            num_warps=4,
-            num_stages=1,
-        )
+        # Vectorizing the seed-coordinate reduction removes one tiny program
+        # per coordinate.  It is safe for wide hidden rows too: the preceding
+        # multi-tile kernel has already reduced their token-local mode and
+        # residual buffers.  The work-budget predicate keeps larger spline
+        # geometries on the established scalar-grid path.
+        if _can_use_vectorized_token_projection(d_seed, knots, modes):
+            block_d = triton.next_power_of_2(d_seed)
+            token_projection_grid = (n_tokens, top_k)
+            _jtok_wrap_kernel(_jtok_backward_token_projection_grad_block_kernel)[
+                token_projection_grid
+            ](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                modes_buffer,
+                grad_mode_buffer,
+                grad_residual_buffer,
+                valid_mask,
+                grad_z_accum,
+                grad_coeff_accum,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=triton.next_power_of_2(knots),
+                BLOCK_D=block_d,
+                HAS_MASK=bool(valid_mask.numel()),
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            token_projection_grid = (n_tokens, top_k, d_seed)
+            _jtok_wrap_kernel(_jtok_backward_token_projection_grad_kernel)[
+                token_projection_grid
+            ](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                modes_buffer,
+                grad_mode_buffer,
+                grad_residual_buffer,
+                valid_mask,
+                grad_z_accum,
+                grad_coeff_accum,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=triton.next_power_of_2(knots),
+                HAS_MASK=bool(valid_mask.numel()),
+                num_warps=4,
+                num_stages=1,
+            )
+        projection_block_m = 64 if single_hidden_tile and n_tokens >= 64 else 32
+        projection_block_h = 128
         projection_grid = (
             experts,
-            triton.cdiv(n_tokens, 32),
-            triton.cdiv(hidden, 128),
+            triton.cdiv(n_tokens, projection_block_m),
+            triton.cdiv(hidden, projection_block_h),
         )
         _jtok_wrap_kernel(_jtok_backward_projection_grad_kernel)[projection_grid](
             surface,
@@ -2563,8 +2837,8 @@ def _run_jtok_backward_triton(
             NUM_EXPERTS=experts,
             NUM_MODES=modes,
             TOP_K=top_k,
-            BLOCK_M=32,
-            BLOCK_H=128,
+            BLOCK_M=projection_block_m,
+            BLOCK_H=projection_block_h,
             num_warps=4,
             num_stages=1,
         )

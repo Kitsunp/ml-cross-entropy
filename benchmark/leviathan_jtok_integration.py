@@ -8,9 +8,12 @@ repository or is not available in the test checkout.
 
 The harness exercises a real training-shaped path::
 
-    token ids -> Triton Leviathan embedding + differentiable seed
-              -> Linear/LayerNorm seed coordinate
-              -> several JTok/JTok-M layers -> loss -> backward -> AdamW
+    Leviathan baseline:
+        token ids -> Triton Leviathan embedding -> loss -> backward -> AdamW
+    JTok/JTok-M:
+        token ids -> Triton Leviathan embedding + differentiable seed
+                  -> Linear/LayerNorm seed coordinate
+                  -> several JTok/JTok-M layers -> loss -> backward -> AdamW
 
 Examples (run in the CUDA environment)::
 
@@ -68,6 +71,7 @@ from cut_cross_entropy.leviathan import (
     jtok_apply,
     jtokm_apply,
     jtokm_auxiliary_loss,
+    leviathan_embedding_compiler_safe,
     leviathan_embedding_with_seed_compiler_safe,
 )
 
@@ -249,6 +253,7 @@ class LeviathanJTokIntegration(nn.Module):
         super().__init__()
         self.variant = args.variant
         self.backend = backend
+        has_jtok = args.variant != "leviathan"
         self.experts = args.experts if args.variant == "jtokm" else 1
         self.top_k = args.top_k if args.variant == "jtokm" else 1
         self.aux_weight = args.aux_weight
@@ -264,23 +269,27 @@ class LeviathanJTokIntegration(nn.Module):
             dtype=args.dtype,
         )
         self.generator = LeviathanGenerator(self.lev_config).cuda()
-        self.coordinate = SeedCoordinate(args.d_seed, args.dtype).cuda()
-        residual_scale = 1.0 / math.sqrt(2.0 * args.layers)
-        self.layers = nn.ModuleList(
-            IntegrationLayer(
-                hidden=args.hidden,
-                d_seed=args.d_seed,
-                knots=args.knots,
-                modes=args.modes,
-                experts=args.experts,
-                top_k=args.top_k,
-                variant=args.variant,
-                backend=backend,
-                dtype=args.dtype,
-                residual_scale=residual_scale,
-            ).cuda()
-            for _ in range(args.layers)
+        self.coordinate = (
+            SeedCoordinate(args.d_seed, args.dtype).cuda() if has_jtok else None
         )
+        residual_scale = 1.0 / math.sqrt(2.0 * args.layers)
+        self.layers = nn.ModuleList()
+        if has_jtok:
+            self.layers.extend(
+                IntegrationLayer(
+                    hidden=args.hidden,
+                    d_seed=args.d_seed,
+                    knots=args.knots,
+                    modes=args.modes,
+                    experts=args.experts,
+                    top_k=args.top_k,
+                    variant=args.variant,
+                    backend=backend,
+                    dtype=args.dtype,
+                    residual_scale=residual_scale,
+                ).cuda()
+                for _ in range(args.layers)
+            )
 
     def forward(
         self,
@@ -295,12 +304,23 @@ class LeviathanJTokIntegration(nn.Module):
             "head_spline_delta": self.generator.head_spline_delta,
             "head_out_weight": self.generator.head_out_weight,
         }
+        if self.variant == "leviathan":
+            hidden = leviathan_embedding_compiler_safe(
+                input_ids,
+                params,
+                self.lev_config,
+                self.generator.knot_grid,
+            )
+            return hidden, ()
+
         hidden, seed = leviathan_embedding_with_seed_compiler_safe(
             input_ids,
             params,
             self.lev_config,
             self.generator.knot_grid,
         )
+        if self.coordinate is None:  # pragma: no cover - guarded by variant
+            raise RuntimeError("JTok variants require a seed coordinate bridge")
         z_tilde = self.coordinate(seed)
         stats: list[dict[str, torch.Tensor]] = []
         for layer in self.layers:
@@ -537,7 +557,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("jtok", "jtokm"), default="jtok")
+    parser.add_argument(
+        "--variant",
+        choices=("leviathan", "jtok", "jtokm"),
+        default="jtok",
+        help="Baseline Leviathan-only path or the opt-in JTok/JTok-M extension.",
+    )
     parser.add_argument("--backend", choices=("torch", "triton"), default="triton")
     parser.add_argument("--compiled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fullgraph", action=argparse.BooleanOptionalAction, default=False)

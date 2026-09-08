@@ -14,10 +14,8 @@ launch geometry, autograd formulas, allocator implementation, or the caller's
   integration has not been disabled.
 - `TORCH_2_14_GRAPH_ANNOTATIONS`: CUDA Graph profiling labels were explicitly
   requested.
-- `TORCH_2_14_CUDA_MEMORY_POOL`: allocations are routed through the shared
-  PyTorch 2.14 CUDA pool.
-- `TORCH_2_14_CUDA_KERNEL_CONTEXT`: either allocation routing or graph
-  annotation is active, so compiler boundaries enter the integration context.
+- `TORCH_2_14_CUDA_KERNEL_CONTEXT`: graph annotation is active, so compiler
+  boundaries enter the annotation context.
 - `TORCH_2_14_MEMORY_ANNOTATIONS`: allocation annotations were explicitly
   requested.
 
@@ -65,58 +63,61 @@ Optional allocation labels are available through
 when CUDA memory-history recording is active. They are off by default because
 they are diagnostic metadata, not a throughput optimization.
 
-By default on Torch 2.14+, allocations made while the three external-kernel
-boundaries execute are routed through `torch.cuda.use_mem_pool()` when the
-caller is eager or uses a CUDA-graph path that does not belong to Inductor.
-The pool is created lazily, one per CUDA device, and shared by CCE, Leviathan,
-and PolyNorm so released blocks can be reused across components. It uses
-`torch.cuda.MemPool(use_on_oom=True)`, allowing the general allocator to use
-its released blocks under memory pressure. Set
-`CUT_CROSS_ENTROPY_TORCH_2_14_MEMORY_POOL=0` before Python starts to disable
-only pool routing while retaining other 2.14 integration features.
-
-The boundary automatically skips this external pool while Inductor CUDA Graph
-Trees owns the current device. In PyTorch 2.14, Inductor validates returned
-storages against its own graph pool; nesting a second `MemPool` around a
-custom-op implementation makes those outputs look foreign to
-`cudagraph_trees.check_memory_pool` and aborts the compiled step. The guard
-uses the read-only private `get_manager(..., create_if_none_exists=False)`
-probe because PyTorch 2.14 does not expose a public predicate for the current
-Graph Trees phase. If that compatibility probe changes or fails, the optional
-external pool is skipped for safety. This does not disable `torch.compile`,
-change CUDA Graph capture policy, or change any kernel.
-
 ## Deliberate exclusions
 
 `torch.Tag.cudagraph_unsafe` remains on CCE and Leviathan. The new hooks do not
 prove that their data-dependent saved tensors are safe to replay, and changing
 that tag would change the training compiler policy.
 
-No pool is created on Torch 2.13 or older. The implementation also avoids one
-pool per kernel, which would unnecessarily isolate released blocks. Pool memory
-can increase `memory_reserved()` even when `memory_allocated()` is unchanged;
-both values must therefore be reported in full-model validation.
+The external `torch.cuda.MemPool`/`torch.cuda.use_mem_pool` integration is
+intentionally not part of this module. A benchmark may use
+`--memory-limit-gib 10` as a resource guard, but production memory capacity
+remains controlled by the process and PyTorch's default allocator.
 
-The pool is intentionally not a hard-coded 10-GiB allocator limit. A benchmark
-may use `--memory-limit-gib 10` as a resource guard, but production memory
-capacity remains controlled by the process and PyTorch allocator. PyTorch 2.14
-builds without both `MemPool` and `use_mem_pool` fail the capability probe and
-automatically leave pool routing disabled. The external pool is also bypassed
-for an active Inductor Graph Tree, even when the environment variable requests
-pool routing.
+## Findings from the Torch 2.14 integration audit
+
+The relevant public composition contract is `torch.library.triton_op` plus
+`torch.library.wrap_triton`: the former exposes a Triton-backed operation to
+`torch.compile`, while the latter makes the individual launch traceable. The
+JTok external path follows that contract. It does not, by itself, guarantee
+that a larger graph containing other custom operators can be captured by
+CUDA Graph Trees; that interaction is tested separately in
+`benchmark/neo_llm_jtok.py`.
+
+Torch 2.14 also provides public CUDA Graph lifecycle hooks and
+`torch.cuda.graph_annotations.mark_kernels`, which are useful for attribution
+in profiles, plus post-facto allocation annotations. These are observability
+features and are disabled unless the corresponding environment flags are set.
+The release also adds side-pool retention through `torch.cuda.use_mem_pool()`;
+the CCE/Inductor regression test showed that adding an external pool to this
+training path is unsafe, so this project does not enable it.
+
+NVGEMM and its epilogue fusion improve Inductor's own `mm`/`addmm` candidates;
+they do not replace or silently execute the external JTok or Leviathan kernels.
+They may be useful for the surrounding Torch oracle, but they are not evidence
+that the external kernel is being reused. Relevant upstream references are
+the [Torch 2.14 release notes](https://pytorch.org/blog/pytorch-2-14-release-blog/),
+the [`torch.library.triton_op` API](https://docs.pytorch.org/docs/main/library.html#torch.library.triton_op),
+and the [user-defined Triton integration recipe](https://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html).
 
 ## Regression fixed: Inductor Graph Trees cross-pool storage
 
-The failure was reproduced on Torch `2.14.0+cu132` with
-`torch.compile(mode="max-autotune")`: a minimal custom CUDA op succeeded on
-the first warmup call and then failed on the next call with
-`These storage data ptrs are not allocated in pool (0, 1) but should be ...`.
-The traceback ended in Inductor's `cudagraph_trees.check_memory_pool`, after
-Triton's `triton_mm` autotune. The failure was allocator ownership bookkeeping,
-not a Triton matmul correctness or autotune failure. With the guard active, the
-same four-call reproduction completes successfully while the shared pool is
-still used by eager calls. The regression test is
-`test_kernel_region_does_not_nest_pool_inside_inductor_graph_tree`.
+The failure was reproduced on Torch `2.14.0+cu132` with a compiled PolyNorm
+forward/backward call at `8192×1536`, BF16, and dropout `0.1`. The first
+CUDA-Graph-Trees recording failed with
+`These storage data ptrs are not allocated in pool ...`; the full NeoLLM run
+later exposed the same invalidation as `cudaStreamCaptureStatusInvalidated` at
+`torch.empty_like` inside PolyNorm's CuTe boundary. The cause was the separate
+CCE `MemPool` competing with Inductor's graph pool, not a JTok-M fallback or a
+kernel-math error. Removing the external pool makes the same three-step
+forward/backward reproduction complete with finite outputs and gradients. The
+regression test is
+`test_compiled_polynorm_graph_tree_allocator_safe`.
+
+The older `memory_pool_*.json` files under
+`benchmark/results/torch214_cuda_integration/` are retained as historical A/B
+artifacts; they were collected before this pool integration was removed and
+must not be used as current production results.
 
 ## Reproducible comparison
 
@@ -143,8 +144,9 @@ reported numbers are medians over independent processes.
 
 The following result was obtained remotely on 2026-09-05 with the environment
 listed above. It exercises the compiler-safe CCE path, CuTe PolyNorm path, and
-Leviathan forward/training path. “On” means the 2.14 integration and shared
-CUDA pool were enabled; “off” disables the integration in a fresh process.
+Leviathan forward/training path. This table is historical: “On” included the
+external pool that was subsequently removed; “off” disabled the integration in
+a fresh process.
 
 | Case | Off | On | Change |
 | --- | ---: | ---: | ---: |

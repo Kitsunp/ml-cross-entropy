@@ -21,6 +21,9 @@ from cut_cross_entropy.leviathan import (
     jtokm_auxiliary_loss,
     jtokm_routing_stats,
 )
+from cut_cross_entropy.leviathan.jtok import (
+    _can_use_vectorized_token_projection,
+)
 
 
 def _inputs(
@@ -66,6 +69,25 @@ def _inputs(
         "router_weight": router_weight,
         "grid": grid,
     }
+
+
+@pytest.mark.parametrize(
+    ("d_seed", "knots", "modes", "expected"),
+    [
+        (128, 16, 4, True),
+        (64, 32, 4, True),
+        (128, 32, 4, False),
+        (256, 16, 4, False),
+    ],
+)
+def test_vectorized_token_projection_uses_geometry_budget(
+    d_seed: int,
+    knots: int,
+    modes: int,
+    expected: bool,
+) -> None:
+    """The dispatch guard is shape-driven, not tied to batch/hidden constants."""
+    assert _can_use_vectorized_token_projection(d_seed, knots, modes) is expected
 
 
 def test_jtok_torch_path_handles_noncontiguous_inputs_and_mask() -> None:
@@ -312,6 +334,63 @@ def test_jtokm_triton_general_path_handles_hidden_above_single_tile() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_triton_boundary_hidden_256_uses_compact_path() -> None:
+    """Keep the measured single-/multi-tile dispatch boundary covered."""
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=7,
+        hidden=256,
+        d_seed=4,
+        knots=5,
+        modes=2,
+    )
+    valid = torch.ones(7, device="cuda", dtype=torch.bool)
+    valid[[1, 5]] = False
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+
+    def run(backend: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output, _ = jtokm_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["router_state"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            trainable["router_weight"],
+            values["grid"],
+            top_k=2,
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        gradients = {
+            key: trainable[key].grad.detach().clone() for key in trainable
+        }
+        return output.detach(), gradients
+
+    reference, reference_grads = run("torch")
+    actual, actual_grads = run("triton")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=8e-2, atol=8e-2)
+    for key in reference_grads:
+        assert torch.isfinite(actual_grads[key]).all(), key
+        torch.testing.assert_close(
+            actual_grads[key].float(),
+            reference_grads[key].float(),
+            rtol=0.18,
+            atol=0.12,
+            msg=f"boundary gradient mismatch for {key}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_jtokm_triton_backward_reaches_all_trainable_inputs() -> None:
     values = _inputs(device="cuda", dtype=torch.bfloat16, n=17, hidden=13, d_seed=5)
     trainable = {
@@ -380,7 +459,11 @@ def test_jtokm_triton_backward_matches_torch_reference() -> None:
             backend=backend,  # type: ignore[arg-type]
         )
         (output.float() * probe).sum().backward()
-        return {key: trainable[key].grad.detach().clone() for key in trainable}
+        gradients = {}
+        for key, value in trainable.items():
+            assert value.grad is not None, f"missing gradient for {key}"
+            gradients[key] = value.grad.detach().clone()
+        return gradients
 
     reference = run("torch")
     actual = run("triton")
@@ -447,6 +530,67 @@ def test_jtokm_triton_wide_backward_avoids_reference_fallback(
             rtol=0.22,
             atol=0.18,
             msg=f"wide gradient mismatch for {key}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtok_triton_wide_d_seed_128_matches_reference() -> None:
+    """Cover the full-model d_seed=128 vectorized token-gradient geometry."""
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=7,
+        hidden=512,
+        d_seed=128,
+        knots=16,
+        modes=4,
+        experts=1,
+    )
+    valid = torch.ones(7, device="cuda", dtype=torch.bool)
+    valid[3] = False
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+
+    def run(backend: str) -> dict[str, torch.Tensor]:
+        jtok_keys = (
+            "delta",
+            "z",
+            "coeff",
+            "spline_out",
+            "residual_out",
+            "scaler",
+        )
+        trainable = {
+            key: values[key].detach().clone().requires_grad_(True)
+            for key in jtok_keys
+        }
+        output = jtok_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            values["grid"],
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        gradients = {}
+        for key, value in trainable.items():
+            assert value.grad is not None, f"missing gradient for {key}"
+            gradients[key] = value.grad.detach().clone()
+        return gradients
+
+    reference = run("torch")
+    actual = run("triton")
+    for key in reference:
+        assert torch.isfinite(actual[key]).all(), key
+        torch.testing.assert_close(
+            actual[key].float(),
+            reference[key].float(),
+            rtol=0.22,
+            atol=0.18,
+            msg=f"d_seed=128 gradient mismatch for {key}",
         )
 
 
