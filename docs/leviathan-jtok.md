@@ -325,3 +325,40 @@ by about `0.52--0.53 GiB` for both JTok variants. Live allocated memory changes
 only slightly because the large model and optimizer buffers remain. The
 profile traces contain `cut_cross_entropy::leviathan_forward_with_seed`,
 `_lev_fused_dot`, the JTok kernels, and no `jtok_reference` event.
+
+### Geometry-aware JTok autotune (2026-09-08)
+
+The hidden-tile planner remains a correctness decision: a complete row is
+processed by one tile only when its padded work fits the safe budget. For the
+full NeoLLM geometry (`hidden=512`, `d_seed=128`, `modes=4`, `top_k=2`) the
+backward uses two 256-lane multi-tile programs per token. Triton autotune does
+not select between the single-tile and multi-tile algorithms.
+
+Autotune now selects only launch parameters for the chosen geometry:
+
+- the wide backward benchmarks a small set of warp/stage configurations;
+- the projection-gradient reduction benchmarks `BLOCK_M` and launch
+  resources independently from hidden-tile ownership;
+- the cache key includes the effective tensor geometry, mask state, dtypes,
+  and tile width;
+- the reusable `surface` activation is restored between candidates because
+  the kernel consumes it as input and writes its gradient to the same buffer.
+
+The first occurrence of a geometry pays the candidate benchmark; later calls
+reuse Triton's per-process result. This does not change the Torch compile
+policy and does not add a Torch fallback.
+
+The corrected full-flow JTok-M run used seed `1729`, BF16, batch `64`,
+sequence `512`, 12 Transformer layers, real CCE/AdEMAMix and auxiliary losses,
+MXFP8 inactive, and one profile inside a 12-step run. Recomputing stable
+steps 4--11 from the recorded steps gives a median of `373.271 ms`
+(`2.679 steps/s`) and mean `372.201 ms`; peak allocation was `20.418 GiB`
+and peak reservation `21.756 GiB`. Two validation steps completed.
+
+The trace totals were approximately `243.64 ms` for
+`cut_cross_entropy::leviathan_backward`, `43.28 ms` for
+`_jtok_backward_multi_tile_fast_kernel`, `28.07 ms` for
+`_jtok_backward_projection_grad_kernel`, and `0.69 ms` for the global
+normalization-dot kernel. The earlier route-cached full-flow profile is kept
+as historical diagnostic data, not as a causal A/B baseline, because it
+predates the global hidden-axis normalization-dot correction.

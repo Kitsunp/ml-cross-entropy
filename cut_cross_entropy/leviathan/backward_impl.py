@@ -555,8 +555,12 @@ def leviathan_backward(
     if seed_grad is not None and seed_grad.numel() != 0:
         # JTok/JTok-M shares the exact Leviathan seed.  Merge its gradient
         # before the existing scatter so the reference and Triton backward
-        # have the same single codebook accumulation boundary.
-        dz = dz + seed_grad.reshape(N, d_seed).to(device=dz.device, dtype=wd)
+        # have the same single codebook accumulation boundary.  ``dz`` is a
+        # fresh workspace, so do not allocate another full [N, d_seed] result.
+        seed_term = seed_grad.reshape(N, d_seed)
+        if seed_term.device != dz.device or seed_term.dtype != dz.dtype:
+            seed_term = seed_term.to(device=dz.device, dtype=dz.dtype)
+        dz.add_(seed_term)
 
     # codebooks: scatter-add sobre los dígitos base-b
     coords = coords.to(G.device)

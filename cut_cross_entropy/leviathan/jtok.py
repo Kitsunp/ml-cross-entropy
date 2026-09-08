@@ -41,7 +41,7 @@ explicit ``backend="torch"`` oracle for comparison.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, Optional
+from typing import Any, Literal, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +61,7 @@ from cut_cross_entropy.torch_2_14 import (
     TORCH_2_14_MEMORY_ANNOTATIONS,
     annotate_tensors,
     cuda_kernel_region,
+    mark_warmup_incomplete_once,
 )
 
 try:  # Triton is an optional dependency on CPU/macOS installations.
@@ -95,7 +96,52 @@ _TOKEN_PROJECTION_BLOCK_WORK_LIMIT = 8192
 # budget, not a model-specific batch/hidden constant; larger surfaces retain
 # the established one-program-per-mode implementation below.
 _MODE_EVALUATION_WORK_LIMIT = 8192
+# Keep the established reduction width explicit.  The tile policy below uses
+# this value whenever a complete-row program would exceed its geometry budget.
+_BACKWARD_MULTI_TILE_BLOCK_H = 256
+# A complete hidden row can be processed by one backward program only when
+# the combined hidden/vector work remains below this budget.  This guard is
+# deliberately expressed in terms of the actual kernel geometry rather than
+# the NeoLLM model dimensions.  Larger rows retain the established 256-lane
+# multi-tile reduction to avoid excessive register pressure.
+_BACKWARD_SINGLE_TILE_WORK_LIMIT = 131072
+# Do not widen the established reduction beyond 256 lanes without a separate
+# register/occupancy measurement.  A complete-row tile is a correctness
+# property, while projection-block tuning is an independent kernel choice.
+_BACKWARD_SINGLE_TILE_MAX_H = _BACKWARD_MULTI_TILE_BLOCK_H
+# These configurations tune launch resources only.  They must not select the
+# mathematical ownership mode: ``SINGLE_HIDDEN_TILE`` is supplied by the
+# geometry planner because it determines whether direct stores are race-free.
+# The candidate set is intentionally small; the first call for a new geometry
+# benchmarks it once and the Autotuner keeps the winning configuration in its
+# per-process cache.
+if _TRITON_AVAILABLE:
+    _JTOK_WIDE_BACKWARD_CONFIGS = [
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=2),
+    ]
+    _JTOK_PROJECTION_GRAD_CONFIGS = [
+        triton.Config({"BLOCK_M": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 16}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 32}, num_warps=4, num_stages=2),
+    ]
+else:  # pragma: no cover - CPU-only installations do not import Triton
+    _JTOK_WIDE_BACKWARD_CONFIGS = []
+    _JTOK_PROJECTION_GRAD_CONFIGS = []
 _USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
+
+
+class _BackwardTilePlan(NamedTuple):
+    """Launch and reduction invariants for the wide JTok backward."""
+
+    block_h: int
+    num_tiles: int
+    work_items: int
+    direct_store: bool
 
 
 def _can_use_vectorized_token_projection(
@@ -128,6 +174,75 @@ def _can_use_vectorized_mode_evaluation(
         and mode_pad <= 32
         and d_seed * knot_pad * mode_pad <= _MODE_EVALUATION_WORK_LIMIT
     )
+
+
+def _can_use_route_vectorized_mode_evaluation(
+    d_seed: int,
+    knots: int,
+    modes: int,
+    top_k: int,
+) -> bool:
+    """Return whether Top-K routes can share one B-spline basis program.
+
+    The basis depends only on ``z`` and is identical for every selected
+    expert.  The route-vector kernel keeps at most two selected experts in a
+    program; larger ``top_k`` values retain the route-independent kernel so
+    its coefficient tile does not become register-bound.
+    """
+    if top_k != 2:
+        return False
+    return _can_use_vectorized_mode_evaluation(d_seed, knots, modes)
+
+
+def _backward_hidden_tile_plan(
+    hidden: int,
+    d_seed: int,
+    modes: int,
+    top_k: int,
+) -> _BackwardTilePlan:
+    """Choose the hidden tile width and whether it is a complete-row tile.
+
+    The multi-tile kernel keeps compact token-local reductions, but each
+    additional hidden tile requires atomic accumulation into the mode,
+    residual, and route-weight workspaces.  A single tile can use direct
+    stores for those values.  ``direct_store`` is therefore a mathematical
+    ownership invariant, not merely a performance hint: it is true only when
+    exactly one program covers the complete hidden reduction.  The resource
+    budget is independent of batch size and model-specific constants and
+    rejects invalid or unusually wide geometries.
+    """
+    if hidden < 1 or d_seed < 1 or modes < 1 or top_k < 1:
+        return _BackwardTilePlan(0, 0, 0, False)
+    padded_hidden = 1 << (int(hidden) - 1).bit_length()
+    single_work = padded_hidden * (int(d_seed) + int(modes) * int(top_k))
+    single_tile = (
+        padded_hidden <= _BACKWARD_SINGLE_TILE_MAX_H
+        and single_work <= _BACKWARD_SINGLE_TILE_WORK_LIMIT
+    )
+    if single_tile:
+        return _BackwardTilePlan(
+            padded_hidden,
+            1,
+            single_work,
+            True,
+        )
+    block_h = min(_BACKWARD_MULTI_TILE_BLOCK_H, padded_hidden)
+    return _BackwardTilePlan(
+        block_h,
+        (int(hidden) + block_h - 1) // block_h,
+        block_h * (int(d_seed) + int(modes) * int(top_k)),
+        False,
+    )
+
+
+def _can_use_single_hidden_tile_backward(
+    hidden: int,
+    d_seed: int,
+    modes: int,
+    top_k: int,
+) -> bool:
+    """Return whether the wide backward can use one complete hidden tile."""
+    return _backward_hidden_tile_plan(hidden, d_seed, modes, top_k).direct_store
 
 
 def _jtok_op_decorator(name: str):
@@ -191,6 +306,31 @@ def _flatten_inputs(
     delta_flat = delta_m.reshape(-1, hidden_size).contiguous()
     z_flat = z_tilde.reshape(-1, z_tilde.shape[-1]).contiguous()
     return delta_flat, z_flat, orig_shape
+
+
+def _flatten_aux_input(
+    values: torch.Tensor,
+    leading_shape: tuple[int, ...],
+    width: int,
+    name: str,
+) -> torch.Tensor:
+    """Flatten an auxiliary feature without touching the already-flat seed.
+
+    JTok-M validates ``router_state`` against ``delta_m`` and ``z_tilde``.
+    Calling ``_flatten_inputs(router_state, z_tilde, ...)`` for that validation
+    used to reshape and re-contiguous the same Leviathan seed a second time.
+    Keep the validation, but flatten only the auxiliary router feature.
+    """
+    if values.ndim < 2 or tuple(values.shape[:-1]) != leading_shape:
+        raise ValueError(
+            f"{name} must share all leading dimensions with delta_m; got "
+            f"{tuple(values.shape)} and {leading_shape + (width,)}"
+        )
+    if values.shape[-1] != width:
+        raise ValueError(
+            f"{name} last dimension must be {width}, got {values.shape[-1]}"
+        )
+    return values.reshape(-1, width).contiguous()
 
 
 def _valid_mask(
@@ -779,6 +919,115 @@ if _TRITON_AVAILABLE:
             + mode_offsets,
             value.to(modes_ptr.dtype.element_ty),
             mask=row_mask & mode_mask,
+        )
+
+    @triton.jit
+    def _jtok_modes_kernel_route_vectorized(
+        z_ptr,
+        coeff_ptr,
+        grid_ptr,
+        expert_idx_ptr,
+        valid_ptr,
+        modes_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        MODE_PAD: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Evaluate two selected routes while sharing each token's basis.
+
+        JTok-M selects multiple experts for the same token, but the normalized
+        B-spline basis is a function of ``z`` only.  The ordinary vectorized
+        kernel launches one program per route and repeats that basis work.
+        This route-vector form keeps the two selected experts in one program,
+        reuses the basis, and writes the same compact ``[N, TOP_K, M]``
+        workspace.  The Python geometry guard restricts it to ``TOP_K=2`` so
+        the extra coefficient tile does not make unusual routes register-bound.
+        """
+        row = tl.program_id(0)
+        row_mask = row < N
+        slots = tl.arange(0, TOP_K)
+        route_mask = tl.load(
+            expert_idx_ptr + row * TOP_K + slots,
+            mask=row_mask,
+            other=0,
+        ).to(tl.int32)
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        knot_mask = knot_offsets < NUM_KNOTS
+        mode_offsets = tl.arange(0, MODE_PAD)
+        mode_mask = mode_offsets < NUM_MODES
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scale = float(max(int(NUM_KNOTS) - 1, 0))
+        log_acc = tl.zeros((TOP_K, MODE_PAD), dtype=tl.float32)
+        neg_acc = tl.zeros((TOP_K, MODE_PAD), dtype=tl.int32)
+
+        for d in tl.range(0, D_SEED):
+            x = tl.load(
+                z_ptr + row * D_SEED + d,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            distance = tl.abs(x - grid) * scale
+            basis = tl.where(
+                distance < 0.5,
+                0.75 - distance * distance,
+                tl.where(
+                    distance < 1.5,
+                    0.5 * (1.5 - distance) * (1.5 - distance),
+                    0.0,
+                ),
+            )
+            basis = tl.where(knot_mask, basis, 0.0)
+            basis = basis / tl.maximum(tl.sum(basis, axis=0), 1e-12)
+            coeff = tl.load(
+                coeff_ptr
+                + (
+                    (
+                        (
+                            route_mask[:, None, None] * NUM_MODES
+                            + mode_offsets[None, :, None]
+                        )
+                        * D_SEED
+                        + d
+                    )
+                    * NUM_KNOTS
+                    + knot_offsets[None, None, :]
+                ),
+                mask=(
+                    row_mask
+                    & (slots[:, None, None] < TOP_K)
+                    & mode_mask[None, :, None]
+                    & knot_mask[None, None, :]
+                ),
+                other=0.0,
+            ).to(tl.float32)
+            phi = tl.sum(basis[None, None, :] * coeff, axis=2)
+            log_acc += tl.log(tl.abs(phi) + 1e-9)
+            neg_acc += (phi < 0).to(tl.int32)
+
+        value = (1.0 - 2.0 * (neg_acc & 1).to(tl.float32)) * tl.exp(log_acc)
+        value = tl.where(row_valid & row_mask, value, 0.0)
+        value = tl.where(mode_mask[None, :], value, 0.0)
+        tl.store(
+            modes_ptr
+            + row * TOP_K * NUM_MODES
+            + slots[:, None] * NUM_MODES
+            + mode_offsets[None, :],
+            value.to(modes_ptr.dtype.element_ty),
+            mask=row_mask & mode_mask[None, :],
         )
 
     @triton.jit
@@ -1547,6 +1796,7 @@ if _TRITON_AVAILABLE:
         scaler_ptr,
         surface_ptr,
         norm_ptr,
+        norm_dot_ptr,
         grad_out_ptr,
         valid_ptr,
         grad_delta_ptr,
@@ -1624,7 +1874,7 @@ if _TRITON_AVAILABLE:
 
         if MIXTURE:
             surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
             grad_surface = (
                 surface_grad_factor / norm
                 - mixed * dot / (norm * norm * norm)
@@ -1633,7 +1883,7 @@ if _TRITON_AVAILABLE:
             grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
         else:
             surface_grad_factor = grad_out * delta_value * scaler_value
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
             grad_surface = (
                 surface_grad_factor / norm
                 - mixed * dot / (norm * norm * norm)
@@ -1825,6 +2075,93 @@ if _TRITON_AVAILABLE:
             )
 
     @triton.jit
+    def _jtok_backward_norm_dot_kernel(
+        surface_ptr,
+        delta_ptr,
+        scaler_ptr,
+        grad_out_ptr,
+        valid_ptr,
+        dot_ptr,
+        N,
+        HIDDEN: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        NUM_TILES: tl.constexpr,
+        RESIDUAL_SCALE: tl.constexpr,
+        MIXTURE: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Reduce the normalization dot product over the complete hidden row.
+
+        For ``y = s / (||s|| + eps)``, the backward contains
+        ``dot(a, s)`` over *all* hidden coordinates.  The tiled projection
+        backward cannot form that scalar independently in each tile without
+        changing the derivative.  This token-owned reduction writes one
+        scalar per row, so the following tile pass can compute the exact same
+        derivative while retaining its compact token/route workspaces.
+        """
+        row = tl.program_id(0)
+        row_mask = row < N
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
+        dot = tl.zeros((), dtype=tl.float32)
+        for tile in tl.range(0, NUM_TILES):
+            cols = tile * BLOCK_H + tl.arange(0, BLOCK_H)
+            active = row_mask & (cols < HIDDEN) & row_valid
+            mixed = tl.load(
+                surface_ptr + row * HIDDEN + cols,
+                mask=row_mask & (cols < HIDDEN),
+                other=0.0,
+            ).to(tl.float32)
+            grad_out = tl.load(
+                grad_out_ptr + row * HIDDEN + cols,
+                mask=row_mask & (cols < HIDDEN),
+                other=0.0,
+            ).to(tl.float32)
+            scaler = tl.load(
+                scaler_ptr + cols,
+                mask=cols < HIDDEN,
+                other=0.0,
+            ).to(tl.float32)
+            if MIXTURE:
+                factor = RESIDUAL_SCALE * scaler * grad_out
+            else:
+                delta = tl.load(
+                    delta_ptr + row * HIDDEN + cols,
+                    mask=row_mask & (cols < HIDDEN),
+                    other=0.0,
+                ).to(tl.float32)
+                factor = grad_out * delta * scaler
+            dot += tl.sum(tl.where(active, factor * mixed, 0.0), axis=0)
+        tl.store(dot_ptr + row, dot, mask=row_mask)
+
+    @triton.autotune(
+        configs=_JTOK_WIDE_BACKWARD_CONFIGS,
+        key=[
+            "N",
+            "D_SEED",
+            "NUM_MODES",
+            "TOP_K",
+            "HIDDEN",
+            "BLOCK_H",
+            "MIXTURE",
+            "HAS_MASK",
+            "SINGLE_HIDDEN_TILE",
+        ],
+        reset_to_zero=[
+            "grad_mode_ptr",
+            "grad_residual_ptr",
+            "grad_scaler_ptr",
+            "grad_weights_ptr",
+        ],
+        # ``surface_ptr`` is intentionally reused as the input activation and
+        # as the hand-off buffer for projection gradients.  Every benchmark
+        # candidate overwrites it, so it must be restored before the next
+        # candidate and before the selected configuration runs.
+        restore_value=["surface_ptr"],
+    )
+    @triton.jit
     def _jtok_backward_multi_tile_fast_kernel(
         delta_ptr,
         z_ptr,
@@ -1838,6 +2175,7 @@ if _TRITON_AVAILABLE:
         scaler_ptr,
         surface_ptr,
         norm_ptr,
+        norm_dot_ptr,
         grad_out_ptr,
         valid_ptr,
         grad_delta_ptr,
@@ -1899,22 +2237,24 @@ if _TRITON_AVAILABLE:
 
         if MIXTURE:
             surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
             grad_delta = grad_out
             grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
         else:
             surface_grad_factor = grad_out * delta_value * scaler_value
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
             grad_delta = grad_out * (1.0 + scaler_value * mixed / norm)
             grad_scaler = grad_out * delta_value * mixed / norm
+
+        if SINGLE_HIDDEN_TILE:
+            # One program owns the complete hidden reduction, so the local
+            # dot is mathematically global.  Multi-tile rows receive the
+            # token-owned reduction produced by _jtok_backward_norm_dot_kernel.
+            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+        else:
+            dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
+        grad_surface = (
+            surface_grad_factor / norm
+            - mixed * dot / (norm * norm * norm)
+        )
 
         valid_active = active_mask & row_valid
         grad_surface = tl.where(valid_active, grad_surface, 0.0)
@@ -2342,6 +2682,19 @@ if _TRITON_AVAILABLE:
             mask=row_mask & row_valid & d_mask,
         )
 
+    @triton.autotune(
+        configs=_JTOK_PROJECTION_GRAD_CONFIGS,
+        key=[
+            "N",
+            "D_SEED",
+            "HIDDEN",
+            "NUM_EXPERTS",
+            "NUM_MODES",
+            "TOP_K",
+            "BLOCK_H",
+        ],
+        reset_to_zero=["grad_spline_out_ptr", "grad_residual_out_ptr"],
+    )
     @triton.jit
     def _jtok_backward_projection_grad_kernel(
         grad_surface_ptr,
@@ -2392,31 +2745,51 @@ if _TRITON_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
+        # Route metadata is invariant across the mode and seed-coordinate
+        # reductions below.  Loading it inside both loops made the wide
+        # backward reread ``expert_idx`` and ``selected_weights`` up to
+        # ``NUM_MODES + D_SEED`` times per token block.  Keep the compact
+        # [BLOCK_M, TOP_K] route tile in registers and reuse it for both
+        # projection-gradient families.  This is only a register tile; it
+        # does not materialize an expert-expanded activation.
+        route_slots = tl.arange(0, TOP_K)
+        route_mask = row_mask[:, None]
+        route_experts = tl.load(
+            expert_idx_ptr
+            + rows[:, None] * TOP_K
+            + route_slots[None, :],
+            mask=route_mask,
+            other=0,
+        ).to(tl.int32)
+        route_weights = tl.load(
+            selected_weights_ptr
+            + rows[:, None] * TOP_K
+            + route_slots[None, :],
+            mask=route_mask,
+            other=0.0,
+        ).to(tl.float32)
+        expert_weight = tl.sum(
+            tl.where(route_experts == expert, route_weights, 0.0), axis=1
+        )
+
         # The same grad_surface tile is reused for all modes.  This keeps the
         # hidden projection read traffic close to one pass per expert/block.
         for mode in tl.range(0, NUM_MODES):
-            coefficient = tl.zeros((BLOCK_M,), dtype=tl.float32)
-            for slot in tl.range(0, TOP_K):
-                routed_expert = tl.load(
-                    expert_idx_ptr + rows * TOP_K + slot,
-                    mask=row_mask,
-                    other=0,
-                ).to(tl.int32)
-                weight = tl.load(
-                    selected_weights_ptr + rows * TOP_K + slot,
-                    mask=row_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                mode_value = tl.load(
-                    modes_ptr + (rows * TOP_K + slot) * NUM_MODES + mode,
-                    mask=row_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                coefficient += tl.where(
-                    routed_expert == expert,
-                    weight * mode_value,
+            mode_value = tl.load(
+                modes_ptr
+                + (rows[:, None] * TOP_K + route_slots[None, :]) * NUM_MODES
+                + mode,
+                mask=route_mask,
+                other=0.0,
+            ).to(tl.float32)
+            coefficient = tl.sum(
+                tl.where(
+                    route_experts == expert,
+                    route_weights * mode_value,
                     0.0,
-                )
+                ),
+                axis=1,
+            )
             partial = tl.sum(
                 grad_surface * coefficient[:, None],
                 axis=0,
@@ -2430,28 +2803,12 @@ if _TRITON_AVAILABLE:
             )
 
         for d in tl.range(0, D_SEED):
-            coefficient = tl.zeros((BLOCK_M,), dtype=tl.float32)
-            for slot in tl.range(0, TOP_K):
-                routed_expert = tl.load(
-                    expert_idx_ptr + rows * TOP_K + slot,
-                    mask=row_mask,
-                    other=0,
-                ).to(tl.int32)
-                weight = tl.load(
-                    selected_weights_ptr + rows * TOP_K + slot,
-                    mask=row_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                z_value = tl.load(
-                    z_ptr + rows * D_SEED + d,
-                    mask=row_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                coefficient += tl.where(
-                    routed_expert == expert,
-                    weight * z_value,
-                    0.0,
-                )
+            z_value = tl.load(
+                z_ptr + rows * D_SEED + d,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            coefficient = expert_weight * z_value
             partial = tl.sum(
                 grad_surface * coefficient[:, None],
                 axis=0,
@@ -2548,7 +2905,27 @@ def _run_jtok_triton(
     modes_buffer = torch.empty(
         (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
     )
-    if _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
+    if _can_use_route_vectorized_mode_evaluation(d_seed, knots, modes, top_k):
+        mode_grid = (n_tokens,)
+        _jtok_wrap_kernel(_jtok_modes_kernel_route_vectorized)[mode_grid](
+            z,
+            spline_coeff,
+            knot_grid,
+            expert_idx,
+            valid_mask,
+            modes_buffer,
+            n_tokens,
+            D_SEED=d_seed,
+            NUM_KNOTS=knots,
+            NUM_MODES=modes,
+            TOP_K=top_k,
+            KNOT_PAD=knot_pad,
+            MODE_PAD=triton.next_power_of_2(modes),
+            HAS_MASK=has_mask,
+            num_warps=4,
+            num_stages=1,
+        )
+    elif _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
         mode_grid = (n_tokens * top_k,)
         _jtok_wrap_kernel(_jtok_modes_kernel_vectorized)[mode_grid](
             z,
@@ -2659,6 +3036,20 @@ def _run_jtok_triton(
             norm=norm,
             output=output,
         )
+    mark_warmup_incomplete_once(
+        "jtok.mixture" if mixture else "jtok.forward",
+        (
+            delta.device.index,
+            delta.dtype,
+            int(n_tokens),
+            int(hidden),
+            int(d_seed),
+            int(knots),
+            int(modes),
+            int(top_k),
+            bool(has_mask),
+        ),
+    )
     return output
 
 
@@ -2792,8 +3183,14 @@ def _run_jtok_backward_triton(
         # tensors.  At the one-tile boundary the fast kernel writes each
         # token exactly once, so it can skip the memset and use stores for
         # those token-local workspaces; wider rows retain FP32 atomics.
-        block_h = min(256, triton.next_power_of_2(hidden))
-        single_hidden_tile = hidden <= block_h
+        tile_plan = _backward_hidden_tile_plan(
+            hidden,
+            d_seed,
+            modes,
+            top_k,
+        )
+        block_h = tile_plan.block_h
+        single_hidden_tile = tile_plan.direct_store
         if not single_hidden_tile:
             grad_weights.zero_()
         modes_buffer = torch.empty(
@@ -2816,7 +3213,27 @@ def _run_jtok_backward_triton(
             grad_residual_buffer = torch.zeros(
                 (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
             )
-        if _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
+        if _can_use_route_vectorized_mode_evaluation(d_seed, knots, modes, top_k):
+            mode_grid = (n_tokens,)
+            _jtok_wrap_kernel(_jtok_modes_kernel_route_vectorized)[mode_grid](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                valid_mask,
+                modes_buffer,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=triton.next_power_of_2(knots),
+                MODE_PAD=triton.next_power_of_2(modes),
+                HAS_MASK=bool(valid_mask.numel()),
+                num_warps=4,
+                num_stages=1,
+            )
+        elif _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
             mode_grid = (n_tokens * top_k,)
             _jtok_wrap_kernel(_jtok_modes_kernel_vectorized)[mode_grid](
                 z,
@@ -2895,6 +3312,33 @@ def _run_jtok_backward_triton(
             num_warps=4,
             num_stages=1,
         )
+        # The normalization derivative couples every hidden tile through one
+        # scalar dot product.  Compute it once per token before the tiled
+        # gradient pass; a complete-row tile computes the same scalar locally
+        # and does not need this launch or workspace initialization.
+        # The single-tile specialization never reads ``norm_dot`` because it
+        # computes the complete reduction locally.  Reuse ``norm`` there so
+        # the optimization does not introduce a dead FP32 allocation; only
+        # genuinely multi-tile rows receive a second per-token scalar buffer.
+        norm_dot = norm if single_hidden_tile else torch.empty_like(norm)
+        if not single_hidden_tile:
+            _jtok_wrap_kernel(_jtok_backward_norm_dot_kernel)[(n_tokens,)](
+                surface,
+                delta,
+                scaler,
+                grad_out,
+                valid_mask,
+                norm_dot,
+                n_tokens,
+                HIDDEN=hidden,
+                BLOCK_H=block_h,
+                NUM_TILES=tile_plan.num_tiles,
+                RESIDUAL_SCALE=float(residual_scale),
+                MIXTURE=bool(mixture),
+                HAS_MASK=bool(valid_mask.numel()),
+                num_warps=4,
+                num_stages=1,
+            )
         _jtok_wrap_kernel(_jtok_backward_multi_tile_fast_kernel)[project_grid](
             delta,
             z,
@@ -2908,6 +3352,7 @@ def _run_jtok_backward_triton(
             scaler,
             surface,
             norm,
+            norm_dot,
             grad_out,
             valid_mask,
             grad_delta,
@@ -2923,9 +3368,7 @@ def _run_jtok_backward_triton(
             RESIDUAL_SCALE=float(residual_scale),
             MIXTURE=bool(mixture),
             HAS_MASK=bool(valid_mask.numel()),
-            SINGLE_HIDDEN_TILE=bool(hidden <= block_h),
-            num_warps=4,
-            num_stages=1,
+            SINGLE_HIDDEN_TILE=bool(single_hidden_tile),
         )
         # Vectorizing the seed-coordinate reduction removes one tiny program
         # per coordinate.  It is safe for wide hidden rows too: the preceding
@@ -2984,13 +3427,21 @@ def _run_jtok_backward_triton(
                 num_warps=4,
                 num_stages=1,
             )
-        projection_block_m = 64 if single_hidden_tile and n_tokens >= 64 else 32
+        # Keep projection tiling independent from the hidden-reduction
+        # ownership mode.  The old coupling selected BLOCK_M=64 whenever the
+        # preceding pass used a complete hidden tile; on the full training
+        # geometry that made the projection-gradient kernel substantially
+        # slower even though the single-tile reduction itself was valid.
+        # Triton's autotuner now benchmarks BLOCK_M and launch resources for
+        # this exact token/hidden geometry.
         projection_block_h = 128
-        projection_grid = (
-            experts,
-            triton.cdiv(n_tokens, projection_block_m),
-            triton.cdiv(hidden, projection_block_h),
-        )
+        def projection_grid(meta):
+            return (
+                experts,
+                triton.cdiv(n_tokens, meta["BLOCK_M"]),
+                triton.cdiv(hidden, meta["BLOCK_H"]),
+            )
+
         _jtok_wrap_kernel(_jtok_backward_projection_grad_kernel)[projection_grid](
             surface,
             z,
@@ -3005,11 +3456,22 @@ def _run_jtok_backward_triton(
             NUM_EXPERTS=experts,
             NUM_MODES=modes,
             TOP_K=top_k,
-            BLOCK_M=projection_block_m,
             BLOCK_H=projection_block_h,
-            num_warps=4,
-            num_stages=1,
         )
+    mark_warmup_incomplete_once(
+        "jtok.mixture.backward" if mixture else "jtok.backward",
+        (
+            grad_out.device.index,
+            grad_out.dtype,
+            int(n_tokens),
+            int(hidden),
+            int(d_seed),
+            int(knots),
+            int(modes),
+            int(top_k),
+            bool(valid_mask.numel()),
+        ),
+    )
     return (
         grad_delta,
         grad_z_accum.to(z.dtype),
@@ -3690,7 +4152,12 @@ def jtokm_apply(
 ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
     """Apply JTok-M and optionally return compact balance diagnostics."""
     dm, z, orig_shape = _flatten_inputs(delta_m, z_tilde, delta_m.shape[-1])
-    h, _, _ = _flatten_inputs(router_state, z_tilde, delta_m.shape[-1])
+    h = _flatten_aux_input(
+        router_state,
+        tuple(delta_m.shape[:-1]),
+        delta_m.shape[-1],
+        "router_state",
+    )
     if h.shape != dm.shape:
         raise ValueError("router_state must have the same shape as delta_m")
     experts = int(spline_coeff.shape[0])

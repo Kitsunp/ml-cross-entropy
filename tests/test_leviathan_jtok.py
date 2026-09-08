@@ -14,6 +14,8 @@ import math
 
 import pytest
 import torch
+from torch import nn
+import cut_cross_entropy.leviathan.jtok as jtok_impl
 
 from cut_cross_entropy.leviathan import (
     jtok_apply,
@@ -22,9 +24,12 @@ from cut_cross_entropy.leviathan import (
     jtokm_routing_stats,
 )
 from cut_cross_entropy.leviathan.jtok import (
+    _backward_hidden_tile_plan,
+    _can_use_route_vectorized_mode_evaluation,
     _can_use_vectorized_mode_evaluation,
     _can_use_vectorized_token_projection,
 )
+from cut_cross_entropy.linear_cross_entropy import linear_cross_entropy
 
 
 def _inputs(
@@ -111,6 +116,58 @@ def test_vectorized_mode_evaluation_uses_geometry_budget(
     assert _can_use_vectorized_mode_evaluation(d_seed, knots, modes) is expected
 
 
+@pytest.mark.parametrize(
+    ("d_seed", "knots", "modes", "top_k", "expected"),
+    [
+        (128, 16, 4, 2, True),
+        (128, 16, 4, 1, False),
+        (128, 16, 4, 3, False),
+        (128, 32, 4, 2, False),
+        (128, 16, 8, 2, False),
+    ],
+)
+def test_route_vectorized_modes_share_only_supported_top_k_geometry(
+    d_seed: int,
+    knots: int,
+    modes: int,
+    top_k: int,
+    expected: bool,
+) -> None:
+    assert (
+        _can_use_route_vectorized_mode_evaluation(d_seed, knots, modes, top_k)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden", "d_seed", "modes", "top_k", "expected_block", "single"),
+    [
+        (256, 128, 4, 2, 256, True),
+        (257, 4, 2, 2, 256, False),
+        (512, 128, 4, 2, 256, False),
+        (512, 128, 8, 4, 256, False),
+        # The padded row is still 512, but the seed/mode work exceeds the
+        # single-program budget and must retain the multi-tile reduction.
+        (512, 256, 8, 4, 256, False),
+        (1024, 128, 4, 2, 256, False),
+        (0, 128, 4, 2, 0, False),
+    ],
+)
+def test_backward_hidden_tile_plan_is_geometry_driven(
+    hidden: int,
+    d_seed: int,
+    modes: int,
+    top_k: int,
+    expected_block: int,
+    single: bool,
+) -> None:
+    plan = _backward_hidden_tile_plan(hidden, d_seed, modes, top_k)
+    assert plan.block_h == expected_block
+    assert plan.direct_store is single
+    assert plan.num_tiles == (0 if hidden == 0 else (hidden + expected_block - 1) // expected_block)
+    assert plan.work_items >= 0
+
+
 def test_jtok_torch_path_handles_noncontiguous_inputs_and_mask() -> None:
     values = _inputs(n=18)
     delta = values["delta"].view(2, 9, -1).transpose(0, 1)
@@ -165,6 +222,36 @@ def test_jtokm_torch_path_is_dense_reference_and_returns_metrics() -> None:
     assert stats["expert_probability"].shape == (4,)
     assert stats["expert_fraction"].shape == (4,)
     assert not stats["p_sum"].requires_grad
+
+
+def test_jtokm_router_validation_does_not_reflatten_seed(monkeypatch) -> None:
+    """Router validation must not prepare Leviathan's seed a second time."""
+    values = _inputs()
+    original = jtok_impl._flatten_inputs
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(jtok_impl, "_flatten_inputs", counted)
+    output, _ = jtokm_apply(
+        values["delta"],
+        values["z"],
+        values["router_state"],
+        values["coeff"],
+        values["spline_out"],
+        values["residual_out"],
+        values["scaler"],
+        values["router_weight"],
+        values["grid"],
+        top_k=2,
+        backend="torch",
+    )
+
+    assert calls == 1
+    assert output.shape == values["delta"].shape
 
 
 def test_jtokm_auxiliary_loss_matches_definition() -> None:
@@ -309,49 +396,266 @@ def test_jtokm_triton_matches_torch_reference_on_odd_geometry(dtype: torch.dtype
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
-def test_jtokm_triton_general_path_handles_hidden_above_single_tile() -> None:
-    """Keep the two-stage reduction correct when hidden needs two tiles."""
+def test_jtokm_route_vectorized_full_geometry_matches_reference() -> None:
+    """Exercise the new shared-basis Top-K=2 route kernel directly.
+
+    The ordinary odd-geometry test intentionally stays on the conservative
+    path.  This case matches the full-model seed/mode geometry so the new
+    route-vector dispatch is actually executed in both forward and backward.
+    """
     values = _inputs(
         device="cuda",
         dtype=torch.bfloat16,
-        n=9,
-        hidden=257,
+        n=13,
+        hidden=512,
+        d_seed=128,
+        knots=16,
+        modes=4,
+        experts=8,
+    )
+    valid = torch.ones(13, device="cuda", dtype=torch.bool)
+    valid[[2, 9]] = False
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+
+    def run(backend: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output, _ = jtokm_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["router_state"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            trainable["router_weight"],
+            values["grid"],
+            top_k=2,
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        return output.detach(), {
+            key: value.grad.detach().clone() for key, value in trainable.items()
+        }
+
+    reference, reference_grads = run("torch")
+    actual, actual_grads = run("triton")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=0.12, atol=0.12)
+    for key in reference_grads:
+        assert torch.isfinite(actual_grads[key]).all(), key
+        torch.testing.assert_close(
+            actual_grads[key].float(),
+            reference_grads[key].float(),
+            rtol=0.25,
+            atol=0.2,
+            msg=f"full-geometry route gradient mismatch for {key}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_triton_general_path_handles_hidden_above_single_tile() -> None:
+    """Check the global normalization reduction on a genuinely wide row.
+
+    The derivative of ``surface / ||surface||`` contains one dot product over
+    the complete hidden axis.  A per-tile dot product is numerically wrong,
+    even though the forward result can still look correct.  ``hidden=513``
+    forces the compact multi-tile path and makes this regression observable.
+    """
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=5,
+        hidden=513,
         d_seed=4,
         knots=5,
         modes=2,
     )
-    valid = torch.ones(9, device="cuda", dtype=torch.bool)
+    valid = torch.ones(5, device="cuda", dtype=torch.bool)
     valid[::3] = False
-    reference, _ = jtokm_apply(
-        values["delta"],
-        values["z"],
-        values["router_state"],
-        values["coeff"],
-        values["spline_out"],
-        values["residual_out"],
-        values["scaler"],
-        values["router_weight"],
-        values["grid"],
-        top_k=2,
-        valid_mask=valid,
-        backend="torch",
-    )
-    actual, _ = jtokm_apply(
-        values["delta"],
-        values["z"],
-        values["router_state"],
-        values["coeff"],
-        values["spline_out"],
-        values["residual_out"],
-        values["scaler"],
-        values["router_weight"],
-        values["grid"],
-        top_k=2,
-        valid_mask=valid,
-        backend="triton",
-    )
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+
+    def run(backend: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output, _ = jtokm_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["router_state"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            trainable["router_weight"],
+            values["grid"],
+            top_k=2,
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        return output.detach(), {
+            key: value.grad.detach().clone() for key, value in trainable.items()
+        }
+
+    reference, reference_grads = run("torch")
+    actual, actual_grads = run("triton")
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, reference, rtol=8e-2, atol=8e-2)
+    for key in reference_grads:
+        assert torch.isfinite(actual_grads[key]).all(), key
+        torch.testing.assert_close(
+            actual_grads[key].float(),
+            reference_grads[key].float(),
+            rtol=0.25,
+            atol=0.2,
+            msg=f"wide normalization gradient mismatch for {key}",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtokm_multi_tile_normalization_uses_global_dot() -> None:
+    """Reject a per-tile dot product in the normalization derivative.
+
+    The second hidden tile has a nonzero surface but zero upstream
+    ``delta``.  Its gradient therefore depends entirely on the global
+    normalization dot from the first tile; a tile-local reduction silently
+    returns zero there.
+    """
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=3,
+        hidden=513,
+        d_seed=4,
+        knots=5,
+        modes=2,
+        experts=4,
+    )
+    values["delta"] = torch.zeros_like(values["delta"])
+    values["delta"][:, :256] = 1
+    values["z"].fill_(0.5)
+    values["coeff"].fill_(1)
+    values["spline_out"].fill_(1)
+    values["residual_out"].zero_()
+    values["scaler"].fill_(1)
+    values["router_state"].zero_()
+    values["router_weight"].zero_()
+    valid = torch.ones(3, device="cuda", dtype=torch.bool)
+    probe = torch.zeros_like(values["delta"], dtype=torch.float32)
+    probe[:, :256] = 1
+
+    def run(backend: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output, _ = jtokm_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["router_state"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            trainable["router_weight"],
+            values["grid"],
+            top_k=2,
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        return output.detach(), {
+            key: value.grad.detach().clone() for key, value in trainable.items()
+        }
+
+    reference, reference_grads = run("torch")
+    actual, actual_grads = run("triton")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=8e-2, atol=8e-2)
+    reference_tail = reference_grads["spline_out"][..., 256:]
+    assert reference_tail.abs().max().item() > 1e-3
+    torch.testing.assert_close(
+        actual_grads["spline_out"].float(),
+        reference_grads["spline_out"].float(),
+        rtol=1e-2,
+        atol=1e-3,
+        msg="multi-tile normalization used a tile-local dot product",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtok_multi_tile_normalization_uses_global_dot() -> None:
+    """Exercise the same global reduction through the plain JTok boundary."""
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=3,
+        hidden=513,
+        d_seed=4,
+        knots=5,
+        modes=2,
+        experts=1,
+    )
+    values["delta"] = torch.zeros_like(values["delta"])
+    values["delta"][:, :256] = 1
+    values["z"].fill_(0.5)
+    values["coeff"].fill_(1)
+    values["spline_out"].fill_(1)
+    values["residual_out"].zero_()
+    values["scaler"].fill_(1)
+    valid = torch.ones(3, device="cuda", dtype=torch.bool)
+    probe = torch.zeros_like(values["delta"], dtype=torch.float32)
+    probe[:, :256] = 1
+
+    def run(backend: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        trainable = {
+            key: values[key].detach().clone().requires_grad_(True)
+            for key in (
+                "delta",
+                "z",
+                "coeff",
+                "spline_out",
+                "residual_out",
+                "scaler",
+            )
+        }
+        output = jtok_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            values["grid"],
+            valid_mask=valid,
+            backend=backend,  # type: ignore[arg-type]
+        )
+        (output.float() * probe).sum().backward()
+        return output.detach(), {
+            key: value.grad.detach().clone() for key, value in trainable.items()
+        }
+
+    reference, reference_grads = run("torch")
+    actual, actual_grads = run("triton")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=8e-2, atol=8e-2)
+    reference_tail = reference_grads["spline_out"][..., 256:]
+    assert reference_tail.abs().max().item() > 1e-3
+    torch.testing.assert_close(
+        actual_grads["spline_out"].float(),
+        reference_grads["spline_out"].float(),
+        rtol=1e-2,
+        atol=1e-3,
+        msg="plain JTok multi-tile normalization used a tile-local dot product",
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
@@ -552,6 +856,179 @@ def test_jtokm_triton_wide_backward_avoids_reference_fallback(
             atol=0.18,
             msg=f"wide gradient mismatch for {key}",
         )
+
+
+@pytest.mark.manual
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+@pytest.mark.skipif(
+    not hasattr(torch, "compiler")
+    or not hasattr(torch.compiler, "cudagraph_mark_warmup_incomplete"),
+    reason="Test requires the Torch 2.14 CUDA-Graph warmup hook",
+)
+def test_jtokm_aux_graph_capture_warmup_is_package_only() -> None:
+    """Keep the real JTok-M/Inductor capture regression without NeoLLM imports.
+
+    The failure reproduced on Torch 2.14 when the route-shared mode kernel,
+    ``compute_aux=True``, AOTAutograd backward, and CUDA Graph Trees met in
+    the same max-autotune step.  This probe intentionally mirrors only the
+    package contract: twelve JTok-M calls, the full d_seed/knots/modes/top-k
+    geometry, an MEAP-like validity mask, CCE, and an optimizer update.
+    It is manual because max-autotune compilation is expensive; it must remain
+    independent of modeling_neollm.py and train.py.
+    """
+    from cut_cross_entropy.leviathan import jtokm_auxiliary_loss
+
+    batch, sequence, hidden = 64, 512, 512
+    d_seed, modes, knots, experts, vocab = 128, 4, 16, 5, 4096
+    layers = 12
+    device = torch.device("cuda")
+
+    class _JTokMGraphProbe(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.coeff = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.randn(
+                            experts,
+                            modes,
+                            d_seed,
+                            knots,
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.15
+                    )
+                    for _ in range(layers)
+                ]
+            )
+            self.spline_out = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.randn(
+                            experts, modes, hidden,
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.2
+                    )
+                    for _ in range(layers)
+                ]
+            )
+            self.residual_out = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.randn(
+                            experts, d_seed, hidden,
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.2
+                    )
+                    for _ in range(layers)
+                ]
+            )
+            self.scaler = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.randn(hidden, device=device, dtype=torch.bfloat16)
+                        * 0.1
+                    )
+                    for _ in range(layers)
+                ]
+            )
+            self.router_weight = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.randn(
+                            experts, hidden,
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.2
+                    )
+                    for _ in range(layers)
+                ]
+            )
+            self.lm_head = nn.Parameter(
+                torch.randn(vocab, hidden, device=device, dtype=torch.bfloat16)
+                * 0.02
+            )
+            self.register_buffer(
+                "grid",
+                torch.linspace(0.0, 1.0, knots, device=device, dtype=torch.float32),
+            )
+
+        def forward(
+            self,
+            delta: torch.Tensor,
+            z: torch.Tensor,
+            router_state: torch.Tensor,
+            valid_mask: torch.Tensor,
+            targets: torch.Tensor,
+        ) -> torch.Tensor:
+            aux_loss = delta.new_zeros(())
+            for coeff, out_weight, residual, scaler, router_weight in zip(
+                self.coeff,
+                self.spline_out,
+                self.residual_out,
+                self.scaler,
+                self.router_weight,
+            ):
+                delta, stats = jtokm_apply(
+                    delta,
+                    z,
+                    router_state,
+                    coeff,
+                    out_weight,
+                    residual,
+                    scaler,
+                    router_weight,
+                    self.grid,
+                    top_k=2,
+                    valid_mask=valid_mask,
+                    compute_aux=True,
+                    backend="triton",
+                )
+                aux_loss = aux_loss + jtokm_auxiliary_loss(
+                    stats,
+                    num_experts=experts,
+                    top_k=2,
+                    weight=1e-2,
+                )
+            loss = linear_cross_entropy(
+                delta,
+                self.lm_head,
+                targets,
+                impl="cce",
+                shift=1,
+            )
+            return loss + aux_loss
+
+    torch.manual_seed(1729)
+    model = _JTokMGraphProbe()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    compiled = torch.compile(model, mode="max-autotune")
+    delta = torch.randn(
+        batch, sequence, hidden, device=device, dtype=torch.bfloat16
+    )
+    z = torch.sigmoid(
+        torch.randn(batch, sequence, d_seed, device=device, dtype=torch.bfloat16)
+    )
+    router_state = torch.randn(
+        batch, sequence, hidden, device=device, dtype=torch.bfloat16
+    )
+    valid_mask = torch.ones(batch, sequence, device=device, dtype=torch.bool)
+    valid_mask.reshape(-1)[::7] = False
+    targets = torch.randint(8, vocab, (batch, sequence), device=device)
+
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        loss = compiled(delta, z, router_state, valid_mask, targets)
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        assert torch.isfinite(loss)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")

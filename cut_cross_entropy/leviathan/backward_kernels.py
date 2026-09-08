@@ -586,8 +586,13 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
         # JTok/JTok-M differentiates through the same kernel-produced seed.
         # Add that contribution before the one existing codebook scatter so
         # Leviathan and JTok never build two independent gather/backward
-        # routes for the shared codebooks.
-        dz = dz + seed_grad.reshape(N, d).float()
+        # routes for the shared codebooks.  ``dz`` is a fresh contraction
+        # result, so an in-place add avoids allocating a second full [N, d]
+        # result just to merge the two gradients.
+        seed_term = seed_grad.reshape(N, d)
+        if seed_term.device != dz.device or seed_term.dtype != dz.dtype:
+            seed_term = seed_term.to(device=dz.device, dtype=dz.dtype)
+        dz.add_(seed_term)
     if use_dwout_bf16:
         dWout = (M.reshape(N, h * krank).to(torch.bfloat16).t()
                  .matmul(G_bf16).reshape(h, krank, D))
