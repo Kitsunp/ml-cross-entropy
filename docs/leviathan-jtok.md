@@ -803,3 +803,50 @@ autotuning of `_jtok_backward_projection_grad_kernel` is independent and
 remains accepted.  The benchmark and traces were kept outside the commit as
 local investigation artifacts, while this result is recorded here to prevent
 repeating the same forward-tile autotune experiment.
+
+### Rejected experiment: compact plain-route metadata (2026-09-08)
+
+This experiment attempted to specialize plain JTok (`experts=1`, `top_k=1`)
+at compile time.  The proposed change replaced the per-token route tensors
+`[tokens, 1]` with one implicit entry `[1, 1]` (expert `0`, weight `1`) and
+added `PLAIN_ROUTE` branches to the mode, projection, and backward kernels.
+The mathematical operation was unchanged; the intent was to remove route
+loads, route comparisons, and saved autograd metadata.  JTok-M was expected
+to remain on the general routed path.
+
+The candidate exposed a real correctness hazard first: the vectorized mode
+kernel still indexed `expert_idx[row * TOP_K + slot]`.  With seven tokens and
+the geometry `hidden=512`, `d_seed=128`, `knots=16`, `modes=4`, the compact
+`[1, 1]` buffer produced an invalid address-space access.  The failure was
+reproduced in the model-free CUDA suite with `CUDA_LAUNCH_BLOCKING=1`; adding
+the missing compile-time branch made the isolated test pass.  That fix was
+not sufficient for the complete model flow, so the candidate was not kept.
+
+The decisive comparison used seed `1729`, BF16, batch `64`, sequence `512`,
+12 Transformer layers, 150 training steps plus 10 validation steps,
+`torch.compile(mode="max-autotune")`, AdEMAMix, Delta disabled, MXFP8
+inactive, and the strict Triton backend on the same RTX 5090 environment
+(`torch 2.14.0+cu132`, CUDA 13.2, Triton 3.8.0):
+
+| complete JTok training | accepted build | compact-route candidate | change |
+| --- | ---: | ---: | ---: |
+| stable step median | 279.692 ms | 384.790 ms | +37.6% |
+| stable steps/s | 3.5754 | 2.5990 | -27.3% |
+| stable p95 | 284.071 ms | 388.030 ms | +36.6% |
+| peak allocated | 19.946 GiB | 19.951 GiB | +0.03% |
+| peak reserved | 21.221 GiB | 21.746 GiB | +2.48% |
+
+Both runs completed all requested steps, reported `jtok_kernel_backend="triton"`,
+and emitted no `jtok_reference` event.  The trace explains the regression:
+the accepted build used `_jtok_modes_kernel_vectorized` for 12 calls totaling
+`12.766 ms`; the compact candidate used `_jtok_modes_kernel_masked` for 24
+calls totaling `83.035 ms`.  `leviathan_backward` increased from `157.601`
+to `236.406 ms`.  Therefore the compact boundary altered the complete
+compiled dispatch/graph enough to select a much slower mode path and retain
+extra work.  The memory saving was not material and did not compensate for
+the latency.
+
+The working tree was restored to the accepted build.  The compact metadata
+and its associated kernel branches are not part of the current implementation;
+the existing per-token route contract remains authoritative until a future
+change can preserve the vectorized dispatch in a complete training run.
