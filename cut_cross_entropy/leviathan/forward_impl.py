@@ -531,7 +531,8 @@ def _auto_split_head(device, num_heads: int) -> bool:
 
 def leviathan_forward(ids, params, cfg, save_intermediates=False,
                       variant="exact", mask_embedding=None,
-                      mask_token_id=None):
+                      mask_token_id=None, return_seed=False,
+                      fuse_gather=None):
     """Kernel forward: (embeds, saved).
 
     ids:       int tensor [*shape] (any integral dtype)
@@ -545,6 +546,12 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
     save_intermediates: if True, saved = {"z", "B_por_head": None,
                "phi_por_head": None, "modes_por_head"}  (B/phi are NOT saved:
                the backward recomputes them from z -- see README)
+    return_seed: if True, return a saved ``z`` even when the backward
+               checkpoints are disabled.  JTok/JTok-M use this to consume the
+               exact seed produced by Leviathan instead of gathering it again.
+    fuse_gather: explicit request for the safe ``ids -> z`` fused path.  When
+               None, use the automatic safe policy; ``LEV_FUSE_GATHER=0`` is
+               the explicit A/B escape hatch.
     Returns (embeds [*shape, D], saved).
     Requires CUDA, or TRITON_INTERPRET=1 for CPU debugging (N <= 64).
     """
@@ -644,8 +651,10 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
     dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
     # A full z register tile is safe for the paper default d_seed=128.  Keep
     # the proven two-pass path for d_seed=256 to avoid register spills.
-    fuse_gather = (dot_phi and d <= 128
-                   and os.environ.get("LEV_FUSE_GATHER", "0") != "0")
+    if fuse_gather is None:
+        policy = os.environ.get("LEV_FUSE_GATHER", "auto").strip().lower()
+        fuse_gather = policy not in {"0", "false", "off", "no"}
+    fuse_gather = bool(fuse_gather) and dot_phi and d <= 128
     if fuse_gather:
         block_k = d
     if not fuse_gather:
@@ -685,7 +694,8 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
                 VEC=cd.kwargs["VEC"], SPLINE_BF16=spline_bf16,
                 ROUND_ZH=ROUND_ZH, SAVE_XH=save_xh, SAVE_T=save_t,
                 DOT_IEEE=dot_ieee, FUSE_GATHER=fuse_gather,
-                SAVE_Z=save_xh, EPS=NORM_EPS, LOG_EPS=LOG_EPS,
+                SAVE_Z=save_xh or bool(return_seed), EPS=NORM_EPS,
+                LOG_EPS=LOG_EPS,
                 SPLIT_HEAD=split_head,
                 num_warps=cd.num_warps, num_stages=cd.num_stages)
         else:
@@ -730,16 +740,17 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
         )
 
     saved = None
-    if save_intermediates:
-        saved = {
-            "z": z,
-            "knot_grid": prep["knot_grid"],
-            "x_hat_por_head": xhat,          # [h, N, d] fp32 — lean backward
-            "t_por_head": t_saved if save_t else None,  # [h, N, d] fp16; avoids sigmoid recompute
-            "mean_por_head": mean.unsqueeze(-1),    # [h, N, 1] fp32
-            "rsqrt_por_head": rsqrt.unsqueeze(-1),  # [h, N, 1] fp32
-            "B_por_head": None,      # never materialized (memory: see README)
-            "phi_por_head": None,    # never materialized (memory: see README)
-            "modes_por_head": modes.view(N, h, krank),
-        }
+    if save_intermediates or return_seed:
+        saved = {"z": z}
+        if save_intermediates:
+            saved.update({
+                "knot_grid": prep["knot_grid"],
+                "x_hat_por_head": xhat,          # [h, N, d] fp32 — lean backward
+                "t_por_head": t_saved if save_t else None,  # [h, N, d] fp16; avoids sigmoid recompute
+                "mean_por_head": mean.unsqueeze(-1),    # [h, N, 1] fp32
+                "rsqrt_por_head": rsqrt.unsqueeze(-1),  # [h, N, 1] fp32
+                "B_por_head": None,      # never materialized (memory: see README)
+                "phi_por_head": None,    # never materialized (memory: see README)
+                "modes_por_head": modes.view(N, h, krank),
+            })
     return embeds.view(*orig_shape, D), saved

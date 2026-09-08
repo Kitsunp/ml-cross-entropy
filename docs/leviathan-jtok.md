@@ -21,18 +21,33 @@ the compatibility custom-op registration.
 
 ## Leviathan connection and gradients
 
-The legacy `leviathan_embedding_compiler_safe` call still produces the
-embedding through the existing Leviathan kernel. JTok additionally needs the
-compositional seed `z`. The new
-`leviathan_embedding_with_seed_compiler_safe` helper repeats only the cheap
-base-`k` codebook lookup/sum in a compiler-visible differentiable bridge. It
-does not repeat the projection, spline, or output stages. This is necessary
-because the legacy custom op saves its internal seed for its own backward and
-does not expose that saved tensor as a differentiable output.
+The legacy `leviathan_embedding_compiler_safe` entry point remains available
+for callers that only need the embedding. When JTok/JTok-M is active,
+`leviathan_embedding_with_seed_compiler_safe` uses a multi-output Leviathan
+operation instead:
 
-The bridge is tested against `leviathan_forward_ref`: its seed and embedding
-match the reference, and a loss through the returned seed produces finite
-codebook gradients.
+```text
+ids -> codebook gather -> z -> Leviathan embedding
+                         \\-> JTok/JTok-M
+```
+
+For supported CUDA geometries, the gather is fused into Leviathan's stage-A
+kernel (`FUSE_GATHER=True`). The kernel writes `z` once and returns that exact
+tensor to JTok/JTok-M; the old CUDA path that called
+`_leviathan_seed_from_codebooks` a second time is not used. In backward, the
+Leviathan gradient and the JTok/JTok-M seed gradient are added before the one
+codebook scatter. The CPU/reference path retains the differentiable bridge for
+model-independent tests and non-CUDA callers.
+
+`LEV_FUSE_GATHER=0` disables the automatic fused-gather policy for the ordinary
+Leviathan path. The JTok/JTok-M multi-output operation requests the safe fused
+path explicitly because it must expose the shared seed. Base Leviathan training
+still saves `z` when its backward needs it; base inference keeps `SAVE_Z=False`
+when no consumer requests the seed.
+
+The integration tests compare the returned embedding and seed with
+`leviathan_forward_ref`, verify that the CUDA path does not call the duplicate
+seed bridge, and check finite codebook gradients through both output routes.
 
 ## NeoLLM activation
 
@@ -208,3 +223,105 @@ routing and a partial validity mask. These are inference/pre-fill results;
 they do not repair the independent training+CCE capture failure above, and
 the Triton surface is not yet at the required +/-5% speed parity with the
 Torch oracle in this configuration.
+
+### Full training profile: vectorized mode evaluation (2026-09-08)
+
+The next optimization was restricted to the wide JTok/JTok-M path. The old
+mode evaluator launched one Triton program per `(token, route, mode)` and
+rebuilt the same normalized B-spline basis for every mode. The new guarded
+path launches one program per `(token, route)`, evaluates a padded mode vector,
+and reuses the basis across modes. It is enabled only when
+`d_seed <= 128`, `mode_pad <= 32`, and
+`d_seed * knot_pad * mode_pad <= 8192`; larger or unusual surfaces retain the
+previous evaluator.
+
+The valid full-flow runs used the supplied NeoLLM source, seed `1729`, BF16,
+batch 64, sequence 512, 12 Transformer layers, the real CCE loss,
+`torch.compile(mode="max-autotune")`, AdEMAMix, and MXFP8 inactive. The
+external package provenance was checked before execution:
+
+```text
+/workspace/codex_ml_cross_entropy_jtok_wide256_exp/cut_cross_entropy/__init__.py
+/workspace/codex_ml_cross_entropy_jtok_wide256_exp/cut_cross_entropy/leviathan/jtok.py
+```
+
+The first run made without `PYTHONPATH` was discarded for this comparison,
+because the editable install pointed at the older clone under
+`/root/src/cut-cross-entropy`. This is intentionally recorded so an installed
+package cannot be mistaken for the checkout under test.
+
+Stable step medians were taken from steps 4--11 of the same profiled process;
+the first compiled step and the profiler step were excluded:
+
+| full training flow | stable step | steps/s | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: |
+| Leviathan base | 223.31 ms | 4.478 | 19.53 GiB | 20.86 GiB |
+| JTok before mode fusion | 380.21 ms | 2.630 | 19.95 GiB | 21.75 GiB |
+| JTok with vectorized modes | 321.94 ms | 3.106 | 19.95 GiB | 21.75 GiB |
+| JTok-M before mode fusion | 560.72 ms | 1.783 | 20.43 GiB | 22.27 GiB |
+| JTok-M with vectorized modes | 441.51 ms | 2.265 | 20.43 GiB | 22.27 GiB |
+
+Relative to the immediately preceding implementation, the complete JTok step
+improved by 15.32% and JTok-M by 21.26%, without an observed VRAM increase.
+Relative to the original full-flow measurements, the cumulative reductions are
+31.38% for JTok and 38.97% for JTok-M. The base Leviathan flow is still faster:
+the remaining time gap is 98.63 ms for JTok and 218.20 ms for JTok-M per step.
+
+The clean traces confirmed the intended external route. JTok used
+`_jtok_modes_kernel_vectorized` 24 times for the profiled window, plus the
+existing Leviathan and CCE kernels; JTok-M used the same vectorized mode kernel
+and its routed auxiliary-loss path. No `jtok_reference` event was present.
+For JTok, the mode kernel fell from 81.84 ms to 25.26 ms in the trace. For
+JTok-M it fell from 164.89 ms to 50.55 ms. The remaining largest JTok-specific
+kernel is `_jtok_backward_multi_tile_fast_kernel` at 36.98 ms (72.83 ms for
+JTok-M), so that is the next optimization target. No change to that kernel has
+been claimed yet.
+
+The profile harness synchronizes before and after each measured step, so its
+`cudaStreamSynchronize` duration is not attributed to JTok without a separate
+launch-boundary experiment. Full-flow JSON results and traces are retained
+outside the source distribution rather than committed with model data.
+
+### Rejected experiment: vectorized backward mode contraction (2026-09-08)
+
+The next candidate added a padded `modes x hidden-tile` load to
+`_jtok_backward_multi_tile_fast_kernel`. It was guarded by a geometry budget and
+kept the previous scalar loop for larger surfaces. Focused CUDA tests passed,
+but the full-flow profiles did not justify keeping it:
+
+| variant | previous stable step (4--11) | candidate stable step (4--11) | multi-tile kernel in trace |
+| --- | ---: | ---: | ---: |
+| JTok | 321.94 ms | 321.77 ms | 36.98 -> 36.70 ms |
+| JTok-M | 441.51 ms | 448.60 ms | 72.83 -> 81.13 ms |
+
+The real geometry uses four modes, so the scalar loop was already small. The
+vectorized version kept a larger output-weight tile live, increased register
+pressure, and did not remove launches, atomics, or hidden-tile reads. The
+candidate was removed before commit. The mode-evaluation fusion remains; the
+shared Leviathan seed boundary is now implemented, so JTok and JTok-M do not
+repeat the codebook gather already performed by Leviathan.
+
+### Shared seed / fused gather full-flow result (2026-09-08)
+
+The shared-seed change was measured in the complete NeoLLM training flow with
+seed `1729`, BF16, batch `64`, sequence `512`, 12 Transformer layers, the real
+CCE loss, AdEMAMix, `torch.compile(mode="max-autotune")`, and MXFP8 inactive.
+Each row is one profiled process; stable medians use steps 4--11 and exclude
+the cold compiled step and profiler step.
+
+| full flow | stable step | steps/s | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: |
+| Leviathan base, before | 223.311 ms | 4.478 | 19.53 GiB | 20.86 GiB |
+| Leviathan base, fused gather | 223.479 ms | 4.475 | 19.54 GiB | 20.86 GiB |
+| JTok, before shared seed | 321.939 ms | 3.106 | 19.95 GiB | 21.75 GiB |
+| JTok, shared seed | 322.924 ms | 3.097 | 19.94 GiB | 21.22 GiB |
+| JTok-M, before shared seed | 441.515 ms | 2.265 | 20.43 GiB | 22.27 GiB |
+| JTok-M, shared seed | 442.074 ms | 2.262 | 20.42 GiB | 21.76 GiB |
+
+The result is not a claim of a complete-step speedup: the gather is small
+relative to the Transformer, CCE, backward, and optimizer. The change keeps
+base within measurement noise, while reducing the allocator's peak reservation
+by about `0.52--0.53 GiB` for both JTok variants. Live allocated memory changes
+only slightly because the large model and optimizer buffers remain. The
+profile traces contain `cut_cross_entropy::leviathan_forward_with_seed`,
+`_lev_fused_dot`, the JTok kernels, and no `jtok_reference` event.

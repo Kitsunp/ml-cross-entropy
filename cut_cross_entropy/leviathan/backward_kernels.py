@@ -342,7 +342,8 @@ def supports(cfg, saved) -> bool:
         return False
 
 
-def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
+def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
+                              seed_grad=None):
     """Grads dict with the same keys as params (Triton chain + cuBLAS GEMMs).
 
     Returns None when the config is unsupported (caller falls back to the
@@ -581,6 +582,12 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids):
     zf = z.float()                          # [N, d]
     dWp = torch.einsum("hnd,ni->hdi", dzh, zf)      # [h, d, d]
     dz = torch.einsum("hnd,hdi->ni", dzh, Wf)       # [N, d]
+    if seed_grad is not None and seed_grad.numel() != 0:
+        # JTok/JTok-M differentiates through the same kernel-produced seed.
+        # Add that contribution before the one existing codebook scatter so
+        # Leviathan and JTok never build two independent gather/backward
+        # routes for the shared codebooks.
+        dz = dz + seed_grad.reshape(N, d).float()
     if use_dwout_bf16:
         dWout = (M.reshape(N, h * krank).to(torch.bfloat16).t()
                  .matmul(G_bf16).reshape(h, krank, D))

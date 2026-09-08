@@ -453,6 +453,7 @@ def leviathan_backward(
     saved: Optional[Dict[str, Any]] = None,
     ids: Optional[torch.Tensor] = None,
     chunk: Optional[int] = None,
+    seed_grad: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Gradientes de todos los parámetros LEV respecto a grad_out [..., D].
 
@@ -550,6 +551,12 @@ def leviathan_backward(
         dbeta[l] = db_l
         dWout[l] = dWo_l
         dz += dz_l
+
+    if seed_grad is not None and seed_grad.numel() != 0:
+        # JTok/JTok-M shares the exact Leviathan seed.  Merge its gradient
+        # before the existing scatter so the reference and Triton backward
+        # have the same single codebook accumulation boundary.
+        dz = dz + seed_grad.reshape(N, d_seed).to(device=dz.device, dtype=wd)
 
     # codebooks: scatter-add sobre los dígitos base-b
     coords = coords.to(G.device)

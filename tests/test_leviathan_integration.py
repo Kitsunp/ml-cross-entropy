@@ -130,6 +130,93 @@ def test_seed_bridge_matches_leviathan_stage_one_and_keeps_gradient() -> None:
     assert torch.isfinite(params["codebooks"].grad).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_cuda_seed_output_reuses_leviathan_and_merges_seed_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JTok's CUDA seed must be Leviathan's z, not a second codebook gather."""
+    import cut_cross_entropy.leviathan.compiler as compiler
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = _detached_params(generator)
+    ids = torch.tensor([[7, 13, 99, 2048]], device="cuda")
+
+    def fail_duplicate_seed(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("CUDA seed path must not rebuild z in Python")
+
+    monkeypatch.setattr(
+        compiler,
+        "_leviathan_seed_from_codebooks",
+        fail_duplicate_seed,
+    )
+    embedding, seed = compiler.leviathan_embedding_with_seed_compiler_safe(
+        ids,
+        params,
+        cfg,
+        generator.knot_grid,
+    )
+    expected_embedding, saved = leviathan_forward_ref(
+        ids,
+        {**params, "knot_grid": generator.knot_grid},
+        cfg,
+        save_intermediates=True,
+    )
+    torch.testing.assert_close(embedding, expected_embedding, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        seed,
+        saved["z"].reshape_as(seed),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert seed.requires_grad
+
+    # Keep the embedding branch in the graph with a zero coefficient so the
+    # custom backward receives both outputs while this check isolates the
+    # merged JTok dL/dz contribution.
+    loss = embedding.float().sum() * 0.0 + seed.float().square().mean()
+    loss.backward()
+    assert params["codebooks"].grad is not None
+    assert torch.isfinite(params["codebooks"].grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_cuda_seed_inference_returns_seed_without_backward_checkpoints() -> None:
+    import cut_cross_entropy.leviathan.compiler as compiler
+
+    cfg = _config(dtype=torch.bfloat16)
+    generator = LeviathanGenerator(cfg).cuda()
+    params = {
+        name: getattr(generator, name).detach()
+        for name in (
+            "codebooks",
+            "head_proj_weight",
+            "head_norm_weight",
+            "head_norm_bias",
+            "head_spline_delta",
+            "head_out_weight",
+        )
+    }
+    ids = torch.tensor([[7, 13, 99, 2048]], device="cuda")
+    with torch.no_grad():
+        embedding, seed = compiler.leviathan_embedding_with_seed_compiler_safe(
+            ids,
+            params,
+            cfg,
+            generator.knot_grid,
+        )
+        base = compiler.leviathan_embedding_compiler_safe(
+            ids,
+            params,
+            cfg,
+            generator.knot_grid,
+        )
+    torch.testing.assert_close(embedding, base, rtol=0.0, atol=0.0)
+    assert seed.shape == (*ids.shape, cfg.generator_d_seed)
+    assert not seed.requires_grad
+
+
 def test_compiler_safe_meap_fallback_isolates_leviathan_gradients() -> None:
     cfg = _config(dtype=torch.float32)
     generator = LeviathanGenerator(cfg)

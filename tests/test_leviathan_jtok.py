@@ -22,6 +22,7 @@ from cut_cross_entropy.leviathan import (
     jtokm_routing_stats,
 )
 from cut_cross_entropy.leviathan.jtok import (
+    _can_use_vectorized_mode_evaluation,
     _can_use_vectorized_token_projection,
 )
 
@@ -88,6 +89,26 @@ def test_vectorized_token_projection_uses_geometry_budget(
 ) -> None:
     """The dispatch guard is shape-driven, not tied to batch/hidden constants."""
     assert _can_use_vectorized_token_projection(d_seed, knots, modes) is expected
+
+
+@pytest.mark.parametrize(
+    ("d_seed", "knots", "modes", "expected"),
+    [
+        (128, 16, 4, True),
+        (32, 16, 4, True),
+        (128, 16, 8, False),
+        (128, 32, 4, False),
+        (128, 16, 33, False),
+    ],
+)
+def test_vectorized_mode_evaluation_uses_geometry_budget(
+    d_seed: int,
+    knots: int,
+    modes: int,
+    expected: bool,
+) -> None:
+    """The mode fusion guard remains shape-driven for unusual geometries."""
+    assert _can_use_vectorized_mode_evaluation(d_seed, knots, modes) is expected
 
 
 def test_jtok_torch_path_handles_noncontiguous_inputs_and_mask() -> None:

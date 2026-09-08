@@ -74,6 +74,8 @@ def _saved_or_reference(
     cfg: LeviathanConfig,
     *,
     save_intermediates: bool = True,
+    return_seed: bool = False,
+    fuse_gather: bool | None = None,
     mask_embedding: torch.Tensor | None = None,
     mask_token_id: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -86,10 +88,12 @@ def _saved_or_reference(
                     params,
                     cfg,
                     save_intermediates=save_intermediates,
+                    return_seed=return_seed,
+                    fuse_gather=fuse_gather,
                     mask_embedding=mask_embedding,
                     mask_token_id=mask_token_id,
                 )
-            if not save_intermediates:
+            if not save_intermediates and not return_seed:
                 return embeds, {}
             if saved is not None:
                 return embeds, saved
@@ -105,7 +109,7 @@ def _saved_or_reference(
             ids,
             params,
             cfg,
-            save_intermediates=save_intermediates,
+            save_intermediates=save_intermediates or return_seed,
         )
         if mask_embedding is not None:
             positions = ids.eq(int(mask_token_id)).unsqueeze(-1)
@@ -114,11 +118,245 @@ def _saved_or_reference(
                 mask_embedding.to(device=embeds.device, dtype=embeds.dtype),
                 embeds,
             )
-    if not save_intermediates:
+    if not save_intermediates and not return_seed:
         return embeds, {}
     if saved is None:  # pragma: no cover - the reference always saves here
         raise RuntimeError("Leviathan reference forward returned no checkpoints")
     return embeds, saved
+
+
+def _leviathan_forward_impl(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+    *,
+    return_seed: bool = False,
+    fuse_gather: bool | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    params = {
+        "codebooks": codebooks.detach(),
+        "head_proj_weight": head_proj_weight.detach(),
+        "head_norm_weight": head_norm_weight.detach(),
+        "head_norm_bias": head_norm_bias.detach(),
+        "head_spline_delta": head_spline_delta.detach(),
+        "head_out_weight": head_out_weight.detach(),
+        "knot_grid": knot_grid.detach(),
+    }
+    cfg = _make_config(
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+        codebooks.dtype,
+    )
+    has_meap = mask_embedding.numel() != 0
+    forward_kwargs = {
+        "return_seed": return_seed,
+        "fuse_gather": fuse_gather,
+        "mask_embedding": mask_embedding.detach() if has_meap else None,
+        "mask_token_id": mask_token_id if has_meap else None,
+    }
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("leviathan.forward", ids.device):
+            embeds, saved = _saved_or_reference(
+                ids.detach(),
+                params,
+                cfg,
+                **forward_kwargs,
+            )
+    else:
+        embeds, saved = _saved_or_reference(
+            ids.detach(),
+            params,
+            cfg,
+            **forward_kwargs,
+        )
+
+    z = saved["z"].contiguous()
+    xhat = saved.get("x_hat_por_head")
+    mean = saved.get("mean_por_head")
+    rsqrt = saved.get("rsqrt_por_head")
+    modes = saved.get("modes_por_head")
+    if xhat is None:
+        # Inference-with-seed uses this helper only to obtain z and does not
+        # expose checkpoints to autograd.  Keep the tuple shape stable for
+        # the fake/custom-op boundary without allocating a second checkpoint.
+        xhat = codebooks.new_empty((num_modes, ids.numel(), d_seed))
+        mean = torch.empty(
+            (num_modes, ids.numel(), 1),
+            dtype=torch.float32,
+            device=codebooks.device,
+        )
+        rsqrt = torch.empty_like(mean)
+    else:
+        xhat = xhat.contiguous()
+        mean = mean.contiguous()
+        rsqrt = rsqrt.contiguous()
+    has_modes = modes is not None
+    if modes is None:
+        # Keep the output metadata stable when a supported CUDA config falls
+        # back at runtime.  The flag tells the backward op not to consume this
+        # uninitialized placeholder.
+        modes = codebooks.new_empty((ids.numel(), num_modes, krank))
+    else:
+        modes = modes.contiguous()
+    mode_flag = codebooks.new_tensor(1 if has_modes else 0, dtype=torch.int8)
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors(
+            "leviathan.forward",
+            embeds=embeds,
+            z=z,
+            xhat=xhat,
+            mean=mean,
+            rsqrt=rsqrt,
+            modes=modes,
+            mode_flag=mode_flag,
+        )
+    return embeds, z, xhat, mean, rsqrt, modes, mode_flag
+
+
+@torch.library.custom_op(
+    "cut_cross_entropy::leviathan_forward_with_seed",
+    mutates_args=(),
+    device_types="cuda",
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
+def _leviathan_forward_with_seed_op(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Training boundary that exposes the kernel-produced seed to JTok.
+
+    The forward implementation is shared with the legacy op.  The only
+    policy difference is that it requests ``return_seed`` and the safe fused
+    gather, so the returned ``z`` is the same stage-one result used by
+    Leviathan itself.  Its registered backward combines the Leviathan output
+    gradient and JTok's seed gradient before the codebook scatter.
+    """
+    return _leviathan_forward_impl(
+        ids,
+        codebooks,
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        mask_token_id,
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+        return_seed=True,
+        fuse_gather=True,
+    )
+
+
+@_leviathan_forward_with_seed_op.register_fake
+def _leviathan_forward_with_seed_fake(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return _leviathan_forward_fake(
+        ids,
+        codebooks,
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        mask_token_id,
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+    )
 
 
 @torch.library.custom_op(
@@ -155,16 +393,17 @@ def _leviathan_forward_op(
     torch.Tensor,
     torch.Tensor,
 ]:
-    params = {
-        "codebooks": codebooks.detach(),
-        "head_proj_weight": head_proj_weight.detach(),
-        "head_norm_weight": head_norm_weight.detach(),
-        "head_norm_bias": head_norm_bias.detach(),
-        "head_spline_delta": head_spline_delta.detach(),
-        "head_out_weight": head_out_weight.detach(),
-        "knot_grid": knot_grid.detach(),
-    }
-    cfg = _make_config(
+    return _leviathan_forward_impl(
+        ids,
+        codebooks,
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        mask_token_id,
         vocab_size,
         hidden_size,
         d_seed,
@@ -173,53 +412,7 @@ def _leviathan_forward_op(
         spline_degree,
         generator_k,
         krank,
-        codebooks.dtype,
     )
-    has_meap = mask_embedding.numel() != 0
-    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
-        with cuda_kernel_region("leviathan.forward", ids.device):
-            embeds, saved = _saved_or_reference(
-                ids.detach(),
-                params,
-                cfg,
-                mask_embedding=mask_embedding.detach() if has_meap else None,
-                mask_token_id=mask_token_id if has_meap else None,
-            )
-    else:
-        embeds, saved = _saved_or_reference(
-            ids.detach(),
-            params,
-            cfg,
-            mask_embedding=mask_embedding.detach() if has_meap else None,
-            mask_token_id=mask_token_id if has_meap else None,
-        )
-
-    z = saved["z"].contiguous()
-    xhat = saved["x_hat_por_head"].contiguous()
-    mean = saved["mean_por_head"].contiguous()
-    rsqrt = saved["rsqrt_por_head"].contiguous()
-    modes = saved.get("modes_por_head")
-    has_modes = modes is not None
-    if modes is None:
-        # Keep the output metadata stable when a supported CUDA config falls
-        # back at runtime.  The flag tells the backward op not to consume this
-        # uninitialized placeholder.
-        modes = codebooks.new_empty((ids.numel(), num_modes, krank))
-    else:
-        modes = modes.contiguous()
-    mode_flag = codebooks.new_tensor(1 if has_modes else 0, dtype=torch.int8)
-    if TORCH_2_14_MEMORY_ANNOTATIONS:
-        annotate_tensors(
-            "leviathan.forward",
-            embeds=embeds,
-            z=z,
-            xhat=xhat,
-            mean=mean,
-            rsqrt=rsqrt,
-            modes=modes,
-            mode_flag=mode_flag,
-        )
-    return embeds, z, xhat, mean, rsqrt, modes, mode_flag
 
 
 @_leviathan_forward_op.register_fake
@@ -398,6 +591,119 @@ def _leviathan_inference_fake(
     return codebooks.new_empty((*ids.shape, hidden_size))
 
 
+@torch.library.custom_op(
+    "cut_cross_entropy::leviathan_inference_with_seed",
+    mutates_args=(),
+    device_types="cuda",
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
+def _leviathan_inference_with_seed_op(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inference boundary returning embedding plus the kernel-produced seed."""
+    params = {
+        "codebooks": codebooks.detach(),
+        "head_proj_weight": head_proj_weight.detach(),
+        "head_norm_weight": head_norm_weight.detach(),
+        "head_norm_bias": head_norm_bias.detach(),
+        "head_spline_delta": head_spline_delta.detach(),
+        "head_out_weight": head_out_weight.detach(),
+        "knot_grid": knot_grid.detach(),
+    }
+    cfg = _make_config(
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+        codebooks.dtype,
+    )
+    has_meap = mask_embedding.numel() != 0
+    forward_kwargs = {
+        "save_intermediates": False,
+        "return_seed": True,
+        "fuse_gather": True,
+        "mask_embedding": mask_embedding.detach() if has_meap else None,
+        "mask_token_id": mask_token_id if has_meap else None,
+    }
+    if TORCH_2_14_CUDA_KERNEL_CONTEXT:
+        with cuda_kernel_region("leviathan.inference", ids.device):
+            embeds, saved = _saved_or_reference(
+                ids.detach(), params, cfg, **forward_kwargs
+            )
+    else:
+        embeds, saved = _saved_or_reference(
+            ids.detach(), params, cfg, **forward_kwargs
+        )
+    seed = saved["z"].contiguous()
+    if TORCH_2_14_MEMORY_ANNOTATIONS:
+        annotate_tensors("leviathan.inference", embeds=embeds, z=seed)
+    return embeds, seed
+
+
+@_leviathan_inference_with_seed_op.register_fake
+def _leviathan_inference_with_seed_fake(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del (
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        mask_token_id,
+        vocab_size,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+    )
+    return (
+        codebooks.new_empty((*ids.shape, hidden_size)),
+        codebooks.new_empty((ids.numel(), d_seed)),
+    )
+
+
 def _compute_leviathan_grads(
     grad_out: torch.Tensor,
     params: dict[str, torch.Tensor],
@@ -405,6 +711,7 @@ def _compute_leviathan_grads(
     saved: dict[str, Any],
     ids: torch.Tensor,
     has_modes: bool,
+    seed_grad: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     grads = None
     if has_modes and _leviathan_backward_triton is not None:
@@ -415,6 +722,7 @@ def _compute_leviathan_grads(
                 cfg,
                 saved,
                 ids,
+                seed_grad=seed_grad,
             )
         except (TypeError, ValueError, AttributeError):
             grads = None
@@ -431,6 +739,7 @@ def _compute_leviathan_grads(
             saved=saved,
             ids=ids,
             chunk=chunk,
+            seed_grad=seed_grad,
         )
     return grads
 
@@ -457,6 +766,7 @@ def _leviathan_backward_op(
     rsqrt: torch.Tensor,
     modes: torch.Tensor,
     modes_available: torch.Tensor,
+    seed_grad: torch.Tensor,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -507,11 +817,13 @@ def _leviathan_backward_op(
     if TORCH_2_14_CUDA_KERNEL_CONTEXT:
         with cuda_kernel_region("leviathan.backward", ids.device):
             grads = _compute_leviathan_grads(
-                grad_out, params, cfg, saved, ids, has_modes
+                grad_out, params, cfg, saved, ids, has_modes,
+                seed_grad=seed_grad,
             )
     else:
         grads = _compute_leviathan_grads(
-            grad_out, params, cfg, saved, ids, has_modes
+            grad_out, params, cfg, saved, ids, has_modes,
+            seed_grad=seed_grad,
         )
     if TORCH_2_14_MEMORY_ANNOTATIONS:
         annotate_tensors("leviathan.backward", **grads)
@@ -545,6 +857,7 @@ def _leviathan_backward_fake(
     rsqrt: torch.Tensor,
     modes: torch.Tensor,
     modes_available: torch.Tensor,
+    seed_grad: torch.Tensor,
     vocab_size: int,
     hidden_size: int,
     d_seed: int,
@@ -571,6 +884,7 @@ def _leviathan_backward_fake(
         rsqrt,
         modes,
         modes_available,
+        seed_grad,
         vocab_size,
         hidden_size,
         d_seed,
@@ -643,8 +957,11 @@ def _leviathan_setup_context(ctx, inputs, output) -> None:
     ctx.mark_non_differentiable(z, xhat, mean, rsqrt, modes, mode_flag)
 
 
-def _leviathan_backward(ctx, *grads):
-    grad_out = grads[0]
+def _leviathan_backward_impl(
+    ctx,
+    grad_out: torch.Tensor,
+    seed_grad: torch.Tensor | None = None,
+):
     (
         ids,
         codebooks,
@@ -717,6 +1034,7 @@ def _leviathan_backward(ctx, *grads):
             rsqrt,
             modes,
             mode_flag,
+            codebooks.new_empty(0) if seed_grad is None else seed_grad,
             vocab_size,
             hidden_size,
             d_seed,
@@ -750,10 +1068,82 @@ def _leviathan_backward(ctx, *grads):
     )
 
 
+def _leviathan_backward(ctx, *grads):
+    """Backward for the legacy embedding-only custom op."""
+    return _leviathan_backward_impl(ctx, grads[0])
+
+
 torch.library.register_autograd(
     _leviathan_forward_op,
     _leviathan_backward,
     setup_context=_leviathan_setup_context,
+)
+
+
+def _leviathan_with_seed_setup_context(ctx, inputs, output) -> None:
+    """Save the same checkpoints while keeping the seed differentiable."""
+    (
+        ids,
+        codebooks,
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        mask_token_id,
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+    ) = inputs
+    _embeds, z, xhat, mean, rsqrt, modes, mode_flag = output
+    ctx.save_for_backward(
+        ids,
+        codebooks,
+        head_proj_weight,
+        head_norm_weight,
+        head_norm_bias,
+        head_spline_delta,
+        head_out_weight,
+        knot_grid,
+        mask_embedding,
+        z,
+        xhat,
+        mean,
+        rsqrt,
+        modes,
+        mode_flag,
+    )
+    ctx.config_values = (
+        mask_token_id,
+        vocab_size,
+        hidden_size,
+        d_seed,
+        num_modes,
+        num_knots,
+        spline_degree,
+        generator_k,
+        krank,
+    )
+    # z is intentionally omitted: JTok/JTok-M must receive its gradient.
+    ctx.mark_non_differentiable(xhat, mean, rsqrt, modes, mode_flag)
+
+
+def _leviathan_with_seed_backward(ctx, *grads):
+    """Merge d(embedding) and d(seed) before Leviathan's codebook scatter."""
+    return _leviathan_backward_impl(ctx, grads[0], grads[1])
+
+
+torch.library.register_autograd(
+    _leviathan_forward_with_seed_op,
+    _leviathan_with_seed_backward,
+    setup_context=_leviathan_with_seed_setup_context,
 )
 
 
@@ -889,24 +1279,88 @@ def leviathan_embedding_with_seed_compiler_safe(
     mask_embedding: torch.Tensor | None = None,
     mask_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run legacy LEV and expose a differentiable seed for JTok/JTok-M.
+    """Run Leviathan and expose the *same* kernel-produced seed to JTok.
 
-    The original ``leviathan_embedding_compiler_safe`` contract and custom-op
-    graph remain unchanged. The additional seed bridge is intentionally
-    limited to the compositional codebook stage so JTok can train the shared
-    codebooks without forcing the full reference Leviathan graph into the
-    model.
+    CUDA training uses a multi-output custom op.  Leviathan's A stage writes
+    ``z`` once, JTok/JTok-M consumes that output, and the custom backward adds
+    JTok's ``dL/dz`` to Leviathan's ``dL/dz`` before one codebook scatter.  The
+    legacy embedding-only entry point is not changed.  CPU/reference callers
+    retain the differentiable bridge because the Triton custom op is CUDA
+    only.
     """
-    embedding = leviathan_embedding_compiler_safe(
-        ids,
-        params,
-        cfg,
-        knot_grid,
-        mask_embedding=mask_embedding,
-        mask_token_id=mask_token_id,
+    has_meap = mask_embedding is not None or mask_token_id is not None
+    if has_meap:
+        if mask_embedding is None or mask_token_id is None:
+            raise ValueError("mask_embedding and mask_token_id must be provided together")
+        if not isinstance(mask_token_id, int):
+            raise TypeError("mask_token_id must be an integer")
+        if not 0 <= mask_token_id < int(cfg.vocab_size):
+            raise ValueError("mask_token_id must be inside the Leviathan vocabulary")
+        if mask_embedding.ndim != 1 or mask_embedding.numel() != int(cfg.hidden_size):
+            raise ValueError("mask_embedding must be a vector with cfg.hidden_size elements")
+        if mask_embedding.device != params["codebooks"].device:
+            raise ValueError("mask_embedding must be on the Leviathan device")
+        if not mask_embedding.is_floating_point():
+            raise TypeError("mask_embedding must be floating point")
+
+    if not ids.is_cuda or not params["codebooks"].is_cuda:
+        embedding = leviathan_embedding_compiler_safe(
+            ids,
+            params,
+            cfg,
+            knot_grid,
+            mask_embedding=mask_embedding,
+            mask_token_id=mask_token_id,
+        )
+        seed = _leviathan_seed_from_codebooks(ids, params["codebooks"])
+        return embedding, seed
+
+    grad_enabled = torch.is_grad_enabled()
+    needs_backward = grad_enabled and any(
+        tensor.requires_grad for name, tensor in params.items() if name != "knot_grid"
     )
-    seed = _leviathan_seed_from_codebooks(ids, params["codebooks"])
-    return embedding, seed
+    mask_needs_backward = grad_enabled and has_meap and mask_embedding.requires_grad
+    external_mask_grad = mask_needs_backward and not needs_backward
+    fuse_mask_in_kernel = has_meap and not external_mask_grad
+    kernel_mask_embedding = (
+        mask_embedding
+        if fuse_mask_in_kernel and needs_backward
+        else mask_embedding.detach()
+        if fuse_mask_in_kernel
+        else knot_grid.reshape(-1)[:0]
+    )
+    args = (
+        ids,
+        params["codebooks"],
+        params["head_proj_weight"],
+        params["head_norm_weight"],
+        params["head_norm_bias"],
+        params["head_spline_delta"],
+        params["head_out_weight"],
+        knot_grid,
+        kernel_mask_embedding,
+        int(mask_token_id) if fuse_mask_in_kernel else -1,
+        int(cfg.vocab_size),
+        int(cfg.hidden_size),
+        int(cfg.generator_d_seed),
+        int(cfg.generator_num_modes),
+        int(cfg.generator_num_knots),
+        int(cfg.generator_spline_degree),
+        int(cfg.generator_k),
+        int(getattr(cfg, "generator_krank", params["head_spline_delta"].shape[-1])),
+    )
+    if needs_backward:
+        result = _leviathan_forward_with_seed_op(*args)
+        embedding, seed = result[0], result[1]
+    else:
+        embedding, seed = _leviathan_inference_with_seed_op(*args)
+    if external_mask_grad:
+        embedding = torch.where(
+            ids.eq(int(mask_token_id)).unsqueeze(-1),
+            mask_embedding.to(device=embedding.device, dtype=embedding.dtype),
+            embedding,
+        )
+    return embedding, seed.reshape(*ids.shape, int(cfg.generator_d_seed))
 
 
 __all__ = [

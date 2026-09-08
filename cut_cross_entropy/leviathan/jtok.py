@@ -90,6 +90,11 @@ _SINGLE_TILE_HIDDEN_LIMIT = 256
 # real NeoLLM geometry (d_seed=128, knots=16, modes=4) while keeping larger
 # spline surfaces on the established scalar-grid path.
 _TOKEN_PROJECTION_BLOCK_WORK_LIMIT = 8192
+# The wide mode evaluator can reuse the B-spline basis across modes when the
+# padded coefficient surface fits one Triton program.  This is a geometry
+# budget, not a model-specific batch/hidden constant; larger surfaces retain
+# the established one-program-per-mode implementation below.
+_MODE_EVALUATION_WORK_LIMIT = 8192
 _USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
 
 
@@ -105,6 +110,23 @@ def _can_use_vectorized_token_projection(
     return (
         d_seed <= 128
         and d_seed * knot_pad * modes <= _TOKEN_PROJECTION_BLOCK_WORK_LIMIT
+    )
+
+
+def _can_use_vectorized_mode_evaluation(
+    d_seed: int,
+    knots: int,
+    modes: int,
+) -> bool:
+    """Return whether mode evaluation fits the vectorized geometry budget."""
+    if d_seed < 1 or knots < 1 or modes < 1:
+        return False
+    knot_pad = 1 << (int(knots) - 1).bit_length()
+    mode_pad = 1 << (int(modes) - 1).bit_length()
+    return (
+        d_seed <= 128
+        and mode_pad <= 32
+        and d_seed * knot_pad * mode_pad <= _MODE_EVALUATION_WORK_LIMIT
     )
 
 
@@ -653,6 +675,110 @@ if _TRITON_AVAILABLE:
             modes_ptr + (row * TOP_K + slot) * NUM_MODES + mode,
             value.to(modes_ptr.dtype.element_ty),
             mask=row_mask,
+        )
+
+    @triton.jit
+    def _jtok_modes_kernel_vectorized(
+        z_ptr,
+        coeff_ptr,
+        grid_ptr,
+        expert_idx_ptr,
+        valid_ptr,
+        modes_ptr,
+        N,
+        D_SEED: tl.constexpr,
+        NUM_KNOTS: tl.constexpr,
+        NUM_MODES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        KNOT_PAD: tl.constexpr,
+        MODE_PAD: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+    ):
+        """Evaluate all selected modes while sharing each token's basis.
+
+        The legacy wide evaluator launches one program per
+        ``(token, route, mode)``.  Every such program rereads the same seed
+        coordinate and rebuilds the same normalized B-spline basis.  This
+        variant launches one program per ``(token, route)`` and carries a
+        padded mode vector, so the basis is formed once and the coefficient
+        surface is reduced across modes in parallel.  ``MODE_PAD`` and the
+        geometry guard in Python keep irregular mode counts masked without
+        making a model-specific assumption.
+        """
+        pid = tl.program_id(0)
+        row = pid // TOP_K
+        slot = pid % TOP_K
+        row_mask = row < N
+        expert = tl.load(
+            expert_idx_ptr + row * TOP_K + slot,
+            mask=row_mask,
+            other=0,
+        ).to(tl.int32)
+        if HAS_MASK:
+            row_valid = tl.load(
+                valid_ptr + row,
+                mask=row_mask,
+                other=0,
+            ).to(tl.int1)
+        else:
+            row_valid = row_mask
+
+        knot_offsets = tl.arange(0, KNOT_PAD)
+        knot_mask = knot_offsets < NUM_KNOTS
+        mode_offsets = tl.arange(0, MODE_PAD)
+        mode_mask = mode_offsets < NUM_MODES
+        grid = tl.load(
+            grid_ptr + knot_offsets,
+            mask=knot_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scale = float(max(int(NUM_KNOTS) - 1, 0))
+        log_acc = tl.zeros((MODE_PAD,), dtype=tl.float32)
+        neg_acc = tl.zeros((MODE_PAD,), dtype=tl.int32)
+
+        for d in tl.range(0, D_SEED):
+            x = tl.load(
+                z_ptr + row * D_SEED + d,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
+            distance = tl.abs(x - grid) * scale
+            basis = tl.where(
+                distance < 0.5,
+                0.75 - distance * distance,
+                tl.where(
+                    distance < 1.5,
+                    0.5 * (1.5 - distance) * (1.5 - distance),
+                    0.0,
+                ),
+            )
+            basis = tl.where(knot_mask, basis, 0.0)
+            basis = basis / tl.maximum(tl.sum(basis, axis=0), 1e-12)
+            coeff = tl.load(
+                coeff_ptr
+                + (
+                    (
+                        (expert * NUM_MODES + mode_offsets[:, None]) * D_SEED
+                        + d
+                    )
+                    * NUM_KNOTS
+                    + knot_offsets[None, :]
+                ),
+                mask=(mode_mask[:, None] & knot_mask[None, :] & row_mask),
+                other=0.0,
+            ).to(tl.float32)
+            phi = tl.sum(basis[None, :] * coeff, axis=1)
+            log_acc += tl.log(tl.abs(phi) + 1e-9)
+            neg_acc += (phi < 0).to(tl.int32)
+
+        value = (1.0 - 2.0 * (neg_acc & 1).to(tl.float32)) * tl.exp(log_acc)
+        value = tl.where(row_valid & row_mask & mode_mask, value, 0.0)
+        tl.store(
+            modes_ptr
+            + (row * TOP_K + slot) * NUM_MODES
+            + mode_offsets,
+            value.to(modes_ptr.dtype.element_ty),
+            mask=row_mask & mode_mask,
         )
 
     @triton.jit
@@ -2422,9 +2548,9 @@ def _run_jtok_triton(
     modes_buffer = torch.empty(
         (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
     )
-    modes_grid = (n_tokens * top_k * modes,)
-    if has_mask:
-        _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+    if _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
+        mode_grid = (n_tokens * top_k,)
+        _jtok_wrap_kernel(_jtok_modes_kernel_vectorized)[mode_grid](
             z,
             spline_coeff,
             knot_grid,
@@ -2437,25 +2563,46 @@ def _run_jtok_triton(
             NUM_MODES=modes,
             TOP_K=top_k,
             KNOT_PAD=knot_pad,
+            MODE_PAD=triton.next_power_of_2(modes),
+            HAS_MASK=has_mask,
             num_warps=4,
             num_stages=1,
         )
     else:
-        _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
-            z,
-            spline_coeff,
-            knot_grid,
-            expert_idx,
-            modes_buffer,
-            n_tokens,
-            D_SEED=d_seed,
-            NUM_KNOTS=knots,
-            NUM_MODES=modes,
-            TOP_K=top_k,
-            KNOT_PAD=knot_pad,
-            num_warps=4,
-            num_stages=1,
-        )
+        modes_grid = (n_tokens * top_k * modes,)
+        if has_mask:
+            _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                valid_mask,
+                modes_buffer,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=knot_pad,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
+                z,
+                spline_coeff,
+                knot_grid,
+                expert_idx,
+                modes_buffer,
+                n_tokens,
+                D_SEED=d_seed,
+                NUM_KNOTS=knots,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+                KNOT_PAD=knot_pad,
+                num_warps=4,
+                num_stages=1,
+            )
     surface = torch.empty(
         (n_tokens, hidden), device=delta.device, dtype=torch.float32
     )
@@ -2669,9 +2816,9 @@ def _run_jtok_backward_triton(
             grad_residual_buffer = torch.zeros(
                 (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
             )
-        modes_grid = (n_tokens * top_k * modes,)
-        if valid_mask.numel():
-            _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+        if _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
+            mode_grid = (n_tokens * top_k,)
+            _jtok_wrap_kernel(_jtok_modes_kernel_vectorized)[mode_grid](
                 z,
                 spline_coeff,
                 knot_grid,
@@ -2684,25 +2831,46 @@ def _run_jtok_backward_triton(
                 NUM_MODES=modes,
                 TOP_K=top_k,
                 KNOT_PAD=triton.next_power_of_2(knots),
+                MODE_PAD=triton.next_power_of_2(modes),
+                HAS_MASK=bool(valid_mask.numel()),
                 num_warps=4,
                 num_stages=1,
             )
         else:
-            _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
-                z,
-                spline_coeff,
-                knot_grid,
-                expert_idx,
-                modes_buffer,
-                n_tokens,
-                D_SEED=d_seed,
-                NUM_KNOTS=knots,
-                NUM_MODES=modes,
-                TOP_K=top_k,
-                KNOT_PAD=triton.next_power_of_2(knots),
-                num_warps=4,
-                num_stages=1,
-            )
+            modes_grid = (n_tokens * top_k * modes,)
+            if valid_mask.numel():
+                _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
+                    z,
+                    spline_coeff,
+                    knot_grid,
+                    expert_idx,
+                    valid_mask,
+                    modes_buffer,
+                    n_tokens,
+                    D_SEED=d_seed,
+                    NUM_KNOTS=knots,
+                    NUM_MODES=modes,
+                    TOP_K=top_k,
+                    KNOT_PAD=triton.next_power_of_2(knots),
+                    num_warps=4,
+                    num_stages=1,
+                )
+            else:
+                _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
+                    z,
+                    spline_coeff,
+                    knot_grid,
+                    expert_idx,
+                    modes_buffer,
+                    n_tokens,
+                    D_SEED=d_seed,
+                    NUM_KNOTS=knots,
+                    NUM_MODES=modes,
+                    TOP_K=top_k,
+                    KNOT_PAD=triton.next_power_of_2(knots),
+                    num_warps=4,
+                    num_stages=1,
+                )
         surface = torch.empty(
             (n_tokens, hidden), device=delta.device, dtype=torch.float32
         )
