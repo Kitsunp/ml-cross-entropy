@@ -733,6 +733,38 @@ compile/autotune event and is excluded from the steady-state comparison.
 No global compile policy, optimizer flag, MXFP8 setting, model configuration,
 tokenizer, or checkpoint was changed.
 
+### Rejected experiment: hoisting the spline derivative reduction (2026-09-08)
+
+The token-projection backward computes `derivative_sum` from `z` and the knot
+grid, so it is invariant across the mode loop.  A candidate moved that
+reduction outside the loop in both the scalar and vectorized token-projection
+kernels.  The change preserved the same equation and passed the focused CUDA
+suite (`44 passed, 1 deselected`), but it did not improve the complete kernel
+path.
+
+The paired model-free run used seed `1729`, BF16, `batch=16`,
+`sequence=512`, `hidden=512`, `d_seed=128`, `knots=16`, `modes=4`,
+`experts=5`, `top_k=2`, one layer, three warmups, eight measured steps,
+`torch.compile(mode="max-autotune")`, and a CUDA profile in each run:
+
+| isolated training | accepted median | hoisted median | change |
+| --- | ---: | ---: | ---: |
+| JTok forward | 0.522 ms | 0.524 ms | +0.38% |
+| JTok backward | 0.781 ms | 0.785 ms | +0.52% |
+| JTok total | 1.303 ms | 1.312 ms | +0.69% |
+| JTok-M forward | 0.712 ms | 0.703 ms | -1.20% |
+| JTok-M backward | 1.792 ms | 1.831 ms | +2.22% |
+| JTok-M total | 2.505 ms | 2.540 ms | +1.40% |
+
+Peak allocated/reserved memory was unchanged.  The profile showed the
+token-projection kernel itself essentially unchanged; the small forward
+variation did not translate into a backward or end-to-end gain.  Cold
+compilation also increased by approximately 5.4% for JTok and 12.3% for
+JTok-M with the fresh caches used for the comparison.  The candidate was
+removed before a full NeoLLM training run.  The original placement remains
+authoritative because Triton's optimizer already handles this invariant in
+the generated program without a measurable benefit from forcing the rewrite.
+
 ### Rejected experiment: autotuning the forward projection tile (2026-09-08)
 
 The next apparent bottleneck was `_jtok_project_kernel`, which is shared by
