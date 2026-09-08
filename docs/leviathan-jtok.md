@@ -546,3 +546,25 @@ multiple NCCL ranks to the single available GPU, reporting
 `Multiple Ranks are using the same GPU/Partition`.  The complete-row test
 itself passes independently and restores the planner limit after overriding
 it, so unusual geometries retain deterministic dispatch behavior.
+
+### Rejected experiment: masking zero-support spline atomics (2026-09-08)
+
+The token-projection backward evaluates a compact quadratic B-spline, whose
+support is at most three knots per seed coordinate for the usual uniform
+grid.  A candidate added an explicit `distance < 1.5` mask to coefficient
+loads and `grad_coeff` atomics, and also masked invalid rows.  It preserved
+the dense equation and changed no public interface.
+
+The candidate was measured after the complete-row tile was enabled, using the
+same `n=8192`, BF16, `hidden=512`, `d_seed=128`, `knots=16`, `modes=4`
+geometry.  It was slower in both variants:
+
+| isolated backward | accepted path | masked-support candidate | change |
+| --- | ---: | ---: | ---: |
+| JTok | 1.310 ms | 1.428 ms | +9.0% |
+| JTok-M | 2.972 ms | 3.306 ms | +11.2% |
+
+Peak allocated and reserved memory were unchanged.  The dynamic predication
+and masked vector transactions cost more than the zero-valued atomics saved
+on this RTX 5090/Triton geometry.  The candidate was removed before a full
+training run; the unmasked token-projection path remains authoritative.
