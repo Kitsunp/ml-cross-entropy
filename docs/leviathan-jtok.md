@@ -948,3 +948,106 @@ The implementation does not alter Leviathan, CCE, the tokenizer, model
 configuration, optimizer flags, MXFP8, or the global `torch.compile` policy.
 It also does not add a fallback reference path: the Triton backend remains
 mandatory for the registered JTok/JTok-M CUDA operations.
+
+### Rejected experiment: compact grouped expert-route backward (2026-09-08)
+
+The proposed next optimization was tested as a real compiled multi-layer
+training flow, without importing NeoLLM: compact valid token/slot routes into
+expert buckets and use those buckets for grouped reductions of the JTok-M
+projection gradients. The comparison used the same seed (`1729`), BF16,
+`N=32768`, hidden size `512`, `D_SEED=128`, `16` knots, `4` modes, `5`
+experts, `TOP_K=2`, four compiled layers, `torch.compile(mode="max-autotune")`,
+eight measured optimizer steps, and the Triton backend. The baseline was the
+accepted route-shared implementation immediately before this experiment.
+
+| implementation | forward median | backward median | total step median | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| accepted expert-major reductions | 7.787 ms | 26.794 ms | 34.671 ms | 806.59 MiB | 1090 MiB |
+| compact grouped-route candidate | 7.101 ms | 53.168 ms | 60.364 ms | 806.59 MiB | 1090 MiB |
+
+The candidate made forward `8.8%` faster, but made backward `98.4%` slower
+and the complete measured step `74.1%` slower, with no VRAM reduction. Its
+loss remained finite and its cold compile time changed from `36.677 s` to
+`35.439 s`, so the regression is in the executed backward kernels rather than
+an initialization failure.
+
+The profile explains the rejection. The grouped token-projection reduction
+took `25.113 ms` across four calls and the grouped projection reduction took
+`16.252 ms`; the accepted kernels took `5.507 ms` and `8.694 ms`, respectively.
+Route counting and scattering together cost only about `0.184 ms`, and the
+prefix sum cost about `0.003 ms`. Therefore the metadata compaction itself is
+not the problem: the indirect route loads, masked reductions, atomics, and
+register/resource footprint of the grouped kernels dominate the backward.
+
+This candidate is not part of the accepted implementation and must not be
+used as a performance claim. The accepted expert-major path remains the
+reference for subsequent JTok-M work. The experiment is kept here so the
+same route-grouping idea is not repeated without changing its reduction
+strategy and proving a memory benefit first.
+
+#### Reproduction protocol
+
+The benchmark was run twice in separate processes, once with the accepted
+source and once with the grouped candidate. Both runs used the same command
+and only changed the kernel source under test:
+
+```text
+python benchmark/leviathan_jtok.py \
+  --variant jtokm --backend triton --mode training --compiled \
+  --batch 64 --sequence 512 --hidden 512 --d-seed 128 \
+  --knots 16 --modes 4 --experts 5 --top-k 2 --layers 4 \
+  --warmup 3 --steps 8 --optimizer-step --profile
+```
+
+The harness fixes the random seed at `1729`. `--optimizer-step` is important:
+the measurement includes forward, loss, backward, and parameter updates for
+all four compiled layers; it is not a forward-only or isolated-kernel
+benchmark. With batch `64` and sequence `512`, the flattened token count is
+`32768`, so the candidate's wide/sparse dispatch predicate was active. The
+two runs used the same BF16 dtype, CUDA device, Triton backend, compilation
+mode, warmup policy, and measured-step count.
+
+The accepted baseline profile was:
+
+| kernel | calls | total |
+| --- | ---: | ---: |
+| `_jtok_backward_projection_grad_kernel` | 4 | 8.694 ms |
+| `_jtok_backward_token_projection_grad_block_kernel` | 4 | 5.507 ms |
+| `_jtok_project_kernel` | 8 | 8.446 ms |
+| `_jtok_backward_multi_tile_fast_kernel` | 4 | 6.495 ms |
+| route-shared mode evaluator | 2 | 2.252 ms |
+| finalize kernel | 4 | 0.283 ms |
+
+The grouped candidate profile was:
+
+| kernel | calls | total |
+| --- | ---: | ---: |
+| `_jtok_backward_projection_grad_grouped_kernel` | 4 | 16.252 ms |
+| `_jtok_backward_token_projection_grad_grouped_kernel` | 4 | 25.113 ms |
+| `_jtok_project_kernel` | 8 | 7.713 ms |
+| `_jtok_backward_multi_tile_fast_kernel` | 4 | 5.915 ms |
+| route-shared mode evaluator | 2 | 2.044 ms |
+| route-count and route-scatter kernels | 8 total | 0.184 ms |
+| prefix sum | 1 | 0.003 ms |
+| finalize kernel | 4 | 0.274 ms |
+
+This shows why the result cannot be summarized as “compaction was slow”. The
+count/scatter/prefix metadata work was small. The regression appeared inside
+the two grouped reductions: each route now required indirect reads through a
+compact position list, masked reductions over a variable route count, and
+atomic accumulation into expert-owned parameter tiles. That access pattern
+raised the reduction cost despite preserving expert-major output ownership.
+
+#### What was and was not validated
+
+The candidate completed the compiled training loop without a runtime error,
+produced a finite loss (`0.00137514609377831`), and used the same measured
+peak memory as the baseline. This validates execution and memory accounting,
+not numerical equivalence of every individual gradient element. A future
+grouped implementation would additionally need an explicit gradient-parity
+test against the accepted expert-major path before it could be considered.
+
+The result is nevertheless sufficient to reject this implementation for
+performance: the complete step became `74.1%` slower and VRAM did not
+decrease. The grouped code was therefore removed from the accepted source;
+only this negative result and its reproduction protocol are committed.
