@@ -732,3 +732,42 @@ steps plus two validation steps.  The first training step remains a cold
 compile/autotune event and is excluded from the steady-state comparison.
 No global compile policy, optimizer flag, MXFP8 setting, model configuration,
 tokenizer, or checkpoint was changed.
+
+### Rejected experiment: autotuning the forward projection tile (2026-09-08)
+
+The next apparent bottleneck was `_jtok_project_kernel`, which is shared by
+the wide forward path and the wide backward path.  A candidate exposed
+`BLOCK_N` (`64`, `128`, and `256`) to Triton's autotuner and reset `norm` for
+each candidate.  This was removed after a paired, model-free CUDA run; it did
+not meet the no-regression requirement.
+
+The baseline was commit `b0358bb` and the candidate used the same seed `1729`,
+BF16, `batch=16`, `sequence=512`, `hidden=512`, `d_seed=128`, `knots=16`,
+`modes=4`, `experts=5`, `top_k=2`, one JTok layer, three warmups, eight
+measured steps, and `torch.compile(mode="max-autotune")`.  Each run included
+its own CUDA profile and used a fresh Triton/Inductor cache:
+
+| isolated training | baseline median | candidate median | change |
+| --- | ---: | ---: | ---: |
+| JTok forward | 0.522 ms | 0.516 ms | -1.11% |
+| JTok backward | 0.781 ms | 0.799 ms | +2.36% |
+| JTok total | 1.303 ms | 1.319 ms | +1.25% |
+| JTok-M forward | 0.712 ms | 0.733 ms | +2.98% |
+| JTok-M backward | 1.792 ms | 1.974 ms | +10.16% |
+| JTok-M total | 2.505 ms | 2.704 ms | +7.97% |
+
+Peak memory was unchanged (`90.7/316 MiB` allocated/reserved for JTok and
+`125.8/318 MiB` for JTok-M).  The trace explains the regression: the selected
+candidate used a smaller effective projection tile, increasing the projection
+grid from one to two hidden tiles for the tested geometry.  In JTok-M the
+projection kernel total rose from `0.425` to `0.473 ms`; the same surface is
+then consumed again by the backward path, whose projection-gradient and
+multi-tile kernels also became slower.  The forward saving in JTok did not
+cover that additional backward work.
+
+This candidate was removed before any full NeoLLM training run.  The fixed
+projection launch remains authoritative; the previous geometry-aware
+autotuning of `_jtok_backward_projection_grad_kernel` is independent and
+remains accepted.  The benchmark and traces were kept outside the commit as
+local investigation artifacts, while this result is recorded here to prevent
+repeating the same forward-tile autotune experiment.
