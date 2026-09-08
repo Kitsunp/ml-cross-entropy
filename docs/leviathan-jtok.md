@@ -568,3 +568,27 @@ Peak allocated and reserved memory were unchanged.  The dynamic predication
 and masked vector transactions cost more than the zero-valued atomics saved
 on this RTX 5090/Triton geometry.  The candidate was removed before a full
 training run; the unmasked token-projection path remains authoritative.
+
+### Rejected experiment: expert-fused projection-gradient kernel (2026-09-08)
+
+The remaining JTok-M projection-gradient kernel reloads the same
+`grad_surface` tile once per expert.  A candidate instead loaded one
+token/hidden tile and looped over a bounded expert set, preserving
+expert-major FP32 atomics and avoiding any dense expert-expanded workspace.
+The dispatch guard limited it to small expert pools and bounded
+`experts * (d_seed + modes)` work.
+
+The candidate passed the model-free CUDA suite (`44 passed`) and preserved
+the forward and backward equations, but it was slower in the isolated full
+geometry (`n=8192`, BF16, `hidden=512`, `d_seed=128`, `knots=16`, `modes=4`,
+`top_k=2`):
+
+| isolated backward | accepted expert-major path | fused-expert candidate | change |
+| --- | ---: | ---: | ---: |
+| JTok | 1.285 ms | 1.285 ms | no applicable change |
+| JTok-M | 2.972 ms | 3.561 ms | +19.8% |
+
+Peak memory was unchanged.  Reusing the surface load did not compensate for
+the longer expert loop and its register/atomic pressure on the RTX 5090.
+The candidate was removed before a full-flow run; the expert-major kernel
+remains authoritative, including for unbalanced routing.
