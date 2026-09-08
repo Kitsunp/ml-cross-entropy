@@ -474,3 +474,75 @@ experiment: that candidate only changed the reduction of the global
 `grad_scaler` and did not eliminate mode recomputation. The mode-cache change
 is kept because it removes a complete backward mode-evaluation launch per
 layer in the real flow while adding only the compact activation workspace.
+
+### Accepted experiment: complete-row tile for the wide backward (2026-09-08)
+
+The next bottleneck was not the shared scaler reduction.  The wide backward
+was splitting the real hidden row into two 256-lane programs even when the
+complete row fit the existing work budget.  For the real geometry
+`hidden=512`, `d_seed=128`, `modes=4`, the budget is `67584` work items for
+JTok (`top_k=1`) and `69632` for JTok-M (`top_k=2`), both below the
+`131072` limit.
+
+The planner now permits a complete 512-lane row only when both conditions are
+true: the padded hidden width is at most the resource guard and the combined
+seed/mode work fits the budget.  Otherwise it keeps the 256-lane multi-tile
+path.  This is a dispatch change in `_backward_hidden_tile_plan`, not a
+model-specific special case and not a change to the Leviathan base path.
+
+With one complete row, `_jtok_backward_multi_tile_fast_kernel` computes the
+normalization dot product locally and writes the token-local mode, residual,
+and route-weight gradients directly.  It therefore removes the separate
+`_jtok_backward_norm_dot_kernel` launch and the cross-tile atomics for those
+token-local workspaces.  The shared `grad_scaler` still uses its inline FP32
+atomic accumulation across tokens; the rejected standalone scaler-reduction
+kernel was not reintroduced.  No dense expert-expanded workspace is added.
+
+The model-free CUDA comparison used `n=8192`, BF16, seed `1729`, and the
+full `hidden=512, d_seed=128, knots=16, modes=4` geometry.  The output was
+bitwise equal between the tiled and complete-row partitions.  The largest
+absolute gradient differences were `2.44e-4` for the seed and `1.95e-3` for
+the residual surface in JTok; JTok-M remained finite with maximum absolute
+differences no larger than `9.77e-4` for the residual surface.  These are
+the expected FP32 accumulation-order differences, not a mathematical path
+change.  The isolated backward median changed as follows, with no change in
+allocated or reserved peak memory:
+
+| isolated backward | two 256-lane tiles | complete 512-lane row | change |
+| --- | ---: | ---: | ---: |
+| JTok | 1.600 ms | 1.310 ms | -18.1% |
+| JTok-M | 3.455 ms | 2.972 ms | -14.0% |
+
+The complete NeoLLM training flow was then rerun with the same seed `1729`,
+BF16, batch `64`, sequence `512`, 12 Transformer layers, CCE, AdEMAMix,
+`torch.compile(mode="max-autotune")`, MXFP8 inactive, Delta inactive, two
+validation steps, and one profile at step 12.  The comparison is against the
+previous accepted mode-cache run, using stable steps 4--11:
+
+| full flow | previous median | complete-row median | change | previous steps/s | new steps/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JTok | 293.657 ms | 277.506 ms | -5.50% | 3.405 | 3.604 |
+| JTok-M | 358.556 ms | 330.163 ms | -7.92% | 2.789 | 3.029 |
+
+Peak memory was unchanged within the recorded precision:
+
+| full flow | previous allocated/reserved | complete-row allocated/reserved |
+| --- | ---: | ---: |
+| JTok | 19.946 / 21.221 GiB | 19.946 / 21.221 GiB |
+| JTok-M | 20.424 / 21.760 GiB | 20.424 / 21.760 GiB |
+
+Validation did not regress: JTok changed from `131.269` to `131.392 ms`,
+and JTok-M from `137.645` to `137.532 ms`.  The traces provide the causal
+evidence.  The wide backward kernel fell from `22.534` to `9.854 ms` for
+JTok and from `43.311` to `18.347 ms` for JTok-M, while the normalization-dot
+kernel disappeared.  The mode, projection-gradient, and token-projection
+kernels remained on their Triton paths, and no `jtok_reference` event was
+observed.
+
+The focused model-free JTok suite passed `44` tests with one unrelated
+selection.  The full package run passed `3432` tests; its `38` failures were
+the existing multi-process FSDP/vocab-parallel tests attempting to assign
+multiple NCCL ranks to the single available GPU, reporting
+`Multiple Ranks are using the same GPU/Partition`.  The complete-row test
+itself passes independently and restores the planner limit after overriding
+it, so unusual geometries retain deterministic dispatch behavior.

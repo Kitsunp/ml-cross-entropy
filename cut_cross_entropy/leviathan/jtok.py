@@ -105,10 +105,13 @@ _BACKWARD_MULTI_TILE_BLOCK_H = 256
 # the NeoLLM model dimensions.  Larger rows retain the established 256-lane
 # multi-tile reduction to avoid excessive register pressure.
 _BACKWARD_SINGLE_TILE_WORK_LIMIT = 131072
-# Do not widen the established reduction beyond 256 lanes without a separate
-# register/occupancy measurement.  A complete-row tile is a correctness
-# property, while projection-block tuning is an independent kernel choice.
-_BACKWARD_SINGLE_TILE_MAX_H = _BACKWARD_MULTI_TILE_BLOCK_H
+# A complete row up to 512 lanes is safe for the current compact backward
+# geometry when the work budget above also passes.  This is a resource guard,
+# not a model-shape assumption: rows wider than it, or rows whose seed/mode
+# work exceeds the budget, retain the 256-lane multi-tile reduction.
+# A complete-row tile is a correctness property, while projection-block
+# tuning is an independent kernel choice.
+_BACKWARD_SINGLE_TILE_MAX_H = 512
 # These configurations tune launch resources only.  They must not select the
 # mathematical ownership mode: ``SINGLE_HIDDEN_TILE`` is supplied by the
 # geometry planner because it determines whether direct stores are race-free.
@@ -3098,12 +3101,14 @@ def _run_jtok_backward_triton(
     Parameter gradients accumulate into small FP32 workspaces and are cast
     only after the kernel completes.  The workspaces are proportional to the
     trainable surface parameters, not to ``tokens × experts × modes × hidden``.
-    Hidden sizes below 256 use one complete-row program.  The boundary and
-    wider rows use a
-    two-pass tiled reduction: the first pass writes the selected FP32 surface
-    and row norm, and the second pass accumulates parameter gradients per
-    hidden tile.  There is deliberately no Torch/autograd fallback in this
-    registered external-kernel path.
+    Hidden sizes below 256 use the compact single-tile program.  Wider rows
+    use the geometry planner: a complete-row program is selected when the
+    hidden width and combined seed/mode work fit the resource budget;
+    otherwise the established 256-lane two-pass tiled reduction is used.  The
+    tiled path's first pass writes the selected FP32 surface and row norm, and
+    its second pass accumulates parameter gradients per hidden tile.  There
+    is deliberately no Torch/autograd fallback in this registered
+    external-kernel path.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is not installed")

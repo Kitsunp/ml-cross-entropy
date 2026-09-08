@@ -143,9 +143,9 @@ def test_route_vectorized_modes_share_only_supported_top_k_geometry(
     ("hidden", "d_seed", "modes", "top_k", "expected_block", "single"),
     [
         (256, 128, 4, 2, 256, True),
-        (257, 4, 2, 2, 256, False),
-        (512, 128, 4, 2, 256, False),
-        (512, 128, 8, 4, 256, False),
+        (257, 4, 2, 2, 512, True),
+        (512, 128, 4, 2, 512, True),
+        (512, 128, 8, 4, 512, True),
         # The padded row is still 512, but the seed/mode work exceeds the
         # single-program budget and must retain the multi-tile reduction.
         (512, 256, 8, 4, 256, False),
@@ -166,6 +166,77 @@ def test_backward_hidden_tile_plan_is_geometry_driven(
     assert plan.direct_store is single
     assert plan.num_tiles == (0 if hidden == 0 else (hidden + expected_block - 1) // expected_block)
     assert plan.work_items >= 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_complete_row_wide_backward_matches_tiled_partition() -> None:
+    """The 512-lane complete-row path must preserve the tiled backward."""
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=7,
+        hidden=512,
+        d_seed=128,
+        knots=16,
+        modes=4,
+        experts=1,
+    )
+    valid = torch.ones(7, device="cuda", dtype=torch.bool)
+    valid[[2, 6]] = False
+    probe = torch.randn_like(values["delta"], dtype=torch.float32)
+    original_limit = jtok_impl._BACKWARD_SINGLE_TILE_MAX_H
+
+    def run(limit: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        jtok_impl._BACKWARD_SINGLE_TILE_MAX_H = limit
+        trainable = {
+            key: value.detach().clone().requires_grad_(True)
+            for key, value in values.items()
+            if key != "grid"
+        }
+        output = jtok_apply(
+            trainable["delta"],
+            trainable["z"],
+            trainable["coeff"],
+            trainable["spline_out"],
+            trainable["residual_out"],
+            trainable["scaler"],
+            values["grid"],
+            valid_mask=valid,
+            backend="triton",
+        )
+        (output.float() * probe).sum().backward()
+        torch.cuda.synchronize()
+        return output.detach(), {
+            key: value.grad.detach().clone()
+            for key, value in trainable.items()
+            if value.grad is not None
+        }
+
+    try:
+        jtok_impl._BACKWARD_SINGLE_TILE_MAX_H = 256
+        tiled_plan = _backward_hidden_tile_plan(512, 128, 4, 1)
+        assert tiled_plan.block_h == 256
+        assert not tiled_plan.direct_store
+        tiled, tiled_grads = run(256)
+
+        jtok_impl._BACKWARD_SINGLE_TILE_MAX_H = 512
+        complete_plan = _backward_hidden_tile_plan(512, 128, 4, 1)
+        assert complete_plan.block_h == 512
+        assert complete_plan.num_tiles == 1
+        assert complete_plan.direct_store
+        complete, complete_grads = run(512)
+    finally:
+        jtok_impl._BACKWARD_SINGLE_TILE_MAX_H = original_limit
+
+    torch.testing.assert_close(complete, tiled, rtol=0, atol=0)
+    for key in tiled_grads:
+        torch.testing.assert_close(
+            complete_grads[key].float(),
+            tiled_grads[key].float(),
+            rtol=0.03,
+            atol=0.02,
+            msg=f"complete-row/tiled gradient mismatch for {key}",
+        )
 
 
 def test_jtok_torch_path_handles_noncontiguous_inputs_and_mask() -> None:
