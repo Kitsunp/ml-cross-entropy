@@ -850,3 +850,37 @@ The working tree was restored to the accepted build.  The compact metadata
 and its associated kernel branches are not part of the current implementation;
 the existing per-token route contract remains authoritative until a future
 change can preserve the vectorized dispatch in a complete training run.
+
+### Current complete-training reference (2026-09-08)
+
+The accepted `main` implementation was measured end to end with the same
+configuration for all three modes: seed `1729`, BF16, batch `64`, sequence
+`512`, 12 Transformer layers, 150 training steps plus 10 validation steps,
+`torch.compile(mode="max-autotune")`, AdEMAMix, Delta disabled, MXFP8
+inactive, and the strict Triton backend.  The remote environment was an RTX
+5090 with `torch 2.14.0+cu132`, CUDA 13.2, and Triton 3.8.0.  The first
+compilation steps are excluded from the stable statistics; the reported
+median uses the stable steps selected by the probe.
+
+| complete training mode | stable step median | stable p95 | stable steps/s | validation median | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Leviathan | 224.820 ms | 228.469 ms | 4.4480 | 114.868 ms | 19.536 GiB | 20.861 GiB |
+| Leviathan + JTok | 279.692 ms | 284.071 ms | 3.5754 | 138.264 ms | 19.946 GiB | 21.221 GiB |
+| Leviathan + JTok-M | 568.98 ms | 576.78 ms | 1.7575 | 219.79 ms | 20.43 GiB | 22.27 GiB |
+
+Relative to the Leviathan reference, JTok adds `24.41%` step latency,
+reduces throughput by `19.62%`, and adds `0.410 GiB` allocated / `0.360 GiB`
+reserved.  JTok-M adds `153.08%` step latency, reduces throughput by
+`60.49%`, and adds `0.89 GiB` allocated / `1.41 GiB` reserved.  Thus the
+current limitation is computational latency, especially JTok-M, rather than
+the VRAM footprint.
+
+The JTok-M profile attributes most of its extension cost to
+`leviathan_backward` (`369.605 ms`), the masked mode evaluator (`168.127 ms`
+across 24 launches), the multi-tile backward (`74.499 ms`), and projection
+gradient (`41.939 ms`).  All three runs completed their requested steps,
+reported the Triton backend, and emitted no `jtok_reference` event.  The
+model-free CUDA suite for the accepted source passed `43` tests with two
+deselected custom-op checks.  This table is the authoritative baseline for
+the next JTok/JTok-M optimization; no speed claim is made for the rejected
+compact-route candidate.
