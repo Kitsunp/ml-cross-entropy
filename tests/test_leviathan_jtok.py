@@ -1093,6 +1093,47 @@ def test_jtok_triton_wide_d_seed_128_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+def test_jtok_wide_forward_exposes_compact_mode_cache() -> None:
+    """Keep the forward/backward compact-cache contract model-free."""
+    from cut_cross_entropy.leviathan.jtok import _jtok_forward_op
+
+    values = _inputs(
+        device="cuda",
+        dtype=torch.bfloat16,
+        n=7,
+        hidden=512,
+        d_seed=128,
+        knots=16,
+        modes=4,
+        experts=1,
+    )
+    expert_idx = torch.zeros(7, 1, device="cuda", dtype=torch.long)
+    selected_weights = torch.ones(7, 1, device="cuda", dtype=torch.float32)
+    valid_mask = torch.ones(7, device="cuda", dtype=torch.bool)
+    valid_mask[3] = False
+
+    output, modes = _jtok_forward_op(
+        values["delta"],
+        values["z"],
+        values["coeff"][:1],
+        values["spline_out"][:1],
+        values["residual_out"][:1],
+        values["scaler"],
+        values["grid"],
+        expert_idx,
+        selected_weights,
+        valid_mask,
+        1e-6,
+    )
+    torch.cuda.synchronize()
+    assert output.shape == values["delta"].shape
+    assert modes.shape == (7, 1, 4)
+    assert modes.dtype == values["spline_out"].dtype
+    assert modes.device == values["delta"].device
+    assert torch.isfinite(modes).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_jtok_custom_opcheck_and_compiles() -> None:
     from cut_cross_entropy.leviathan.jtok import _jtok_forward_op
 

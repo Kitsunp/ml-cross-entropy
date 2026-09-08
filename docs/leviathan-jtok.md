@@ -362,3 +362,115 @@ The trace totals were approximately `243.64 ms` for
 normalization-dot kernel. The earlier route-cached full-flow profile is kept
 as historical diagnostic data, not as a causal A/B baseline, because it
 predates the global hidden-axis normalization-dot correction.
+
+### Rejected experiment: block reduction of the shared scaler gradient (2026-09-08)
+
+An isolated candidate added a Triton kernel that reduced the global
+`grad_scaler` contribution in token blocks before the atomic update in the
+multi-tile backward. The main multi-tile kernel skipped that contribution and
+received a temporary hidden-sized FP32 workspace, so the numerical equation
+and the legacy/single-tile routes were unchanged.
+
+The candidate passed the focused Triton and multi-tile tests (16 passed) and
+completed the full JTok-M training/evaluation flow with seed `1729`. It was
+not kept because the complete-step result was indistinguishable from the
+previous implementation:
+
+| JTok-M full flow | previous | candidate | change |
+| --- | ---: | ---: | ---: |
+| stable median, steps 4--11 | 373.271 ms | 372.998 ms | -0.073% |
+| stable mean, steps 4--11 | 372.201 ms | 372.773 ms | +0.154% |
+| steps/s from median | 2.6790 | 2.6810 | +0.073% |
+| peak allocated | 20.418 GiB | 20.418 GiB | unchanged |
+| peak reserved | 21.756 GiB | 21.756 GiB | unchanged |
+
+The trace showed the added kernel taking about `0.65 ms` in twelve calls. It
+reduced the measured multi-tile kernel total from `43.28 ms` to `42.76 ms`,
+but the enclosing Leviathan backward increased from `243.64 ms` to
+`245.26 ms`; no complete-step speedup was established. The candidate was
+removed before commit. The next optimization must target the larger
+token-owned compact reductions in the multi-tile and projection-gradient
+paths, not add another small standalone launch.
+
+### Rejected experiment: route-major projection-gradient reduction (2026-09-08)
+
+The next candidate changed only the wide JTok-M projection-gradient ownership.
+The existing expert-major kernel scans each token block once per expert and
+uses a route mask. The candidate instead launched one program per token block
+and selected Top-K slot, then used scattered two-dimensional atomics to write
+the selected expert's grad_spline_out and grad_residual_out. The geometry
+guard was restricted to sparse routing (top_k * 2 <= experts), so the real
+five-expert/Top-2 case selected it while plain JTok did not.
+
+The candidate passed the focused model-free numerical tests (10 passed),
+including the full hidden=512, d_seed=128, modes=4, top_k=2 backward and the
+no-reference-fallback check. It was nevertheless rejected by the complete
+NeoLLM training profile. Both runs used seed 1729, BF16, batch 64, sequence
+512, 12 layers, the real CCE/AdEMAMix flow, MXFP8 inactive, and the same Torch
+2.14 max-autotune training policy:
+
+| JTok-M full flow | expert-major baseline | route-major candidate |
+| --- | ---: | ---: |
+| stable median, steps 4--11 | 373.271 ms | 452.615 ms |
+| steps/s from median | 2.6790 | 2.2094 |
+| peak allocated | 20.418 GiB | 20.418 GiB |
+| peak reserved | 21.756 GiB | 21.756 GiB |
+
+The trace explains the regression: the projection-gradient kernel increased
+from 28.071 ms in 12 calls to 122.434 ms. The scattered atomics were much
+more expensive than the expert-major scan, despite doing fewer logical route
+checks. This candidate was removed from source and remote execution; the
+expert-major path remains authoritative. The result rules out a naive
+route-major atomic design, including for unbalanced routing. A future
+reduction must aggregate by expert in a coalesced way before updating the
+parameter tensors, without introducing a dense expert-expanded workspace.
+
+### Accepted experiment: forward mode-cache reuse in wide backward (2026-09-08)
+
+The next change targets a different source of repeated work. Before this
+change, the wide JTok backward evaluated the selected B-spline mode product a
+second time, even though the forward had already produced the same compact
+`[tokens, top_k, modes]` activation. The new registered forward operation has
+two outputs: the normal JTok/JTok-M result and that compact mode buffer. The
+autograd context retains the buffer and the wide backward consumes it directly
+for the projection and token-local gradient reductions. No dense
+`[tokens, experts, modes, hidden]` activation is introduced, and the global
+scaler-gradient path is unchanged.
+
+The public wrappers still return exactly the previous public values: JTok
+returns one tensor and JTok-M returns `(output, stats)`. The second registered
+output is internal to the external-kernel/autograd boundary. `grad_modes` is
+ignored intentionally because the mode buffer is an implementation cache, not
+a differentiable model output.
+
+The change was first checked without importing NeoLLM: six CUDA tests passed,
+including odd/single-tile geometry, the full `hidden=512, d_seed=128,
+modes=4` geometry, custom-op `opcheck`, compilation, and the no-reference
+fallback assertion. It was then measured in the complete training flow with
+seed `1729`, BF16, batch `64`, sequence `512`, 12 Transformer layers, CCE,
+AdEMAMix, `torch.compile(mode="max-autotune")`, MXFP8 inactive, two validation
+steps, and a profile in step 12.
+
+| full flow | previous stable median (4--11) | mode-cache stable median (4--11) | change | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JTok | 307.876 ms | 293.657 ms | -4.62% | 19.943 -> 19.946 GiB | 21.219 -> 21.221 GiB |
+| JTok-M | 373.271 ms | 358.556 ms | -3.95% | 20.418 -> 20.424 GiB | 21.756 -> 21.760 GiB |
+
+The corresponding stable throughput changed from `3.248` to `3.405`
+steps/s for JTok and from `2.679` to `2.789` steps/s for JTok-M. The
+additional retained compact buffer is approximately 3 MiB over the 12-layer
+JTok flow and 6 MiB over the JTok-M flow for this geometry.
+
+The traces provide the causal check: JTok's
+`_jtok_modes_kernel_vectorized` fell from 24 calls / about 25.30 ms to 12
+calls / 12.70 ms. JTok-M's
+`_jtok_modes_kernel_route_vectorized` fell from 24 calls / about 22.11 ms to
+12 calls / 11.02 ms. The other large backward kernels remained on their
+existing expert-major/token-tile routes. No `jtok_reference` event appeared,
+and the JSON reported `jtok_kernel_backend="triton"`.
+
+This is distinct from the rejected `_jtok_backward_scaler_grad_kernel`
+experiment: that candidate only changed the reduction of the global
+`grad_scaler` and did not eliminate mode recomputation. The mode-cache change
+is kept because it removes a complete backward mode-evaluation launch per
+layer in the real flow while adding only the compact activation workspace.

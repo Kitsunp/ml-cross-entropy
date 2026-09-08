@@ -32,10 +32,10 @@ intended only for library callers that deliberately want capability dispatch.
 
 The registered external-kernel backward is strict: it launches the Triton
 single-tile or multi-tile implementation and raises when CUDA/Triton is not
-available.  It saves only the operation inputs in the custom-op context and
-recomputes cheap selected products, so no dense expert expansion is retained
-by autograd.  The Torch implementation remains available only through the
-explicit ``backend="torch"`` oracle for comparison.
+available.  It retains only the compact ``[tokens, top_k, modes]`` forward
+mode product needed by the wide backward; no dense expert expansion is
+retained by autograd.  The Torch implementation remains available only
+through the explicit ``backend="torch"`` oracle for comparison.
 """
 
 from __future__ import annotations
@@ -1266,6 +1266,7 @@ if _TRITON_AVAILABLE:
         residual_out_ptr,
         expert_idx_ptr,
         selected_weights_ptr,
+        modes_ptr,
         scaler_ptr,
         valid_ptr,
         output_ptr,
@@ -1304,6 +1305,10 @@ if _TRITON_AVAILABLE:
         ).to(tl.float32)
         scale = float(max(int(NUM_KNOTS) - 1, 0))
         mixed = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        if HAS_MASK:
+            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
+        else:
+            row_valid = row_mask
 
         for slot in tl.range(0, TOP_K):
             expert = tl.load(
@@ -1354,6 +1359,14 @@ if _TRITON_AVAILABLE:
                 mode_value = mode_value.to(spline_out_ptr.dtype.element_ty).to(
                     tl.float32
                 )
+                mode_value = tl.where(row_valid, mode_value, 0.0)
+                tl.store(
+                    modes_ptr
+                    + (row * TOP_K + slot) * NUM_MODES
+                    + mode,
+                    mode_value.to(modes_ptr.dtype.element_ty),
+                    mask=row_mask,
+                )
                 out_weight = tl.load(
                     spline_out_ptr
                     + (expert * NUM_MODES + mode) * HIDDEN
@@ -1378,10 +1391,6 @@ if _TRITON_AVAILABLE:
                 residual += z_value * residual_weight
             mixed += weight * (values + residual)
 
-        if HAS_MASK:
-            row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
-        else:
-            row_valid = row_mask
         mixed = tl.where(row_valid, mixed, 0.0)
         norm = tl.sqrt(tl.sum(mixed * mixed, axis=0)) + NORM_EPS
         surface = mixed.to(output_ptr.dtype.element_ty).to(tl.float32)
@@ -2838,7 +2847,7 @@ def _run_jtok_triton(
     norm_eps: float,
     residual_scale: float,
     mixture: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if not _TRITON_AVAILABLE:  # pragma: no cover - guarded by strict dispatch
         raise RuntimeError("Triton is not installed")
     experts, modes, d_seed, knots, hidden = _check_common_kernel_inputs(
@@ -2856,6 +2865,13 @@ def _run_jtok_triton(
         raise ValueError("valid_mask has the wrong number of elements")
 
     knot_pad = triton.next_power_of_2(knots)
+    # Keep the compact mode product as an autograd output.  The backward
+    # consumes it directly instead of launching the B-spline evaluator a
+    # second time.  Its size is tokens * top_k * modes, not a surface-sized
+    # activation; the fused single-tile path writes the same contract.
+    modes_buffer = torch.empty(
+        (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
+    )
     single_tile = hidden < _SINGLE_TILE_HIDDEN_LIMIT
     if single_tile:
         output = torch.empty_like(delta)
@@ -2869,6 +2885,7 @@ def _run_jtok_triton(
             residual_out,
             expert_idx,
             selected_weights,
+            modes_buffer,
             scaler,
             valid_mask,
             output,
@@ -2892,7 +2909,7 @@ def _run_jtok_triton(
                 "jtok.mixture" if mixture else "jtok.forward",
                 output=output,
             )
-        return output
+        return output, modes_buffer
 
     # Keep the wide-path surface in FP32.  The forward kernel reduces its
     # squared norm before the activation-dtype write-back; retaining the
@@ -2902,9 +2919,6 @@ def _run_jtok_triton(
     # former dense expert surface and avoids recalculating the B-spline
     # product for every hidden tile.  It is intentionally scoped to this
     # invocation rather than retained by the autograd context.
-    modes_buffer = torch.empty(
-        (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
-    )
     if _can_use_route_vectorized_mode_evaluation(d_seed, knots, modes, top_k):
         mode_grid = (n_tokens,)
         _jtok_wrap_kernel(_jtok_modes_kernel_route_vectorized)[mode_grid](
@@ -3050,7 +3064,7 @@ def _run_jtok_triton(
             bool(has_mask),
         ),
     )
-    return output
+    return output, modes_buffer
 
 
 def _run_jtok_backward_triton(
@@ -3065,6 +3079,7 @@ def _run_jtok_backward_triton(
     selected_weights: torch.Tensor,
     knot_grid: torch.Tensor,
     valid_mask: torch.Tensor,
+    modes_buffer: torch.Tensor,
     *,
     norm_eps: float,
     residual_scale: float,
@@ -3111,6 +3126,14 @@ def _run_jtok_backward_triton(
     if valid_mask.numel() not in (0, int(delta.shape[0])):
         raise ValueError("valid_mask has the wrong number of elements")
     n_tokens = int(delta.shape[0])
+    expected_modes_shape = (n_tokens, top_k, modes)
+    if tuple(modes_buffer.shape) != expected_modes_shape:
+        raise ValueError(
+            "modes_buffer must preserve the forward compact mode product with "
+            f"shape {expected_modes_shape}, got {tuple(modes_buffer.shape)}"
+        )
+    if modes_buffer.dtype != spline_out.dtype or modes_buffer.device != delta.device:
+        raise ValueError("modes_buffer must match spline_out dtype and delta device")
     grad_delta = torch.empty_like(delta)
     # The kernel accumulates all shared gradients in FP32.  This also avoids
     # dtype-dependent atomic behavior for BF16 parameter gradients.
@@ -3193,9 +3216,6 @@ def _run_jtok_backward_triton(
         single_hidden_tile = tile_plan.direct_store
         if not single_hidden_tile:
             grad_weights.zero_()
-        modes_buffer = torch.empty(
-            (n_tokens, top_k, modes), device=delta.device, dtype=spline_out.dtype
-        )
         # Wide hidden rows accumulate mode and residual contractions once per
         # hidden tile, then finish the B-spline derivative once per token.
         # These FP32 buffers are compact: their size is independent of hidden.
@@ -3213,81 +3233,6 @@ def _run_jtok_backward_triton(
             grad_residual_buffer = torch.zeros(
                 (n_tokens, top_k, d_seed), device=delta.device, dtype=torch.float32
             )
-        if _can_use_route_vectorized_mode_evaluation(d_seed, knots, modes, top_k):
-            mode_grid = (n_tokens,)
-            _jtok_wrap_kernel(_jtok_modes_kernel_route_vectorized)[mode_grid](
-                z,
-                spline_coeff,
-                knot_grid,
-                expert_idx,
-                valid_mask,
-                modes_buffer,
-                n_tokens,
-                D_SEED=d_seed,
-                NUM_KNOTS=knots,
-                NUM_MODES=modes,
-                TOP_K=top_k,
-                KNOT_PAD=triton.next_power_of_2(knots),
-                MODE_PAD=triton.next_power_of_2(modes),
-                HAS_MASK=bool(valid_mask.numel()),
-                num_warps=4,
-                num_stages=1,
-            )
-        elif _can_use_vectorized_mode_evaluation(d_seed, knots, modes):
-            mode_grid = (n_tokens * top_k,)
-            _jtok_wrap_kernel(_jtok_modes_kernel_vectorized)[mode_grid](
-                z,
-                spline_coeff,
-                knot_grid,
-                expert_idx,
-                valid_mask,
-                modes_buffer,
-                n_tokens,
-                D_SEED=d_seed,
-                NUM_KNOTS=knots,
-                NUM_MODES=modes,
-                TOP_K=top_k,
-                KNOT_PAD=triton.next_power_of_2(knots),
-                MODE_PAD=triton.next_power_of_2(modes),
-                HAS_MASK=bool(valid_mask.numel()),
-                num_warps=4,
-                num_stages=1,
-            )
-        else:
-            modes_grid = (n_tokens * top_k * modes,)
-            if valid_mask.numel():
-                _jtok_wrap_kernel(_jtok_modes_kernel_masked)[modes_grid](
-                    z,
-                    spline_coeff,
-                    knot_grid,
-                    expert_idx,
-                    valid_mask,
-                    modes_buffer,
-                    n_tokens,
-                    D_SEED=d_seed,
-                    NUM_KNOTS=knots,
-                    NUM_MODES=modes,
-                    TOP_K=top_k,
-                    KNOT_PAD=triton.next_power_of_2(knots),
-                    num_warps=4,
-                    num_stages=1,
-                )
-            else:
-                _jtok_wrap_kernel(_jtok_modes_kernel_unmasked)[modes_grid](
-                    z,
-                    spline_coeff,
-                    knot_grid,
-                    expert_idx,
-                    modes_buffer,
-                    n_tokens,
-                    D_SEED=d_seed,
-                    NUM_KNOTS=knots,
-                    NUM_MODES=modes,
-                    TOP_K=top_k,
-                    KNOT_PAD=triton.next_power_of_2(knots),
-                    num_warps=4,
-                    num_stages=1,
-                )
         surface = torch.empty(
             (n_tokens, hidden), device=delta.device, dtype=torch.float32
         )
@@ -3686,6 +3631,7 @@ def _jtok_backward_op(
     selected_weights: torch.Tensor,
     knot_grid: torch.Tensor,
     valid_mask: torch.Tensor,
+    modes_buffer: torch.Tensor,
     norm_eps: float,
     residual_scale: float,
     mixture: bool,
@@ -3710,6 +3656,7 @@ def _jtok_backward_op(
         selected_weights,
         knot_grid,
         valid_mask,
+        modes_buffer,
         norm_eps=norm_eps,
         residual_scale=residual_scale,
         mixture=mixture,
@@ -3729,6 +3676,7 @@ def _jtok_backward_fake(
     selected_weights: torch.Tensor,
     knot_grid: torch.Tensor,
     valid_mask: torch.Tensor,
+    modes_buffer: torch.Tensor,
     norm_eps: float,
     residual_scale: float,
     mixture: bool,
@@ -3741,7 +3689,16 @@ def _jtok_backward_fake(
     torch.Tensor,
     torch.Tensor,
 ]:
-    del grad_out, expert_idx, knot_grid, valid_mask, norm_eps, residual_scale, mixture
+    del (
+        grad_out,
+        expert_idx,
+        knot_grid,
+        valid_mask,
+        modes_buffer,
+        norm_eps,
+        residual_scale,
+        mixture,
+    )
     return (
         torch.empty_like(delta),
         torch.empty_like(z),
@@ -3766,7 +3723,7 @@ def _jtok_forward_op(
     selected_weights: torch.Tensor,
     valid_mask: torch.Tensor,
     norm_eps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     with _kernel_region("jtok.forward", delta.device):
         return _run_jtok_triton(
             delta,
@@ -3798,14 +3755,23 @@ def _jtok_forward_fake(
     selected_weights: torch.Tensor,
     valid_mask: torch.Tensor,
     norm_eps: float,
-) -> torch.Tensor:
-    del z, spline_coeff, spline_out, residual_out, scaler, knot_grid
+) -> tuple[torch.Tensor, torch.Tensor]:
+    modes = torch.empty(
+        (delta.shape[0], expert_idx.shape[1], spline_coeff.shape[1]),
+        device=delta.device,
+        dtype=spline_out.dtype,
+    )
+    del z, residual_out, scaler, knot_grid
     del expert_idx, selected_weights, valid_mask, norm_eps
-    return torch.empty_like(delta)
+    return torch.empty_like(delta), modes
 
 
-def _jtok_setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
-    del output
+def _jtok_setup_context(
+    ctx: Any,
+    inputs: tuple[Any, ...],
+    output: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    _, modes_buffer = output
     (
         delta,
         z,
@@ -3830,6 +3796,7 @@ def _jtok_setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor)
         expert_idx,
         selected_weights,
         valid_mask,
+        modes_buffer,
     )
     ctx.norm_eps = float(norm_eps)
 
@@ -3865,7 +3832,12 @@ def _autograd_recompute(
     return tuple(gradients)
 
 
-def _jtok_backward(ctx: Any, grad_out: torch.Tensor):
+def _jtok_backward(
+    ctx: Any,
+    grad_out: torch.Tensor,
+    grad_modes: Optional[torch.Tensor] = None,
+):
+    del grad_modes
     (
         delta,
         z,
@@ -3877,6 +3849,7 @@ def _jtok_backward(ctx: Any, grad_out: torch.Tensor):
         expert_idx,
         selected_weights,
         valid_mask,
+        modes_buffer,
     ) = ctx.saved_tensors
     if not (_TRITON_AVAILABLE and delta.is_cuda):
         raise RuntimeError(
@@ -3895,6 +3868,7 @@ def _jtok_backward(ctx: Any, grad_out: torch.Tensor):
         selected_weights,
         knot_grid,
         valid_mask,
+        modes_buffer,
         float(ctx.norm_eps),
         0.0,
         False,
@@ -3923,7 +3897,7 @@ def _jtokm_forward_op(
     valid_mask: torch.Tensor,
     norm_eps: float,
     residual_scale: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     with _kernel_region("jtokm.forward", delta.device):
         return _run_jtok_triton(
             delta,
@@ -3956,14 +3930,23 @@ def _jtokm_forward_fake(
     valid_mask: torch.Tensor,
     norm_eps: float,
     residual_scale: float,
-) -> torch.Tensor:
-    del z, spline_coeff, spline_out, residual_out, scaler
+) -> tuple[torch.Tensor, torch.Tensor]:
+    modes = torch.empty(
+        (delta.shape[0], expert_idx.shape[1], spline_coeff.shape[1]),
+        device=delta.device,
+        dtype=spline_out.dtype,
+    )
+    del z, residual_out, scaler
     del expert_idx, selected_weights, knot_grid, valid_mask, norm_eps, residual_scale
-    return torch.empty_like(delta)
+    return torch.empty_like(delta), modes
 
 
-def _jtokm_setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor) -> None:
-    del output
+def _jtokm_setup_context(
+    ctx: Any,
+    inputs: tuple[Any, ...],
+    output: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    _, modes_buffer = output
     (
         delta,
         z,
@@ -3989,12 +3972,18 @@ def _jtokm_setup_context(ctx: Any, inputs: tuple[Any, ...], output: torch.Tensor
         selected_weights,
         knot_grid,
         valid_mask,
+        modes_buffer,
     )
     ctx.norm_eps = float(norm_eps)
     ctx.residual_scale = float(residual_scale)
 
 
-def _jtokm_backward(ctx: Any, grad_out: torch.Tensor):
+def _jtokm_backward(
+    ctx: Any,
+    grad_out: torch.Tensor,
+    grad_modes: Optional[torch.Tensor] = None,
+):
+    del grad_modes
     (
         delta,
         z,
@@ -4006,6 +3995,7 @@ def _jtokm_backward(ctx: Any, grad_out: torch.Tensor):
         selected_weights,
         knot_grid,
         valid_mask,
+        modes_buffer,
     ) = ctx.saved_tensors
 
     if not (_TRITON_AVAILABLE and delta.is_cuda):
@@ -4025,6 +4015,7 @@ def _jtokm_backward(ctx: Any, grad_out: torch.Tensor):
         selected_weights,
         knot_grid,
         valid_mask,
+        modes_buffer,
         float(ctx.norm_eps),
         float(ctx.residual_scale),
         True,
@@ -4104,7 +4095,7 @@ def jtok_apply(
         (dm, z, coeff, out_weight, residual, scale, grid),
     )
     if use_kernel:
-        output = _jtok_forward_op(
+        output, _ = _jtok_forward_op(
             dm,
             z,
             coeff,
@@ -4187,7 +4178,7 @@ def jtokm_apply(
         (dm, z, coeff, out_weight, residual, scale, router_weight, grid),
     )
     if use_kernel:
-        output = _jtokm_forward_op(
+        output, _ = _jtokm_forward_op(
             dm,
             z,
             coeff,
