@@ -592,3 +592,77 @@ Peak memory was unchanged.  Reusing the surface load did not compensate for
 the longer expert loop and its register/atomic pressure on the RTX 5090.
 The candidate was removed before a full-flow run; the expert-major kernel
 remains authoritative, including for unbalanced routing.
+
+### Accepted experiment: autotuned token-to-spline backward launch (2026-09-08)
+
+The remaining token-local backward kernel,
+`_jtok_backward_token_projection_grad_block_kernel`, was still using a fixed
+`num_warps=4, num_stages=1` launch.  This kernel owns the derivative of the
+compact B-spline projection: one program handles one `(token, top-k route)`
+and vectorizes the `d_seed` coordinates while accumulating `grad_z` and
+`grad_coeff`.  It is therefore independent from the global `grad_scaler`
+reduction, which remains fused in `_jtok_backward_multi_tile_fast_kernel`.
+
+The accepted change puts only this block kernel behind Triton's autotuner.
+The candidate set is deliberately small and geometry-keyed:
+
+```text
+num_warps=2, num_stages=1
+num_warps=4, num_stages=1
+num_warps=8, num_stages=1
+num_warps=4, num_stages=2
+```
+
+The key includes `N`, `D_SEED`, `NUM_KNOTS`, `NUM_MODES`, `TOP_K`,
+`BLOCK_D`, and the mask flag.  `grad_z` and `grad_coeff` are reset between
+autotune candidates, so benchmarking a candidate cannot accumulate its
+partial gradients into the selected run.  The equations, launch grid,
+workspace sizes, public API, and legacy Leviathan path are unchanged.  The
+first encounter with a new geometry pays Triton's compile/benchmark cost;
+subsequent calls use the cached configuration.
+
+The model-free CUDA check used seed `1729`, BF16, `n=8192`,
+`hidden=512`, `d_seed=128`, `knots=16`, and `modes=4`.  Compared with the
+fixed launch, using the same forward+backward measurement and excluding the
+separate auxiliary-statistics calculation, the median changed as follows:
+
+| isolated backward | fixed launch | autotuned launch | change |
+| --- | ---: | ---: | ---: |
+| JTok | 1.310 ms | 1.235 ms | -5.8% |
+| JTok-M | 2.972 ms | 2.939 ms | -1.1% |
+
+Peak allocated/reserved memory stayed within measurement noise (JTok-M was
+about `196 MiB` allocated and `428 MiB` reserved in the isolated run).  The
+focused model-free suite passed `44` tests with one unrelated selection.
+
+The full NeoLLM training flow was measured separately for JTok and JTok-M
+with seed `1729`, BF16, batch `64`, sequence `512`, 12 Transformer layers,
+CCE, AdEMAMix, `torch.compile(mode="max-autotune")`, MXFP8 inactive, Delta
+inactive, MEAP/MiLe/MU/NITP enabled, two validation steps, and a profile at
+step 12.  Both runs reported `jtok_kernel_backend="triton"` and did not
+emit a `jtok_reference` event.  Stable steps `4--11` changed as follows:
+
+| full flow | fixed-launch median | autotuned median | change | fixed steps/s | autotuned steps/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JTok | 277.506 ms | 276.548 ms | -0.35% | 3.604 | 3.616 |
+| JTok-M | 330.163 ms | 328.567 ms | -0.48% | 3.029 | 3.044 |
+
+Peak memory did not change:
+
+| full flow | allocated | reserved |
+| --- | ---: | ---: |
+| JTok | 19.946 GiB | 21.221 GiB |
+| JTok-M | 20.424 GiB | 21.760 GiB |
+
+The trace attributes the improvement to the target kernel itself.  Its total
+time over the 12 profiled layers fell from `11.990` to `11.411 ms` for JTok
+and from `20.708` to `18.895 ms` for JTok-M.  The wide backward, projection
+gradient, and mode kernels remained on their existing Triton paths; the
+autotuner did not alter the complete-row dispatch or introduce a dense expert
+workspace.  Validation also remained stable (`130.667 ms` for JTok and
+`137.435 ms` for JTok-M on the second validation step).
+
+The first training step remains a cold compilation event (about six minutes
+in this complete max-autotune probe) and is not used as the steady-state
+comparison.  No global compile policy, optimizer flag, MXFP8 setting, model
+configuration, tokenizer, or checkpoint was changed.

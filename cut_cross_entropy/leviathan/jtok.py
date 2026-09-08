@@ -132,9 +132,16 @@ if _TRITON_AVAILABLE:
         triton.Config({"BLOCK_M": 16}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_M": 32}, num_warps=4, num_stages=2),
     ]
+    _JTOK_TOKEN_PROJECTION_CONFIGS = [
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=2),
+    ]
 else:  # pragma: no cover - CPU-only installations do not import Triton
     _JTOK_WIDE_BACKWARD_CONFIGS = []
     _JTOK_PROJECTION_GRAD_CONFIGS = []
+    _JTOK_TOKEN_PROJECTION_CONFIGS = []
 _USE_COMPOSABLE_TRITON_OP = _TRITON_OP_AVAILABLE
 
 
@@ -2525,6 +2532,19 @@ if _TRITON_AVAILABLE:
             mask=row_mask & row_valid,
         )
 
+    @triton.autotune(
+        configs=_JTOK_TOKEN_PROJECTION_CONFIGS,
+        key=[
+            "N",
+            "D_SEED",
+            "NUM_KNOTS",
+            "NUM_MODES",
+            "TOP_K",
+            "BLOCK_D",
+            "HAS_MASK",
+        ],
+        reset_to_zero=["grad_z_ptr", "grad_coeff_ptr"],
+    )
     @triton.jit
     def _jtok_backward_token_projection_grad_block_kernel(
         z_ptr,
@@ -3349,8 +3369,6 @@ def _run_jtok_backward_triton(
                 KNOT_PAD=triton.next_power_of_2(knots),
                 BLOCK_D=block_d,
                 HAS_MASK=bool(valid_mask.numel()),
-                num_warps=4,
-                num_stages=1,
             )
         else:
             token_projection_grid = (n_tokens, top_k, d_seed)
