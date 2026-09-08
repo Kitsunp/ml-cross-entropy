@@ -666,3 +666,69 @@ The first training step remains a cold compilation event (about six minutes
 in this complete max-autotune probe) and is not used as the steady-state
 comparison.  No global compile policy, optimizer flag, MXFP8 setting, model
 configuration, tokenizer, or checkpoint was changed.
+
+### Accepted experiment: geometry-aware projection-gradient tiles (2026-09-08)
+
+The previous projection-gradient launch fixed `BLOCK_H=128` at the Python
+call site.  That was safe, but it coupled every geometry to the same hidden
+tile even when the hidden dimension and expert routing made a wider tile more
+efficient.  The accepted change moves `BLOCK_H` into the Triton autotuner
+configuration together with `BLOCK_M`.  The candidate set remains bounded:
+
+```text
+(BLOCK_M, BLOCK_H) =
+    (16, 128), (32, 128), (64, 128),
+    (16, 256), (32, 256),
+```
+
+with the existing alternatives for warp count and pipeline stages.  The
+autotune key remains the tensor geometry (`N`, `D_SEED`, `HIDDEN`, expert and
+mode counts, and `TOP_K`); it does not depend on model state or token values.
+`reset_to_zero` still clears `grad_spline_out` and `grad_residual_out` before
+each candidate.  No dense expert-expanded tensor or new persistent workspace
+is introduced, and the projection equations and atomic accumulation order
+remain unchanged.
+
+This is distinct from the old standalone scaler-gradient experiment.  The
+projection kernel computes `grad_spline_out` and `grad_residual_out` by expert,
+whereas the scaler gradient is now accumulated inline by the single-/
+multi-tile backward kernels.  The accepted change does not add or replace a
+scaler kernel.
+
+The complete NeoLLM CUDA probe used seed `1729`, BF16, batch `64`, sequence
+`512`, 12 Transformer layers, CCE, AdEMAMix, `torch.compile(mode="max-autotune")`,
+MXFP8 inactive, Delta inactive, MEAP/MiLe/MU/NITP enabled, two validation
+steps, and a profile at step 12.  It was compared with the preceding accepted
+token-projection-autotune build, using stable steps 4--11 and the same remote
+environment (`torch 2.14.0+cu132`, CUDA 13.2, Triton 3.8.0, RTX 5090):
+
+| full flow | previous median | geometry-aware median | change | previous steps/s | new steps/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JTok | 276.548 ms | 276.816 ms | +0.10% | 3.616 | 3.613 |
+| JTok-M | 328.567 ms | 326.431 ms | -0.65% | 3.044 | 3.063 |
+
+The JTok base result is statistically neutral at this measurement size; the
+change was retained because it does not regress the full flow or memory and
+allows JTok-M to choose a better hidden tile.  In the JTok trace the selected
+projection geometry remained `BLOCK_H=128` and its 12-layer total changed
+from `6.436` to `6.480 ms` (+0.7%).  In JTok-M the autotuner selected the
+two-hidden-tile launch (`grid=[5, 1024, 2]`, corresponding to `BLOCK_H=256`)
+instead of the previous four-tile launch (`grid=[5, 1024, 4]`).  Its
+projection-gradient total changed from `28.020` to `26.355 ms` (-5.94%).
+The JTok-M token-projection total also changed from `18.895` to `18.630 ms`.
+
+Full-run peak memory was unchanged:
+
+| full flow | previous allocated/reserved | geometry-aware allocated/reserved |
+| --- | ---: | ---: |
+| JTok | 19.946 / 21.221 GiB | 19.946 / 21.221 GiB |
+| JTok-M | 20.424 / 21.760 GiB | 20.424 / 21.760 GiB |
+
+The second validation step remained stable (`130.736 ms` for JTok and
+`137.490 ms` for JTok-M).  Both runs reported the Triton backend and no
+`jtok_reference` event.  The focused model-free CUDA suite passed `44` tests
+with one unrelated selection, and the full training run completed all 12
+steps plus two validation steps.  The first training step remains a cold
+compile/autotune event and is excluded from the steady-state comparison.
+No global compile policy, optimizer flag, MXFP8 setting, model configuration,
+tokenizer, or checkpoint was changed.

@@ -126,11 +126,14 @@ if _TRITON_AVAILABLE:
         triton.Config({}, num_warps=4, num_stages=2),
     ]
     _JTOK_PROJECTION_GRAD_CONFIGS = [
-        triton.Config({"BLOCK_M": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 16}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_M": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_H": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_H": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_H": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 16, "BLOCK_H": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_H": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_H": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_H": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 16, "BLOCK_H": 256}, num_warps=8, num_stages=1),
     ]
     _JTOK_TOKEN_PROJECTION_CONFIGS = [
         triton.Config({}, num_warps=2, num_stages=1),
@@ -2723,7 +2726,6 @@ if _TRITON_AVAILABLE:
             "NUM_EXPERTS",
             "NUM_MODES",
             "TOP_K",
-            "BLOCK_H",
         ],
         reset_to_zero=["grad_spline_out_ptr", "grad_residual_out_ptr"],
     )
@@ -3402,7 +3404,6 @@ def _run_jtok_backward_triton(
         # slower even though the single-tile reduction itself was valid.
         # Triton's autotuner now benchmarks BLOCK_M and launch resources for
         # this exact token/hidden geometry.
-        projection_block_h = 128
         def projection_grid(meta):
             return (
                 experts,
@@ -3424,7 +3425,6 @@ def _run_jtok_backward_triton(
             NUM_EXPERTS=experts,
             NUM_MODES=modes,
             TOP_K=top_k,
-            BLOCK_H=projection_block_h,
         )
     mark_warmup_incomplete_once(
         "jtok.mixture.backward" if mixture else "jtok.backward",
