@@ -1,0 +1,98 @@
+{
+  "schema": "neollm-remote-real-10x10-v1",
+  "status": "ok",
+  "mode": "jtok",
+  "backend": "triton",
+  "provenance": {
+    "canonical_repository": "ml-cross-entropy-jtok-pr",
+    "canonical_commit": "5a4072d"
+  },
+  "runtime": {
+    "device": "NVIDIA GeForce RTX 5090",
+    "capability": [12, 0],
+    "torch_version": "2.14.0+cu132",
+    "cuda_build": "13.2",
+    "transformers_version": "5.17.0",
+    "device_count": 1,
+    "cuda_available": true
+  },
+  "module_hashes": {
+    "train.py": "5d43cd58096aaebb0b04eb59a9f1b82163d02089ee18fca83fb6bd1f2175c48d",
+    "modeling_neollm.py": "26914cf05982e015fa10fec29385dddb0e434e97269a09694ffb06f40b519187",
+    "configuration_neollm.py": "d58cfb55ac2dc1056037ef7b0dcd8d38da617dadad0f23d85ce31cc06082706c"
+  },
+  "cce_provenance": {
+    "python_file_count": 52,
+    "python_tree_sha256": "f79fc331d878b49d17b5ba81fdb4ff3cd86505525480f91e60b5101fe3ed4398",
+    "tracked_files_sha256": {
+      "leviathan/backward_dot_kernels.py": "41956e305ea6ff4a1c0326cb7b2b41847dcd6b7b96cf7609dc8f9caebd3ab965",
+      "leviathan/backward_kernels.py": "21548ff05407b694cac44f51ee226331d6d037ed9e68e918d861ab1d333c11ca",
+      "leviathan/jtok.py": "7aca62bcdb307095a06c5f2eed076957b4f39c120a99925009c5faa053f133cc"
+    }
+  },
+  "kernel_policy": {
+    "d_delta_splits": "4",
+    "d_delta_block_m": "auto",
+    "d_delta_block_d": "auto",
+    "d_delta_block_r": "auto",
+    "fused_chain_d_delta": "auto"
+  },
+  "data_policy": {
+    "source": "preexisting_tokenized_remote_data",
+    "download_allowed": false,
+    "synthetic_allowed_for_gate": false
+  },
+  "train_steps_requested": 10,
+  "validation_steps_requested": 10,
+  "train_steps_completed": 10,
+  "validation_steps_completed": 10,
+  "batch_size": 64,
+  "sequence_length": 512,
+  "profile": {
+    "requested": true,
+    "diagnostic_only": true
+  },
+  "runtime_verification": {
+    "leviathan_triton_required": true,
+    "reference_fallback_allowed": false
+  },
+  "timing": {
+    "train_step_median_after_first_seconds": 0.25200606998987496,
+    "train_steps_per_second_after_first": 3.9681583861856096,
+    "train_step_median_seconds": 0.25369235198013484,
+    "train_steps_per_second": 3.9417822105977565,
+    "eval_loss": 8.841336250305176,
+    "train_step_seconds": [
+      365.84049355378374,
+      0.3012791939545423,
+      0.7071608249098063,
+      0.26861958112567663,
+      0.25537863397039473,
+      0.25200606998987496,
+      0.2506884979084134,
+      0.24732862296514213,
+      0.25110112805850804,
+      0.24845111393369734
+    ]
+  },
+  "trace_summary": {
+    "trace_event_count": 115638,
+    "_lev_bwd_ddelta_dot_kernel": {
+      "count": 2,
+      "median_us": 10717.85,
+      "dur_us": [10774.202, 10661.498]
+    },
+    "_lev_bwd_ln_kernel": {
+      "count": 2,
+      "median_us": 244.017
+    },
+    "_lev_bwd_stats_kernel": {
+      "count": 2,
+      "median_us": 28.16
+    },
+    "_lev_fused_dot": {
+      "count": 2,
+      "median_us": 3172.28
+    }
+  }
+}

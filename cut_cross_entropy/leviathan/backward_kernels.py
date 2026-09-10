@@ -465,11 +465,26 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
         block_m = int(os.environ.get("LEV_DDELTA_BM", default_bm))
         block_d = int(os.environ.get("LEV_DDELTA_BD", default_bd))
         block_r = min(int(os.environ.get("LEV_DDELTA_BR", default_br)), krank)
+        ddelta_splits = int(os.environ.get("LEV_DDELTA_SPLITS", "1"))
+        if ddelta_splits not in (1, 2, 4, 8):
+            raise ValueError(
+                f"invalid ddelta split count: {ddelta_splits}; expected one of 1, 2, 4, 8"
+            )
         if d % block_d or krank % block_r:
             raise ValueError(
                 f"invalid ddelta tiles for d={d}, krank={krank}: "
                 f"BM={block_m}, BD={block_d}, BR={block_r}"
             )
+        ddelta_num_blocks = triton.cdiv(N, block_m)
+        ddelta_partial = (
+            ddelta
+            if ddelta_splits == 1
+            else torch.empty(
+                ddelta_splits, h, d, kappa, krank,
+                dtype=torch.float32,
+                device=dev,
+            )
+        )
         fuse_chain_ddelta = (
             kappa == 16 and krank == 64 and block_d == 1
             and block_r == krank and block_m in (32, 64, 128)
@@ -480,22 +495,37 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
             if fuse_chain_ddelta and block_m >= 64 else {})
         if fuse_chain_ddelta:
             # One ddelta pass now also produces dxhat and block statistics;
-            # no chain pass and no N-scaled ddelta partial workspace.
-            num_blocks = triton.cdiv(N, block_m)
+            # no chain pass.  With split-N, ddelta_partial is the only
+            # additional workspace and the fused chain writes disjoint token
+            # blocks for dzh and the per-block statistics.
+            num_blocks = ddelta_num_blocks
             dgamma_partial = torch.empty(
                 h, num_blocks, d, dtype=torch.float32, device=dev)
             dbeta_partial = torch.empty_like(dgamma_partial)
-            grid3 = (h, d // block_d, krank // block_r)
+            grid3 = (h * ddelta_splits, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
                 xhat_c, t_c, rsqrt_c, M_c, dM,
                 gamma.contiguous(), beta.contiguous(), delta.contiguous(),
-                knot_grid, ddelta, dzh, dgamma_partial, dbeta_partial,
+                knot_grid, ddelta, ddelta_partial, dzh,
+                dgamma_partial, dbeta_partial,
                 N, num_blocks,
+                triton.cdiv(num_blocks, ddelta_splits),
                 D_SEED=d, KAPPA=kappa, KAPPA_P=max(kappa, 16), KRANK=krank, H_=h,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=True, PREMUL_DMM=premul_dmm, USE_T=use_t,
+                N_SPLITS=ddelta_splits,
                 **ddelta_launch_kwargs)
+            if ddelta_splits > 1:
+                bdk._lev_bwd_ddelta_split_reduce_kernel[
+                    (h, d // block_d, krank // block_r)
+                ](
+                    ddelta_partial, ddelta,
+                    D_SEED=d, KAPPA=kappa, KRANK=krank, H_=h,
+                    BLOCK_D=block_d, BLOCK_R=block_r,
+                    N_SPLITS=ddelta_splits,
+                    num_warps=4, num_stages=1,
+                )
             grid_ln = (h, num_blocks)
             bdk._lev_bwd_ln_kernel[grid_ln](
                 xhat_c, rsqrt_c, dzh, N,
@@ -521,17 +551,30 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee, USE_T=use_t,
                 PREMUL_DMM=premul_dmm,
                 num_warps=4, num_stages=1)
-            grid3 = (h, d // block_d, krank // block_r)
+            grid3 = (h * ddelta_splits, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
                 xhat_c, t_c, rsqrt_c, M_c, dM,
                 gamma.contiguous(), beta.contiguous(), delta.contiguous(),
-                knot_grid, ddelta, dzh, dgamma_partial, dbeta_partial,
-                N, num_blocks,
+                knot_grid, ddelta, ddelta_partial, dzh,
+                dgamma_partial, dbeta_partial,
+                N, ddelta_num_blocks,
+                triton.cdiv(ddelta_num_blocks, ddelta_splits),
                 D_SEED=d, KAPPA=kappa, KAPPA_P=max(kappa, 16), KRANK=krank, H_=h,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=False, PREMUL_DMM=premul_dmm, USE_T=use_t,
+                N_SPLITS=ddelta_splits,
                 **ddelta_launch_kwargs)
+            if ddelta_splits > 1:
+                bdk._lev_bwd_ddelta_split_reduce_kernel[
+                    (h, d // block_d, krank // block_r)
+                ](
+                    ddelta_partial, ddelta,
+                    D_SEED=d, KAPPA=kappa, KRANK=krank, H_=h,
+                    BLOCK_D=block_d, BLOCK_R=block_r,
+                    N_SPLITS=ddelta_splits,
+                    num_warps=4, num_stages=1,
+                )
             grid2 = (h, d // 32)
             _lev_bwd_stats_kernel[grid2](
                 dgamma_partial, dbeta_partial, dgamma, dbeta, num_blocks,
@@ -576,6 +619,13 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
     # The partial statistics are fully reduced now; release them before the
     # remaining parameter reductions so they cannot inflate the live peak.
     del dgamma_partial, dbeta_partial
+    if use_dot_specialization(
+        dev,
+        d_seed=d,
+        num_knots=kappa,
+        krank=krank,
+    ):
+        del ddelta_partial
 
     # ---- GEMM reductions (cuBLAS) ----
     Wf = Wp.float()                         # [h, d, d]

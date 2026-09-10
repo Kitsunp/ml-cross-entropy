@@ -134,18 +134,23 @@ def _lev_bwd_chain_dot_kernel(
 def _lev_bwd_ddelta_dot_kernel(
     xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr,
     gamma_ptr, beta_ptr, delta_ptr, knot_grid_ptr, ddelta_ptr,
+    ddelta_partial_ptr,
     dzh_ptr, dgamma_partial_ptr, dbeta_partial_ptr, N, NUM_BLOCKS,
+    NUM_SPLIT_BLOCKS,
     D_SEED: tl.constexpr, KAPPA: tl.constexpr, KAPPA_P: tl.constexpr,
     KRANK: tl.constexpr, H_: tl.constexpr, BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr, BLOCK_R: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
     FUSE_CHAIN: tl.constexpr, PREMUL_DMM: tl.constexpr,
-    USE_T: tl.constexpr,
+    USE_T: tl.constexpr, N_SPLITS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
+    pid_hs = tl.program_id(0)
     pid_d = tl.program_id(1)
     pid_r = tl.program_id(2)
-    m = pid_m
+    # Triton 3.8 exposes three program-id axes in this environment.  Encode
+    # (split, head) in axis 0 instead of adding a fourth grid dimension.
+    m = pid_hs % H_
+    pid_s = pid_hs // H_
     dc = pid_d * BLOCK_D
     rc = pid_r * BLOCK_R
     ccols = dc + tl.arange(0, BLOCK_D)
@@ -162,9 +167,17 @@ def _lev_bwd_ddelta_dot_kernel(
     # tl.dot uses KAPPA_P=16; reducing into a KAPPA-wide buffer makes the
     # [KAPPA_P, BLOCK_R] result shape incompatible during compilation.
     acc = tl.zeros([BLOCK_D, KAPPA_P, BLOCK_R], tl.float32)
-    for nb in tl.range(0, N, BLOCK_M, loop_unroll_factor=1):
+    # Split the token reduction without atomics.  Each split owns a disjoint
+    # sequence of token blocks, and therefore also owns the corresponding
+    # dzh/statistics writes when the chain is fused.  ``NUM_BLOCKS`` is the
+    # ceil-divided number of dDelta blocks, while NUM_SPLIT_BLOCKS bounds the
+    # interleaved loop for each split and avoids masked-only iterations.
+    for split_block in tl.range(0, NUM_SPLIT_BLOCKS, loop_unroll_factor=1):
+        block_id = pid_s + split_block * N_SPLITS
+        nb = block_id * BLOCK_M
         rows = nb + tl.arange(0, BLOCK_M)
         mask = rows < N
+        block_valid = block_id < NUM_BLOCKS
         # dM and M are invariant across the seed dimensions in this tile.
         # Hoist their loads so the compiler can overlap them with the basis
         # construction and avoid repeating the traffic when BLOCK_D > 1.
@@ -229,9 +242,11 @@ def _lev_bwd_ddelta_dot_kernel(
                 partial_base = (m * NUM_BLOCKS + nb // BLOCK_M) * D_SEED
                 d_index = dc + di
                 tl.store(dgamma_partial_ptr + partial_base + d_index,
-                         tl.sum(dy * xc), mask=d_index < D_SEED)
+                         tl.sum(dy * xc),
+                         mask=block_valid & (d_index < D_SEED))
                 tl.store(dbeta_partial_ptr + partial_base + d_index,
-                         tl.sum(dy), mask=d_index < D_SEED)
+                         tl.sum(dy),
+                         mask=block_valid & (d_index < D_SEED))
                 tl.store(dzh_ptr + m * (N * D_SEED) + rows * D_SEED
                          + d_index, dy * gcv, mask=mask)
             # acc[d, g, r] += sum_n B[n,g] * dphi[n,r]  =  B^T @ dphi
@@ -243,11 +258,48 @@ def _lev_bwd_ddelta_dot_kernel(
                 tl.arange(0, BLOCK_D)[:, None, None] == di,
                 acc + part[None, :, :], acc)
     # store only the real g columns (padded columns are zero and masked out)
-    tl.store(ddelta_ptr + m * (D_SEED * KAPPA * KRANK)
+    split_base = (pid_s * H_ + m) * (D_SEED * KAPPA * KRANK)
+    tl.store(ddelta_partial_ptr + split_base
              + ccols[:, None, None] * (KAPPA * KRANK)
              + gcols_p[None, :, None] * KRANK
              + rcols[None, None, :],
              acc, mask=gmask[None, :, None])
+
+
+@triton.jit
+def _lev_bwd_ddelta_split_reduce_kernel(
+    ddelta_partial_ptr, ddelta_ptr,
+    D_SEED: tl.constexpr, KAPPA: tl.constexpr, KRANK: tl.constexpr,
+    H_: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_R: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+):
+    """Deterministically reduce split-N dDelta partials into the final tile."""
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    pid_r = tl.program_id(2)
+    m = pid_m
+    dc = pid_d * BLOCK_D
+    rc = pid_r * BLOCK_R
+    ccols = dc + tl.arange(0, BLOCK_D)
+    gcols = tl.arange(0, KAPPA)
+    rcols = rc + tl.arange(0, BLOCK_R)
+    tile_size = D_SEED * KAPPA * KRANK
+    acc = tl.zeros([BLOCK_D, KAPPA, BLOCK_R], tl.float32)
+    for split_id in tl.range(0, N_SPLITS, loop_unroll_factor=1):
+        split_base = (split_id * H_ + m) * tile_size
+        acc += tl.load(
+            ddelta_partial_ptr + split_base
+            + ccols[:, None, None] * (KAPPA * KRANK)
+            + gcols[None, :, None] * KRANK
+            + rcols[None, None, :]
+        )
+    tl.store(
+        ddelta_ptr + m * tile_size
+        + ccols[:, None, None] * (KAPPA * KRANK)
+        + gcols[None, :, None] * KRANK
+        + rcols[None, None, :],
+        acc,
+    )
 
 
 @triton.jit
