@@ -13,6 +13,17 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from .spline_support_kernels import (
+        _compact_quadratic_geometry,
+        _lev_compact_contract,
+    )
+except ImportError:  # pragma: no cover - flat remote staging layout
+    from spline_support_kernels import (
+        _compact_quadratic_geometry,
+        _lev_compact_contract,
+    )
+
 EPS_LOG = 1e-9
 NORM_EPS = 1e-5
 
@@ -27,6 +38,7 @@ def _lev_bwd_chain_dot_kernel(
     BLOCK_K: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
     PREMUL_DMM: tl.constexpr, USE_T: tl.constexpr,
+    COMPACT_SPLINE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -45,9 +57,6 @@ def _lev_bwd_chain_dot_kernel(
 
     gamma = tl.load(gamma_ptr + m * D_SEED + dcols)
     beta = tl.load(beta_ptr + m * D_SEED + dcols)
-    xhat = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
-                   + dcols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
-    rsqrt = tl.load(rsqrt_ptr + m * N + rows, mask=mask, other=0.0)
     dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK + rcols[None, :],
                  mask=mask[:, None], other=0.0)
     M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK + rcols[None, :],
@@ -65,44 +74,55 @@ def _lev_bwd_chain_dot_kernel(
         else:
             tc = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gc + bc)))
         tc = tl.minimum(tl.maximum(tc, 0.0), 1.0)             # [BM]
-        # basis (vectorized over g) + normalizer
-        d3 = tl.abs(tc[:, None] - grid_v[None, :]) * scale    # [BM, KAPPA_P]
-        w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
-                      tl.where(d3 < 1.5,
-                               0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
-        w3 = tl.where(gmask[None, :], w3, 0.0)                # pad -> exact 0
-        denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
-        bgn = w3 / denom                                      # [BM, KAPPA_P]
-        # phi via dot (ieee = exact fp32 chain); st padded with 1*0 = 0
-        st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
-                     + dc * (KAPPA * KRANK)
-                     + (gcols_p % KAPPA)[:, None] * KRANK
-                     + rcols[None, :],
-                     mask=gmask[:, None], other=0.0)          # [KAPPA_P, KRANK] bf16
-        st = 1.0 + st.to(tl.float32)
-        st_t = tl.trans(st)                                   # [KRANK, KAPPA_P]
-        if DOT_IEEE:
-            phi = tl.dot(bgn, st, input_precision="ieee")     # [BM, KRANK]
+        if COMPACT_SPLINE:
+            support, b0, b1, b2, b3, db0, _, db2, db3 = _compact_quadratic_geometry(
+                tc, knot_grid_ptr, KAPPA, True,
+            )
+            phi, phi_dt = _lev_compact_contract(
+                delta_ptr + (m * D_SEED + dc) * KAPPA * KRANK,
+                rcols, mask, support, b0, b1, b2, b3, db0, db2, db3,
+                KRANK, True,
+            )
         else:
-            phi = tl.dot(bgn, st, input_precision="tf32x3")
+            # basis (vectorized over g) + normalizer
+            d3 = tl.abs(tc[:, None] - grid_v[None, :]) * scale
+            w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
+                          tl.where(d3 < 1.5,
+                                   0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
+            w3 = tl.where(gmask[None, :], w3, 0.0)
+            denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
+            bgn = w3 / denom
+            # phi via dot (ieee = exact fp32 chain); st padded with 1*0 = 0
+            st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
+                         + dc * (KAPPA * KRANK)
+                         + (gcols_p % KAPPA)[:, None] * KRANK
+                         + rcols[None, :],
+                         mask=gmask[:, None], other=0.0)
+            st = 1.0 + st.to(tl.float32)
+            st_t = tl.trans(st)
+            if DOT_IEEE:
+                phi = tl.dot(bgn, st, input_precision="ieee")
+            else:
+                phi = tl.dot(bgn, st, input_precision="tf32x3")
         dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
                 * tl.where(phi >= 0, 1.0, -1.0)
                 / (tl.abs(phi) + LOG_EPS))                    # [BM, KRANK]
-        # dB via dot over r: [BM, KRANK] @ [KRANK, KAPPA]
-        if DOT_IEEE:
-            dB = tl.dot(dphi, st_t, input_precision="ieee")   # [BM, KAPPA_P]
+        if COMPACT_SPLINE:
+            # Contract the normalized spline derivative directly with dphi.
+            dt = tl.sum(dphi * phi_dt, axis=1)
         else:
-            dB = tl.dot(dphi, st_t, input_precision="tf32x3")
-        # spline backward, vectorized over g (exact split):
-        #   dt = scale/D^2 * (D*A - wsum*C)
-        dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
-                        tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
-        sgn3 = tl.where(tc[:, None] - grid_v[None, :] >= 0, 1.0, -1.0)
-        wsum = tl.sum(dB * w3, 1)                             # [BM]
-        A = tl.sum(dB * dwd3 * sgn3, 1)
-        C = tl.sum(dwd3 * sgn3, 1)
-        denom1 = tl.reshape(denom, [BLOCK_M])
-        dt = (denom1 * A - wsum * C) * (scale / (denom1 * denom1))
+            if DOT_IEEE:
+                dB = tl.dot(dphi, st_t, input_precision="ieee")
+            else:
+                dB = tl.dot(dphi, st_t, input_precision="tf32x3")
+            dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
+                            tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
+            sgn3 = tl.where(tc[:, None] - grid_v[None, :] >= 0, 1.0, -1.0)
+            wsum = tl.sum(dB * w3, 1)
+            A = tl.sum(dB * dwd3 * sgn3, 1)
+            C = tl.sum(dwd3 * sgn3, 1)
+            denom1 = tl.reshape(denom, [BLOCK_M])
+            dt = (denom1 * A - wsum * C) * (scale / (denom1 * denom1))
         # sigmoid(x/2) + clamp backward; LN backward (per-d part)
         tmask = ((tc > 0.0) & (tc < 1.0)).to(tl.float32)
         dy = dt * (0.5 * tc * (1.0 - tc)) * tmask             # [BM]
@@ -123,6 +143,11 @@ def _lev_bwd_chain_dot_kernel(
                     + dcols[None, :], mask=mask[:, None], other=0.0)
 
     # LayerNorm backward (full-d): dzh = rsqrt * (dxhat - m1 - xhat*m2)
+    # These full-D tensors are needed only after the spline loop. Keeping
+    # them out of that loop shortens the live register working set.
+    xhat = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
+                   + dcols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
+    rsqrt = tl.load(rsqrt_ptr + m * N + rows, mask=mask, other=0.0)
     m1 = tl.sum(dxhat, 1, keep_dims=True) * (1.0 / D_SEED)
     m2 = tl.sum(dxhat * xhat, 1, keep_dims=True) * (1.0 / D_SEED)
     dzh = rsqrt[:, None] * (dxhat - m1 - xhat * m2)
@@ -143,6 +168,7 @@ def _lev_bwd_ddelta_dot_kernel(
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
     FUSE_CHAIN: tl.constexpr, PREMUL_DMM: tl.constexpr,
     USE_T: tl.constexpr, N_SPLITS: tl.constexpr,
+    COMPACT_SPLINE: tl.constexpr,
 ):
     pid_hs = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -181,11 +207,12 @@ def _lev_bwd_ddelta_dot_kernel(
         # dM and M are invariant across the seed dimensions in this tile.
         # Hoist their loads so the compiler can overlap them with the basis
         # construction and avoid repeating the traffic when BLOCK_D > 1.
-        dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK
-                     + rcols[None, :], mask=mask[:, None], other=0.0)
-        M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
-                    + rcols[None, :], mask=mask[:, None],
-                    other=0.0).to(tl.float32)
+        if not COMPACT_SPLINE or BLOCK_D > 1:
+            dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK
+                         + rcols[None, :], mask=mask[:, None], other=0.0)
+            M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
+                        + rcols[None, :], mask=mask[:, None],
+                        other=0.0).to(tl.float32)
         # per-d of this tile: basis + phi + dphi, then acc += B^T @ dphi
         for di in tl.static_range(BLOCK_D):
             gcv = tl.load(gamma_ptr + m * D_SEED + dc + di)
@@ -198,23 +225,41 @@ def _lev_bwd_ddelta_dot_kernel(
             else:
                 tcv = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gcv + bcv)))
             tcv = tl.minimum(tl.maximum(tcv, 0.0), 1.0)
-            d3 = tl.abs(tcv[:, None] - grid_v[None, :]) * scale
-            w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
-                          tl.where(d3 < 1.5,
-                                   0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
-            w3 = tl.where(gmask[None, :], w3, 0.0)
-            denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
-            bgn = w3 / denom                                  # [BM, KAPPA_P]
-            st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
-                         + (dc + di) * (KAPPA * KRANK)
-                         + (gcols_p % KAPPA)[:, None] * KRANK
-                         + rcols[None, :],
-                         mask=gmask[:, None], other=0.0)
-            st = 1.0 + st.to(tl.float32)                      # [KAPPA_P, BLOCK_R]
-            if DOT_IEEE:
-                phi = tl.dot(bgn, st, input_precision="ieee")  # [BM, BLOCK_R]
+            if COMPACT_SPLINE:
+                support, b0, b1, b2, b3, db0, _, db2, db3 = _compact_quadratic_geometry(
+                    tcv, knot_grid_ptr, KAPPA, FUSE_CHAIN,
+                )
+                phi, phi_dt = _lev_compact_contract(
+                    delta_ptr + (m * D_SEED + dc + di) * KAPPA * KRANK,
+                    rcols, mask, support, b0, b1, b2, b3, db0, db2, db3,
+                    KRANK, FUSE_CHAIN,
+                )
             else:
-                phi = tl.dot(bgn, st, input_precision="tf32x3")
+                d3 = tl.abs(tcv[:, None] - grid_v[None, :]) * scale
+                w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
+                              tl.where(d3 < 1.5,
+                                       0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
+                w3 = tl.where(gmask[None, :], w3, 0.0)
+                denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
+                bgn = w3 / denom
+                st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
+                             + (dc + di) * (KAPPA * KRANK)
+                             + (gcols_p % KAPPA)[:, None] * KRANK
+                             + rcols[None, :],
+                             mask=gmask[:, None], other=0.0)
+                st = 1.0 + st.to(tl.float32)
+                if DOT_IEEE:
+                    phi = tl.dot(bgn, st, input_precision="ieee")
+                else:
+                    phi = tl.dot(bgn, st, input_precision="tf32x3")
+            if COMPACT_SPLINE and BLOCK_D == 1:
+                # The BD=1 compact path needs these only after interpolation;
+                # do not retain rank-wide gradient inputs while gathering rows.
+                dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK
+                             + rcols[None, :], mask=mask[:, None], other=0.0)
+                M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
+                            + rcols[None, :], mask=mask[:, None],
+                            other=0.0).to(tl.float32)
             dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
                     * tl.where(phi >= 0, 1.0, -1.0)
                     / (tl.abs(phi) + LOG_EPS))
@@ -222,21 +267,24 @@ def _lev_bwd_ddelta_dot_kernel(
                 # The old chain kernel performed this same dB -> dt -> dy
                 # work after dphi had already been computed once here.  Keep
                 # it in registers so this pass also produces the LN inputs.
-                st_t = tl.trans(st)
-                if DOT_IEEE:
-                    dB = tl.dot(dphi, st_t, input_precision="ieee")
+                if COMPACT_SPLINE:
+                    dt = tl.sum(dphi * phi_dt, axis=1)
                 else:
-                    dB = tl.dot(dphi, st_t, input_precision="tf32x3")
-                dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
-                                tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
-                sgn3 = tl.where(tcv[:, None] - grid_v[None, :] >= 0,
-                                1.0, -1.0)
-                wsum = tl.sum(dB * w3, 1)
-                A = tl.sum(dB * dwd3 * sgn3, 1)
-                C = tl.sum(dwd3 * sgn3, 1)
-                denom1 = tl.reshape(denom, [BLOCK_M])
-                dt = ((denom1 * A - wsum * C)
-                      * (scale / (denom1 * denom1)))
+                    st_t = tl.trans(st)
+                    if DOT_IEEE:
+                        dB = tl.dot(dphi, st_t, input_precision="ieee")
+                    else:
+                        dB = tl.dot(dphi, st_t, input_precision="tf32x3")
+                    dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
+                                    tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
+                    sgn3 = tl.where(tcv[:, None] - grid_v[None, :] >= 0,
+                                    1.0, -1.0)
+                    wsum = tl.sum(dB * w3, 1)
+                    A = tl.sum(dB * dwd3 * sgn3, 1)
+                    C = tl.sum(dwd3 * sgn3, 1)
+                    denom1 = tl.reshape(denom, [BLOCK_M])
+                    dt = ((denom1 * A - wsum * C)
+                          * (scale / (denom1 * denom1)))
                 tmask = ((tcv > 0.0) & (tcv < 1.0)).to(tl.float32)
                 dy = dt * (0.5 * tcv * (1.0 - tcv)) * tmask
                 partial_base = (m * NUM_BLOCKS + nb // BLOCK_M) * D_SEED
@@ -249,11 +297,28 @@ def _lev_bwd_ddelta_dot_kernel(
                          mask=block_valid & (d_index < D_SEED))
                 tl.store(dzh_ptr + m * (N * D_SEED) + rows * D_SEED
                          + d_index, dy * gcv, mask=mask)
-            # acc[d, g, r] += sum_n B[n,g] * dphi[n,r]  =  B^T @ dphi
-            if DOT_IEEE:
-                part = tl.dot(tl.trans(bgn), dphi, input_precision="ieee")
+            # acc[d, g, r] += sum_n B[n,g] * dphi[n,r].  Reconstruct the
+            # compact weights in registers for the validated matrix reduction.
+            if COMPACT_SPLINE:
+                local_knot = gcols_p[None, :] - support[:, None]
+                bfull = tl.where(
+                    local_knot == 0, b0[:, None],
+                    tl.where(local_knot == 1, b1[:, None],
+                             tl.where(local_knot == 2, b2[:, None],
+                                      tl.where(local_knot == 3, b3[:, None], 0.0))),
+                )
+                bfull = tl.where(gmask[None, :], bfull, 0.0)
+                if DOT_IEEE:
+                    part = tl.dot(tl.trans(bfull), dphi,
+                                  input_precision="ieee")
+                else:
+                    part = tl.dot(tl.trans(bfull), dphi,
+                                  input_precision="tf32x3")
             else:
-                part = tl.dot(tl.trans(bgn), dphi, input_precision="tf32x3")
+                if DOT_IEEE:
+                    part = tl.dot(tl.trans(bgn), dphi, input_precision="ieee")
+                else:
+                    part = tl.dot(tl.trans(bgn), dphi, input_precision="tf32x3")
             acc = tl.where(
                 tl.arange(0, BLOCK_D)[:, None, None] == di,
                 acc + part[None, :, :], acc)

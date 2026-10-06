@@ -11,6 +11,8 @@ build
 *.log
 *.log.*
 *.jsonl
+*.trace.json
+*.trace.json.gz
 
 # Data
 !**/alpaca-data-conversation.json
@@ -24,6 +26,7 @@ build
 .DS_Store
 .serena
 .codex
+.codex-tmp/
 wandb
 output
 tmp

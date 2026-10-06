@@ -1,7 +1,7 @@
 {
   "schema": "neollm-remote-real-10x10-v1",
   "status": "ok",
-  "mode": "jtok",
+  "mode": "jtokm",
   "backend": "triton",
   "provenance": {
     "canonical_repository": "ml-cross-entropy-jtok-pr",
@@ -63,17 +63,22 @@
     "leviathan_triton_required": true,
     "reference_fallback_allowed": false
   },
+  "acceptance": {
+    "metric": "stable_full_optimizer_step_steps_per_second",
+    "target_steps_per_second": 4.2,
+    "status": "not_reached"
+  },
   "timing": {
-    "train_step_median_after_first_seconds": 0.25200606998987496,
-    "train_steps_per_second_after_first": 3.9681583861856096,
+    "stable_step_seconds": 0.2922230130061507,
+    "stable_steps_per_second": 3.4220439715298943,
     "timing_scope": "full_optimizer_step_after_cold_compile"
   },
   "trace_summary": {
     "scope": "_lev_bwd_ddelta_dot_kernel",
     "_lev_bwd_ddelta_dot_kernel": {
       "count": 2,
-      "median_us": 10717.85,
-      "dur_us": [10774.202, 10661.498]
+      "median_us": 11478.4065,
+      "dur_us": [11478.807, 11478.006]
     }
   }
 }

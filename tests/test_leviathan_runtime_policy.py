@@ -8,7 +8,11 @@ from cut_cross_entropy.leviathan import (
     LeviathanGenerator,
     leviathan_embedding,
 )
-from cut_cross_entropy.leviathan.runtime_policy import use_dot_specialization
+from cut_cross_entropy.leviathan.runtime_policy import (
+    compact_spline_supported,
+    compact_spline_requested,
+    use_dot_specialization,
+)
 
 _PARAMETER_NAMES = (
     "codebooks",
@@ -53,6 +57,64 @@ def test_dot_specialization_respects_diagnostic_override(
     assert use_dot_specialization(
         torch.device("cpu"), d_seed=128, num_knots=16, krank=64
     )
+
+
+def test_compact_spline_is_explicit_and_composes_with_dot_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LEV_COMPACT_SPLINE", raising=False)
+    monkeypatch.delenv("LEV_DOT", raising=False)
+    assert not compact_spline_requested()
+
+    monkeypatch.setenv("LEV_COMPACT_SPLINE", "1")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    assert compact_spline_requested()
+    assert compact_spline_supported(
+        torch.device("cuda"),
+        d_seed=128,
+        num_knots=16,
+        krank=64,
+        knot_grid=torch.linspace(0.0, 1.0, 16),
+    )
+
+    custom = torch.linspace(0.0, 1.0, 16)
+    custom[4] += 0.001
+    assert not compact_spline_supported(
+        torch.device("cuda"),
+        d_seed=128,
+        num_knots=16,
+        krank=64,
+        knot_grid=custom,
+    )
+    assert not compact_spline_supported(
+        torch.device("cuda"),
+        d_seed=256,
+        num_knots=16,
+        krank=64,
+        knot_grid=torch.linspace(0.0, 1.0, 16),
+    )
+
+
+@pytest.mark.parametrize("d_seed,krank", [(256, 64), (128, 32)])
+def test_compact_geometry_cannot_be_widened_by_dot_override(
+    monkeypatch: pytest.MonkeyPatch, d_seed: int, krank: int,
+) -> None:
+    monkeypatch.setenv("LEV_DOT", "1")
+    assert not compact_spline_supported(
+        torch.device("cuda"), d_seed=d_seed, num_knots=16, krank=krank,
+    )
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0)],
+                         ids=["sm80", "sm90", "sm120"])
+def test_compact_architecture_cannot_be_widened_by_dot_override(
+    monkeypatch: pytest.MonkeyPatch, capability,
+) -> None:
+    monkeypatch.setenv("LEV_DOT", "1")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    assert compact_spline_supported(
+        torch.device("cuda"), d_seed=128, num_knots=16, krank=64,
+    ) is (capability >= (12, 0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

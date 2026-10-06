@@ -241,14 +241,14 @@ batch 64, sequence 512, 12 Transformer layers, the real CCE loss,
 external package provenance was checked before execution:
 
 ```text
-/workspace/codex_ml_cross_entropy_jtok_wide256_exp/cut_cross_entropy/__init__.py
-/workspace/codex_ml_cross_entropy_jtok_wide256_exp/cut_cross_entropy/leviathan/jtok.py
+cut_cross_entropy/__init__.py (isolated candidate checkout)
+cut_cross_entropy/leviathan/jtok.py (same checkout)
 ```
 
 The first run made without `PYTHONPATH` was discarded for this comparison,
-because the editable install pointed at the older clone under
-`/root/src/cut-cross-entropy`. This is intentionally recorded so an installed
-package cannot be mistaken for the checkout under test.
+because the editable install pointed at an older clone rather than the candidate.
+This is intentionally recorded so an installed package cannot be mistaken for
+the checkout under test; machine-specific absolute paths are not published.
 
 Stable step medians were taken from steps 4--11 of the same profiled process;
 the first compiled step and the profiler step were excluded:

@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import statistics
@@ -31,16 +32,51 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
+from leviathan_candidate_provenance import CANDIDATE_FILES, verify_candidate
+
 REAL_TRAIN_STEPS = 10
 REAL_VALIDATION_STEPS = 10
 REQUIRED_DATASET_COLUMNS = frozenset(("input_ids", "attention_mask"))
 CANONICAL_SOURCE_REPOSITORY = "ml-cross-entropy-jtok-pr"
 CANONICAL_SOURCE_COMMIT = "5a4072d"
 CCE_PROVENANCE_FILES = (
-    "leviathan/backward_dot_kernels.py",
-    "leviathan/backward_kernels.py",
+    *CANDIDATE_FILES,
     "leviathan/jtok.py",
 )
+
+
+def _profile_phase(step: int) -> str:
+    """One-based phase for the fixed wait=1, warmup=1, active=2 schedule."""
+    if step < 1:
+        raise ValueError("optimizer step must be one-based")
+    return {1: "cold_wait", 2: "profile_warmup", 3: "profile_active",
+            4: "profile_active"}.get(step, "stable_unprofiled")
+
+
+def _step_statistics(values: list[float]) -> dict[str, Any]:
+    if not values or any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("step times must be finite and positive")
+    ordered = sorted(values)
+    p95_index = 0.95 * (len(ordered) - 1)
+    left = math.floor(p95_index)
+    right = math.ceil(p95_index)
+    p95 = ordered[left] + (ordered[right] - ordered[left]) * (p95_index - left)
+    median = statistics.median(values)
+    return {"count": len(values), "median_seconds": median,
+            "steps_per_second": 1.0 / median, "p95_seconds": p95,
+            "min_seconds": min(values), "max_seconds": max(values),
+            "population_stddev_seconds": statistics.pstdev(values)}
+
+
+def _stable_step_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    stable = [record for record in records if record["phase"] == "stable_unprofiled"]
+    return {
+        "metric": "reciprocal_of_median_batch_ready_compute_seconds",
+        "stable_optimizer_steps": [record["optimizer_step"] for record in stable],
+        "compute": _step_statistics([record["compute_seconds"] for record in stable]),
+        "e2e": _step_statistics([record["e2e_seconds"] for record in stable]),
+        "p95_definition": "linear_interpolation_at_0.95_times_n_minus_one",
+    }
 
 
 def _redact_text(value: object) -> str:
@@ -215,6 +251,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--train-script", type=Path, default=Path("/train.py"))
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--candidate-manifest", type=Path)
     parser.add_argument(
         "--profile",
         type=Path,
@@ -292,7 +329,7 @@ def main() -> int:
             "canonical_repository": CANONICAL_SOURCE_REPOSITORY,
             "canonical_commit": CANONICAL_SOURCE_COMMIT,
         },
-        "seed": 1729,
+        "runner_initial_seed": 1729,
         "train_steps_requested": REAL_TRAIN_STEPS,
         "validation_steps_requested": REAL_VALIDATION_STEPS,
         "batch_size": args.batch_size,
@@ -303,6 +340,7 @@ def main() -> int:
             "synthetic_allowed_for_gate": False,
         },
         "kernel_policy": {
+            "compact_spline": os.environ.get("LEV_COMPACT_SPLINE", "0"),
             "d_delta_splits": os.environ.get("LEV_DDELTA_SPLITS", "1"),
             "d_delta_block_m": os.environ.get("LEV_DDELTA_BM", "auto"),
             "d_delta_block_d": os.environ.get("LEV_DDELTA_BD", "auto"),
@@ -317,6 +355,8 @@ def main() -> int:
 
     timing: dict[str, Any] = {
         "train_step_seconds": [],
+        "step_records": [],
+        "train_losses": [],
         "eval_prediction_steps": 0,
     }
     profile_holder: dict[str, Any] = {"profiler": None}
@@ -349,6 +389,16 @@ def main() -> int:
         import cut_cross_entropy
 
         cce_origin = Path(cut_cross_entropy.__file__).resolve()
+        from cut_cross_entropy.leviathan.runtime_policy import compact_spline_requested
+
+        if compact_spline_requested() and args.candidate_manifest is None:
+            raise ValueError("compact validation requires --candidate-manifest")
+        if args.candidate_manifest is not None:
+            verify_candidate(
+                cce_origin.parent,
+                json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
+            )
+            result["runtime_verification"]["candidate_sources_verified"] = True
         result["imports"] = {
             "training_module": args.train_script.name,
             "cce_module": cce_origin.name,
@@ -377,7 +427,9 @@ def main() -> int:
         training.setup_model = strict_setup_model
 
         def existing_fineweb(tokenizer: Any, block_size: int = 512, **_kwargs: Any):
-            del tokenizer, block_size
+            del tokenizer
+            if block_size != 512:
+                raise ValueError("training sequence length differs from fixed 10x10 contract")
             return _prepare_preexisting_splits(
                 args.data_dir,
                 args.batch_size,
@@ -402,6 +454,10 @@ def main() -> int:
 
         def validation_training_args(output_dir: str, run_name: str):
             train_args = original_setup_args(output_dir, run_name)
+            if train_args.gradient_accumulation_steps != 1:
+                raise ValueError("fixed 10x10 timing currently requires accumulation=1")
+            result["seed"] = int(train_args.seed)
+            result["data_seed"] = int(train_args.data_seed)
             train_args.max_steps = REAL_TRAIN_STEPS
             train_args.num_train_epochs = 1
             train_args.per_device_train_batch_size = args.batch_size
@@ -423,6 +479,7 @@ def main() -> int:
         training.create_and_push_model_card = lambda *a, **k: None
         training.save_tokenizer_with_contract = lambda *a, **k: None
         training.AdEMAMixTrainer.save_model = lambda self, *a, **k: None
+        result_output_path = args.output
 
         class TimingCallback(TrainerCallback):
             def on_train_begin(self, args, state, control, **kwargs):
@@ -438,11 +495,32 @@ def main() -> int:
 
             def on_step_end(self, args, state, control, **kwargs):
                 torch.cuda.synchronize()
+                step_end = time.perf_counter()
                 starts = timing.get("_step_starts", [])
                 if starts:
                     timing["train_step_seconds"].append(
-                        time.perf_counter() - starts[-1]
+                        step_end - starts[-1]
                     )
+                compute_start = timing.pop("_compute_start", None)
+                e2e_start = timing.pop("_e2e_start", None)
+                if compute_start is None or e2e_start is None:
+                    raise RuntimeError("batch-ready compute/e2e timing boundary was not observed")
+                step = len(timing["train_step_seconds"])
+                timing["step_records"].append({
+                    "optimizer_step": step, "phase": _profile_phase(step),
+                    "compute_seconds": step_end - compute_start,
+                    "e2e_seconds": step_end - e2e_start,
+                })
+                loss = timing.pop("_loss_snapshot").item()
+                if not math.isfinite(loss):
+                    raise RuntimeError("nonfinite training loss")
+                timing["train_losses"].append(float(loss))
+                result["memory"] = {
+                    "train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                    "train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                }
+                result["timing"]["step_records"] = timing["step_records"]
+                _write_result(result_output_path, result)
                 profiler = profile_holder.get("profiler")
                 if profiler is not None:
                     profiler.step()
@@ -459,6 +537,8 @@ def main() -> int:
                     for key, value in (metrics or {}).items()
                     if isinstance(value, (int, float))
                 }
+                if any(not math.isfinite(value) for value in timing["eval_metrics"].values()):
+                    raise RuntimeError("nonfinite validation metric")
                 return control
 
             def on_train_end(self, args, state, control, **kwargs):
@@ -470,6 +550,40 @@ def main() -> int:
 
         def timed_trainer_init(self, *init_args, **init_kwargs):
             original_trainer_init(self, *init_args, **init_kwargs)
+            original_batches = self.get_batch_samples
+            original_step = self.training_step
+            original_loss = self.compute_loss
+
+            def measured_batches(*batch_args, **batch_kwargs):
+                torch.cuda.synchronize()
+                timing["_e2e_start"] = time.perf_counter()
+                return original_batches(*batch_args, **batch_kwargs)
+
+            def measured_step(*step_args, **step_kwargs):
+                timing["_inside_training_step"] = True
+                try:
+                    return original_step(*step_args, **step_kwargs)
+                finally:
+                    timing["_inside_training_step"] = False
+
+            def measured_loss(*loss_args, **loss_kwargs):
+                if timing.get("_inside_training_step"):
+                    if "_compute_start" in timing:
+                        raise RuntimeError("multiple loss calls in one fixed-contract optimizer step")
+                    # Trainer has placed/prepared inputs before compute_loss.
+                    # Synchronize outstanding H2D before the wall-clock compute boundary.
+                    torch.cuda.synchronize()
+                    timing["_compute_start"] = time.perf_counter()
+                output = original_loss(*loss_args, **loss_kwargs)
+                if timing.get("_inside_training_step"):
+                    loss = output[0] if isinstance(output, tuple) else output
+                    # Own a tiny scalar copy: cudagraph replay may reuse output storage.
+                    timing["_loss_snapshot"] = loss.detach().float().clone()
+                return output
+
+            self.get_batch_samples = measured_batches
+            self.training_step = measured_step
+            self.compute_loss = measured_loss
             self.add_callback(TimingCallback())
 
         training.AdEMAMixTrainer.__init__ = timed_trainer_init
@@ -508,6 +622,11 @@ def main() -> int:
             raise RuntimeError("real validation completed an unexpected train step count")
         if timing["eval_prediction_steps"] != REAL_VALIDATION_STEPS:
             raise RuntimeError("real validation completed an unexpected eval step count")
+        if args.candidate_manifest is not None:
+            verify_candidate(
+                cce_origin.parent,
+                json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
+            )
 
         result["status"] = "ok"
         train_step_median = statistics.median(timing["train_step_seconds"])
@@ -523,6 +642,10 @@ def main() -> int:
             "train_steps_completed": len(timing["train_step_seconds"]),
             "validation_steps_completed": timing["eval_prediction_steps"],
             "eval_metrics": timing.get("eval_metrics", {}),
+            "train_losses": timing["train_losses"],
+            "step_records": timing["step_records"],
+            "stable": _stable_step_statistics(timing["step_records"]),
+            "instrumentation": "host_cuda_sync_at_batch_fetch_compute_start_and_optimizer_end",
         }
     except BaseException as error:
         result["status"] = "error"
@@ -532,6 +655,8 @@ def main() -> int:
             "train_step_seconds": timing["train_step_seconds"],
             "train_steps_completed": len(timing["train_step_seconds"]),
             "validation_steps_completed": timing["eval_prediction_steps"],
+            "step_records": timing["step_records"],
+            "train_losses": timing["train_losses"],
         }
         _write_result(args.output, result)
         raise

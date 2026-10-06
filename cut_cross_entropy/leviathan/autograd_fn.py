@@ -34,6 +34,11 @@ try:  # import relativo (paquete backward/) o absoluto (layout plano del contrat
 except ImportError:  # pragma: no cover
     from backward_impl import leviathan_backward, leviathan_forward_ref
 
+try:
+    from .runtime_policy import compact_spline_requested
+except ImportError:  # pragma: no cover
+    from runtime_policy import compact_spline_requested
+
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -86,6 +91,9 @@ _leviathan_backward_triton = _load_triton_backward()
 def leviathan_backward_triton_or_torch(grad_out, params, cfg, saved, ids,
                                        chunk):
     """Triton backward when supported, else the verified torch fallback."""
+    compact_required = compact_spline_requested() or (
+        isinstance(saved, dict) and bool(saved.get("compact_spline", False))
+    )
     if _leviathan_backward_triton is not None:
         try:
             grads = _leviathan_backward_triton(grad_out, params, cfg, saved,
@@ -93,7 +101,13 @@ def leviathan_backward_triton_or_torch(grad_out, params, cfg, saved, ids,
             if grads is not None:
                 return grads
         except (RuntimeError, TypeError, ValueError):
-            pass
+            if compact_required:
+                raise
+    if compact_required:
+        raise RuntimeError(
+            "compact Leviathan backward was requested but Triton did not "
+            "accept the configuration"
+        )
     return leviathan_backward(
         grad_out,
         params,
@@ -128,6 +142,8 @@ def _run_forward(ids, params, cfg, variant):
             variant=variant,
         )
     except (RuntimeError, TypeError, ValueError, AttributeError):
+        if compact_spline_requested():
+            raise
         # Unsupported config / wrong dtype / no CUDA -> the differentiable
         # reference forward.  The reference intentionally has no variant
         # switch: it is the semantic fallback for every requested variant.

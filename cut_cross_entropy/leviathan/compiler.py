@@ -30,6 +30,7 @@ from .backward_impl import (
     leviathan_forward_ref,
 )
 from .core import LeviathanConfig
+from .runtime_policy import compact_spline_requested
 
 try:
     from .forward_impl import leviathan_forward as _leviathan_forward
@@ -98,12 +99,16 @@ def _saved_or_reference(
             if saved is not None:
                 return embeds, saved
         except (TypeError, ValueError, AttributeError):
+            if compact_spline_requested():
+                raise
             # The reference path is the semantic fallback for unsupported
             # metadata/configurations. Do not catch CUDA launch failures here:
             # executing the reference after a failed launch can invalidate the
             # surrounding CUDA-graph/FlashAttention partition.
             pass
 
+    if compact_spline_requested():
+        raise RuntimeError("compact Leviathan forward requires Triton checkpoints")
     with torch.no_grad():
         embeds, saved = leviathan_forward_ref(
             ids,
@@ -227,7 +232,10 @@ def _leviathan_forward_impl(
         modes = codebooks.new_empty((ids.numel(), num_modes, krank))
     else:
         modes = modes.contiguous()
-    mode_flag = codebooks.new_tensor(1 if has_modes else 0, dtype=torch.int8)
+    # Reuse the existing scalar metadata output without changing the custom
+    # op schema: 0=reference checkpoints, 1=dense Triton, 2=compact Triton.
+    mode_value = (2 if saved.get("compact_spline", False) else 1) if has_modes else 0
+    mode_flag = codebooks.new_tensor(mode_value, dtype=torch.int8)
     if TORCH_2_14_MEMORY_ANNOTATIONS:
         annotate_tensors(
             "leviathan.forward",
@@ -714,6 +722,7 @@ def _compute_leviathan_grads(
     seed_grad: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     grads = None
+    compact_required = bool(saved.get("compact_spline", False))
     if has_modes and _leviathan_backward_triton is not None:
         try:
             grads = _leviathan_backward_triton(
@@ -725,8 +734,12 @@ def _compute_leviathan_grads(
                 seed_grad=seed_grad,
             )
         except (TypeError, ValueError, AttributeError):
+            if compact_required:
+                raise
             grads = None
     if grads is None:
+        if compact_required:
+            raise RuntimeError("compact Leviathan backward requires Triton")
         # Keep the compiler-boundary fallback bounded just like the regular
         # autograd wrapper. This path is used when the Triton backward is
         # unavailable or rejects metadata; a long sequence must not make the
@@ -810,7 +823,11 @@ def _leviathan_backward_op(
         "rsqrt_por_head": rsqrt,
         "knot_grid": knot_grid,
     }
-    has_modes = bool(modes_available.item())
+    mode_value = int(modes_available.item())
+    if mode_value not in (0, 1, 2):
+        raise ValueError("invalid Leviathan checkpoint mode")
+    has_modes = mode_value != 0
+    saved["compact_spline"] = mode_value == 2
     if has_modes:
         saved["modes_por_head"] = modes
 

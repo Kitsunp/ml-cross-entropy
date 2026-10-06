@@ -7,6 +7,16 @@
     "canonical_repository": "ml-cross-entropy-jtok-pr",
     "canonical_commit": "5a4072d"
   },
+  "source_code_upload_policy": {
+    "modeling_neollm.py": "prohibited_from_repository_fingerprints_private_only",
+    "configuration_neollm.py": "prohibited_from_repository_fingerprints_private_only",
+    "train.py": "prohibited_from_repository_fingerprints_private_only",
+    "source_contents_included": false
+  },
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
   "runtime": {
     "device": "NVIDIA GeForce RTX 5090",
     "capability": [12, 0],
@@ -15,11 +25,6 @@
     "transformers_version": "5.17.0",
     "device_count": 1,
     "cuda_available": true
-  },
-  "module_hashes": {
-    "train.py": "5d43cd58096aaebb0b04eb59a9f1b82163d02089ee18fca83fb6bd1f2175c48d",
-    "modeling_neollm.py": "26914cf05982e015fa10fec29385dddb0e434e97269a09694ffb06f40b519187",
-    "configuration_neollm.py": "d58cfb55ac2dc1056037ef7b0dcd8d38da617dadad0f23d85ce31cc06082706c"
   },
   "cce_provenance_verified_after_run": {
     "python_file_count": 52,
@@ -47,7 +52,9 @@
   "sequence_length": 512,
   "profile": {
     "requested": true,
-    "diagnostic_only": true
+    "diagnostic_only": true,
+    "publication": "sanitized_target_kernel_aggregate_only",
+    "raw_trace_versioned": false
   },
   "runtime_verification": {
     "leviathan_triton_required": true,
@@ -58,40 +65,14 @@
     "validation_steps_completed": 10,
     "train_step_median_after_first_seconds": 0.20340745709836483,
     "train_steps_per_second_after_first": 4.916240605261659,
-    "train_step_median_seconds": 0.2049669330008328,
-    "train_steps_per_second": 4.878835748573829,
-    "eval_loss": 8.881209373474121,
-    "train_step_seconds": [
-      343.59791184798814,
-      0.2691888608969748,
-      0.5738181208726019,
-      0.22195550706237555,
-      0.20652640890330076,
-      0.2031438760459423,
-      0.20340745709836483,
-      0.19915931415744126,
-      0.20331449690274894,
-      0.2011091960594058
-    ]
+    "timing_scope": "full_optimizer_step_after_cold_compile"
   },
   "trace_summary": {
-    "trace_event_count": 103562,
+    "scope": "_lev_bwd_ddelta_dot_kernel",
     "_lev_bwd_ddelta_dot_kernel": {
       "count": 2,
       "median_us": 10949.0925,
       "dur_us": [11268.053, 10630.132]
-    },
-    "_lev_bwd_ln_kernel": {
-      "count": 2,
-      "median_us": 242.112
-    },
-    "_lev_bwd_stats_kernel": {
-      "count": 2,
-      "median_us": 27.696
-    },
-    "_lev_fused_dot": {
-      "count": 2,
-      "median_us": 3192.406
     }
   }
 }

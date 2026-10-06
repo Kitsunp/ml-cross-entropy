@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import sys
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "benchmark"))
 
 _RUNNER_PATH = Path(__file__).parents[1] / "benchmark" / "remote_real_10x10_validation.py"
 _SPEC = importlib.util.spec_from_file_location("remote_real_10x10_validation", _RUNNER_PATH)
@@ -41,8 +46,7 @@ def test_runner_records_canonical_source_and_critical_cce_hashes() -> None:
     assert _RUNNER.CANONICAL_SOURCE_REPOSITORY == "ml-cross-entropy-jtok-pr"
     assert _RUNNER.CANONICAL_SOURCE_COMMIT == "5a4072d"
     assert _RUNNER.CCE_PROVENANCE_FILES == (
-        "leviathan/backward_dot_kernels.py",
-        "leviathan/backward_kernels.py",
+        *_RUNNER.CANDIDATE_FILES,
         "leviathan/jtok.py",
     )
 
@@ -159,3 +163,58 @@ def test_diagnostics_redact_hosts_paths_and_secrets() -> None:
     assert "private-user" not in redacted
     assert "do-not-store" not in redacted
     assert "example.invalid" not in redacted
+
+
+def test_stable_timing_excludes_cold_warmup_and_profile_active_steps() -> None:
+    records = [
+        {"optimizer_step": step, "phase": _RUNNER._profile_phase(step),
+         "compute_seconds": 10.0 if step <= 4 else 0.2,
+         "e2e_seconds": 11.0 if step <= 4 else 0.25}
+        for step in range(1, 11)
+    ]
+    result = _RUNNER._stable_step_statistics(records)
+    assert result["stable_optimizer_steps"] == [5, 6, 7, 8, 9, 10]
+    assert result["compute"]["steps_per_second"] == 5.0
+    assert result["e2e"]["steps_per_second"] == 4.0
+    assert result["compute"]["count"] == 6
+
+
+def test_stable_timing_statistics_and_p95_are_explicit() -> None:
+    result = _RUNNER._step_statistics([0.2, 0.1, 0.4, 0.3])
+    assert result["median_seconds"] == 0.25
+    assert result["steps_per_second"] == 4.0
+    assert result["p95_seconds"] == pytest.approx(0.385)
+    assert result["population_stddev_seconds"] > 0
+
+
+@pytest.mark.parametrize("values", [[], [0.0], [-1.0], [float('nan')], [float('inf')]])
+def test_stable_timing_rejects_missing_or_invalid_evidence(values) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        _RUNNER._step_statistics(values)
+
+
+def test_stable_timing_callback_uses_runner_output_not_training_arguments(tmp_path: Path) -> None:
+    tree = ast.parse(_RUNNER_PATH.read_text(encoding="utf-8"))
+    callback = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.ClassDef) and node.name == "TimingCallback")
+    path = tmp_path / "result.json"
+    cuda = SimpleNamespace(synchronize=lambda: None, max_memory_allocated=lambda: 8,
+                           max_memory_reserved=lambda: 16)
+    result = {"timing": {}}
+    scope = {
+        "TrainerCallback": object, "torch": SimpleNamespace(cuda=cuda),
+        "time": SimpleNamespace(perf_counter=lambda: 4.0), "math": math,
+        "args": SimpleNamespace(output=path), "result": result, "profile_holder": {},
+        "result_output_path": path,
+        "timing": {"_step_starts": [1.0], "train_step_seconds": [],
+                   "_compute_start": 2.0, "_e2e_start": 1.0, "step_records": [],
+                   "_loss_snapshot": SimpleNamespace(item=lambda: 2.5), "train_losses": []},
+        "_profile_phase": _RUNNER._profile_phase, "_write_result": _RUNNER._write_result,
+    }
+    exec(compile(ast.Module(body=[callback], type_ignores=[]), str(_RUNNER_PATH), "exec"), scope)
+    # Deliberately lacks .output, just like real Transformers TrainingArguments.
+    training_args = SimpleNamespace(output_dir="unused")
+    control = object()
+    assert scope["TimingCallback"]().on_step_end(training_args, None, control) is control
+    assert path.exists()
+    assert result["timing"]["step_records"][0]["compute_seconds"] == 2.0

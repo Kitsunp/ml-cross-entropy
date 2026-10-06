@@ -40,7 +40,18 @@ import torch
 import triton
 import triton.language as tl
 
-from .runtime_policy import use_dot_specialization
+try:
+    from .runtime_policy import (
+        compact_spline_requested,
+        compact_spline_supported,
+        use_dot_specialization,
+    )
+except ImportError:  # pragma: no cover - flat remote staging layout
+    from runtime_policy import (
+        compact_spline_requested,
+        compact_spline_supported,
+        use_dot_specialization,
+    )
 
 EPS_LOG = 1e-9
 NORM_EPS = 1e-5
@@ -423,6 +434,29 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
     rsqrt_c = rsqrt.reshape(h, N).contiguous()
     M_c = M.reshape(N, h, krank).contiguous()
 
+    # Preserve the forward choice in the saved contract.  This prevents a
+    # caller that changes an environment variable between forward/backward
+    # from pairing compact forward geometry with the dense backward (or vice
+    # versa).  Older saved dictionaries use the current opt-in environment.
+    compact_spline = (
+        bool(saved["compact_spline"])
+        if "compact_spline" in saved
+        else compact_spline_requested()
+    )
+    if compact_spline and not compact_spline_supported(
+        dev,
+        d_seed=d,
+        num_knots=kappa,
+        krank=krank,
+        # Direct forward checkpoints retain the original frozen buffer;
+        # compiler checkpoints already store that buffer as knot_grid.
+        knot_grid=saved.get("knot_grid_source", knot_grid),
+    ):
+        raise ValueError(
+            "compact Leviathan backward requires the validated SM120 dot "
+            "path, d_seed=128, num_knots=16, krank=64, and the uniform unit grid"
+        )
+
     # The chain writes per-block stats.  The same dzh allocation is passed as
     # both dxhat scratch and final dzh output; the kernel's barrier orders the
     # scratch load before the overwrite.  This removes two full [h,N,d] HBM
@@ -439,7 +473,10 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
         num_knots=kappa,
         krank=krank,
     ):
-        from . import backward_dot_kernels as bdk
+        try:
+            from . import backward_dot_kernels as bdk
+        except ImportError:  # pragma: no cover - flat remote staging layout
+            import backward_dot_kernels as bdk  # type: ignore[no-redef]
 
         dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
         # Keep dM and M independent by default.  Premultiplying them in the
@@ -514,7 +551,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=True, PREMUL_DMM=premul_dmm, USE_T=use_t,
-                N_SPLITS=ddelta_splits,
+                N_SPLITS=ddelta_splits, COMPACT_SPLINE=compact_spline,
                 **ddelta_launch_kwargs)
             if ddelta_splits > 1:
                 bdk._lev_bwd_ddelta_split_reduce_kernel[
@@ -550,6 +587,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 BLOCK_M=dot_chain_block_m, BLOCK_K=min(64, d),
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee, USE_T=use_t,
                 PREMUL_DMM=premul_dmm,
+                COMPACT_SPLINE=compact_spline,
                 num_warps=4, num_stages=1)
             grid3 = (h * ddelta_splits, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
@@ -563,7 +601,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 BLOCK_M=block_m, BLOCK_D=block_d, BLOCK_R=block_r,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=False, PREMUL_DMM=premul_dmm, USE_T=use_t,
-                N_SPLITS=ddelta_splits,
+                N_SPLITS=ddelta_splits, COMPACT_SPLINE=compact_spline,
                 **ddelta_launch_kwargs)
             if ddelta_splits > 1:
                 bdk._lev_bwd_ddelta_split_reduce_kernel[

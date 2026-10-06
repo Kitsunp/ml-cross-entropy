@@ -15,6 +15,11 @@ descargó ningún dataset.
 - Backend JToK: Triton; fallback de referencia: rechazado explícitamente.
 - El gate de `4.5 steps/s` aplica únicamente a `Leviathan + JToK`; Leviathan
   solo conserva su baseline propio y no se evalúa contra ese gate.
+- La meta separada de `Leviathan + JToK-M` es `>=4.2 steps/s` (`<=238.095 ms`
+  por paso).
+- El perfilamiento se ejecuta para diagnóstico, pero las trazas crudas son
+  privadas. Sólo se publica, cuando se especifica, el agregado del kernel
+  investigado y el tiempo total del paso completo.
 - Compilación: `torch.compile` con el modo configurado por `train.py`;
   compilación fría separada del throughput estable.
 
@@ -22,9 +27,6 @@ descargó ningún dataset.
 
 | Artefacto | SHA-256 |
 |---|---|
-| `train.py` | `5d43cd58096aaebb0b04eb59a9f1b82163d02089ee18fca83fb6bd1f2175c48d` |
-| `modeling_neollm.py` | `26914cf05982e015fa10fec29385dddb0e434e97269a09694ffb06f40b519187` |
-| `configuration_neollm.py` | `d58cfb55ac2dc1056037ef7b0dcd8d38da617dadad0f23d85ce31cc06082706c` |
 | árbol Python CCE | `620adc7fd00dc20bc3eabb5d04011e45cb1a51aac949ebd1520c3b610ff4851c` |
 
 Entorno: PyTorch `2.14.0+cu132`, CUDA `13.2`, Triton `3.8.0`, Transformers
@@ -38,6 +40,7 @@ Entorno: PyTorch `2.14.0+cu132`, CUDA `13.2`, Triton `3.8.0`, Transformers
 | Leviathan (`off`, split-N=4, perfilado) | `4.916241 steps/s` (`203.407 ms`) | `10/10` | `10/10` | Kernel candidato válido; sin gate JToK |
 | Leviathan + JToK | `4.042266 steps/s` (`247.386 ms`) | `10/10` | `10/10` | Gate `>=4.5`: **no alcanzado** |
 | Leviathan + JToK (`split-N=4`, perfilado) | `3.968158 steps/s` (`252.006 ms`) | `10/10` | `10/10` | Gate `>=4.5`: **no alcanzado** |
+| Leviathan + JToK-M (`split-N=4`) | `3.422044 steps/s` (`292.223 ms`) | `10/10` | `10/10` | Meta `>=4.2`: **no alcanzado** |
 
 La compilación fría fue aproximadamente `361.5 s` para Leviathan y `457.1 s`
 para JToK. Se reporta por separado y no se usa como throughput estable.
@@ -49,11 +52,8 @@ empezando por `_lev_bwd_ddelta_dot_kernel`.
 
 La variante `LEV_DDELTA_SPLITS=4` se validó dentro del entrenamiento real de
 Leviathan (`mode=off`), con perfilamiento diagnóstico, sin descargar datos y
-sin permitir fallback. Frente al control perfilado comparable, el kernel
-`_lev_bwd_ddelta_dot_kernel` pasó de `12.0860675 ms` a `10.9490925 ms` por
-invocación: reducción de `9.407%`. La pérdida de evaluación fue `8.881209`,
-frente a `8.881250` del control, y no hubo valores no finitos en el smoke de
-corrección.
+sin permitir fallback. El agregado del kernel investigado se publica sólo en
+su alcance explícito; no se publican métricas de componentes no investigados.
 
 Este resultado valida la mejora del kernel de Leviathan. No declara todavía
 que JToK ni JToK-M cumplan su propio criterio: ambos requieren sus corridas
@@ -74,4 +74,7 @@ gate de JToK es **no alcanzado**, sin convertir la mejora de microkernel en
 
 El arnés se ajustó para registrar, en las siguientes corridas, tanto el SHA
 del árbol CCE como los SHA de los archivos críticos; así la procedencia no
-depende sólo de un nombre de traza.
+depende sólo de un nombre de ejecución. Las huellas de las fuentes privadas
+se conservan únicamente en registros locales excluidos del repositorio: no se
+publican ni sus contenidos ni sus fingerprints. Las trazas crudas permanecen
+fuera del control de versiones.

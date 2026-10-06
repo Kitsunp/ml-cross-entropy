@@ -50,14 +50,15 @@ def test_trace_analyzer_ignores_trace_metadata(tmp_path: Path) -> None:
     trace.write_text(
         '{"host_name":"must-not-be-emitted",'
         '"traceEvents":[{"name":"_lev_bwd_ddelta_dot_kernel",'
-        '"ph":"X","dur":12000},{"name":"other",'
-        '"ph":"X","dur":4}]}',
+        '"cat":"kernel","ph":"X","dur":12000},{"name":"other",'
+        '"cat":"kernel","ph":"X","dur":4}]}',
         encoding="utf-8",
     )
 
     result = module.analyze(trace)
 
-    assert result["trace_event_count"] == 2
+    assert "trace_event_count" not in result
     assert result["targets"]["_lev_bwd_ddelta_dot_kernel"]["median_us"] == 12000
+    assert set(result["targets"]) == {"_lev_bwd_ddelta_dot_kernel"}
     assert "host_name" not in result
     assert "must-not-be-emitted" not in str(result)

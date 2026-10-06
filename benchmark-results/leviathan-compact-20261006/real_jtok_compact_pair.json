@@ -1,0 +1,178 @@
+{
+  "schema": "leviathan-kernel-comparison-summary-v1",
+  "data_kind": "real",
+  "mode": "jtok",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.27077987417578697,
+        "median_seconds": 0.26926540303975344,
+        "min_seconds": 0.26591450185514987,
+        "p95_seconds": 0.2707110066548921,
+        "population_stddev_seconds": 0.0018053178651869272,
+        "steps_per_second": 3.713807970541107
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.2677534129470587,
+        "median_seconds": 0.26666313339956105,
+        "min_seconds": 0.26230434398166835,
+        "p95_seconds": 0.26764500071294606,
+        "population_stddev_seconds": 0.001981398674813802,
+        "steps_per_second": 3.7500496872270164
+      },
+      "throughput_gain_percent": 0.9758640450283851,
+      "latency_reduction_percent": 0.9664329731243648
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.28140700212679803,
+        "median_seconds": 0.2791537696029991,
+        "min_seconds": 0.2678673709742725,
+        "p95_seconds": 0.2812281066435389,
+        "population_stddev_seconds": 0.004591230280700691,
+        "steps_per_second": 3.5822550468229695
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.2782262680120766,
+        "median_seconds": 0.27685308433137834,
+        "min_seconds": 0.26496919500641525,
+        "p95_seconds": 0.27797055256087333,
+        "population_stddev_seconds": 0.004599403481177846,
+        "steps_per_second": 3.6120240538951465
+      },
+      "throughput_gain_percent": 0.8310130541536509,
+      "latency_reduction_percent": 0.8241641425414725
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_lev_fused_dot": {
+        "count": 2,
+        "dur_us": [
+          3363.584,
+          3324.192
+        ],
+        "median_us": 3343.888,
+        "total_us": 6687.776,
+        "max_us": 3363.584,
+        "resources": [
+          {
+            "registers_per_thread": 128,
+            "shared_memory_bytes": 40960
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          11464.638,
+          12088.734
+        ],
+        "median_us": 11776.686000000002,
+        "total_us": 23553.372000000003,
+        "max_us": 12088.734,
+        "resources": [
+          {
+            "registers_per_thread": 255,
+            "shared_memory_bytes": 45056
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_split_reduce_kernel": {
+        "count": 2,
+        "dur_us": [
+          10.88,
+          12.064
+        ],
+        "median_us": 11.472000000000001,
+        "total_us": 22.944000000000003,
+        "max_us": 12.064,
+        "resources": [
+          {
+            "registers_per_thread": 40,
+            "shared_memory_bytes": 0
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_lev_fused_dot": {
+        "count": 2,
+        "dur_us": [
+          3195.036,
+          3162.108
+        ],
+        "median_us": 3178.572,
+        "total_us": 6357.144,
+        "max_us": 3195.036,
+        "resources": [
+          {
+            "registers_per_thread": 124,
+            "shared_memory_bytes": 40960
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8043.638,
+          8046.23
+        ],
+        "median_us": 8044.933999999999,
+        "total_us": 16089.867999999999,
+        "max_us": 8046.23,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_split_reduce_kernel": {
+        "count": 2,
+        "dur_us": [
+          11.104,
+          11.232
+        ],
+        "median_us": 11.168,
+        "total_us": 22.336,
+        "max_us": 11.232,
+        "resources": [
+          {
+            "registers_per_thread": 40,
+            "shared_memory_bytes": 0
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_events_per_target",
+    "formula_and_tile_change_together",
+    "native_jtok_not_yet_ported"
+  ],
+  "acceptance_gate": {
+    "metric": "reciprocal_of_median_batch_ready_compute_seconds",
+    "minimum_steps_per_second": 4.5,
+    "achieved": false
+  }
+}

@@ -14,3 +14,19 @@ repos:
             types: [python]
         -   id: ruff-format
             types: [python]
+-   repo: local
+    hooks:
+        -   id: publication-boundary-staged
+            name: publication boundary (staged files)
+            entry: python scripts/verify_publication_boundary.py --staged
+            language: system
+            pass_filenames: false
+            always_run: true
+            stages: [pre-commit]
+        -   id: publication-boundary-tree
+            name: publication boundary (tracked tree)
+            entry: python scripts/verify_publication_boundary.py --tree
+            language: system
+            pass_filenames: false
+            always_run: true
+            stages: [pre-push]

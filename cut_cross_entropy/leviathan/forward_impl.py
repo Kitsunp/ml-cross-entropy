@@ -52,7 +52,26 @@ import torch
 import triton
 import triton.language as tl
 
-from .runtime_policy import use_dot_specialization
+try:
+    from .runtime_policy import (
+        compact_spline_requested,
+        compact_spline_supported,
+        use_dot_specialization,
+    )
+    from .spline_support_kernels import (
+        _compact_quadratic_geometry,
+        _lev_compact_contract,
+    )
+except ImportError:  # pragma: no cover - flat remote staging layout
+    from runtime_policy import (
+        compact_spline_requested,
+        compact_spline_supported,
+        use_dot_specialization,
+    )
+    from spline_support_kernels import (
+        _compact_quadratic_geometry,
+        _lev_compact_contract,
+    )
 
 # ---------------------------------------------------------------------------
 # design constants (not autotuned; numerics-neutral)
@@ -268,6 +287,7 @@ def _lev_fused_dot(
     DOT_IEEE: tl.constexpr, FUSE_GATHER: tl.constexpr, SAVE_Z: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr,
     SPLIT_HEAD: tl.constexpr,
+    COMPACT_SPLINE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_head = tl.program_id(1)
@@ -355,29 +375,39 @@ def _lev_fused_dot(
                      1.0 / tl.sqrt(var + EPS), mask=mask[:, None])
         tl.debug_barrier()
 
-        # ---- phase B: per-d basis (vectorized over g) + phi via tl.dot ----
+        # ---- phase B: per-d basis + phi ----
         log_acc = tl.zeros([BLOCK_M, KRANK], tl.float32)
         sign_acc = tl.zeros([BLOCK_M, KRANK], tl.int32)
         for dc in tl.range(0, D_SEED, loop_unroll_factor=4):
             xc = tl.load(x_ptr + m * (N * D_SEED) + rows * D_SEED + dc,
                          mask=mask, other=0.0)                    # [BM]
-            d3 = tl.abs(xc[:, None] - grid_v[None, :]) * scale    # [BM, KAPPA_P]
-            w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
-                          tl.where(d3 < 1.5,
-                                   0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
-            w3 = tl.where(gmask[None, :], w3, 0.0)                # pad -> 0
-            denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
-            bgn = w3 / denom                                      # [BM, KAPPA_P]
-            st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
-                         + dc * (KAPPA * KRANK)
-                         + (gcols_p % KAPPA)[:, None] * KRANK
-                         + rcols_all[None, :],
-                         mask=gmask[:, None], other=0.0)          # bf16
-            st = 1.0 + st.to(tl.float32)                          # [KAPPA_P, KRANK]
-            if DOT_IEEE:
-                phi = tl.dot(bgn, st, input_precision="ieee")
+            if COMPACT_SPLINE:
+                support, b0, b1, b2, b3, db0, _, db2, db3 = _compact_quadratic_geometry(
+                    xc, knot_grid_ptr, KAPPA, False,
+                )
+                phi, _ = _lev_compact_contract(
+                    delta_ptr + (m * D_SEED + dc) * KAPPA * KRANK,
+                    rcols_all, mask, support, b0, b1, b2, b3, db0, db2, db3,
+                    KRANK, False,
+                )
             else:
-                phi = tl.dot(bgn, st, input_precision="tf32x3")
+                d3 = tl.abs(xc[:, None] - grid_v[None, :]) * scale
+                w3 = tl.where(d3 < 0.5, 0.75 - d3 * d3,
+                              tl.where(d3 < 1.5,
+                                       0.5 * (1.5 - d3) * (1.5 - d3), 0.0))
+                w3 = tl.where(gmask[None, :], w3, 0.0)            # pad -> 0
+                denom = tl.maximum(tl.sum(w3, 1, keep_dims=True), 1e-12)
+                bgn = w3 / denom                                  # [BM, KAPPA_P]
+                st = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
+                             + dc * (KAPPA * KRANK)
+                             + (gcols_p % KAPPA)[:, None] * KRANK
+                             + rcols_all[None, :],
+                             mask=gmask[:, None], other=0.0)      # bf16
+                st = 1.0 + st.to(tl.float32)                      # [KAPPA_P, KRANK]
+                if DOT_IEEE:
+                    phi = tl.dot(bgn, st, input_precision="ieee")
+                else:
+                    phi = tl.dot(bgn, st, input_precision="tf32x3")
             log_acc += tl.log(tl.abs(phi) + LOG_EPS)
             sign_acc ^= (phi < 0).to(tl.int32) & 1
 
@@ -648,6 +678,20 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
         num_knots=kappa,
         krank=krank,
     )
+    compact_spline = compact_spline_requested()
+    if compact_spline and not compact_spline_supported(
+        device,
+        d_seed=d,
+        num_knots=kappa,
+        krank=krank,
+        # Cache validation on the frozen source buffer, not the fresh FP32
+        # promotion of a BF16 grid. Detached custom-op inputs share storage.
+        knot_grid=params.get("knot_grid"),
+    ):
+        raise ValueError(
+            "LEV_COMPACT_SPLINE=1 requires the validated SM120 dot path, "
+            "d_seed=128, num_knots=16, krank=64, and the uniform unit grid"
+        )
     dot_ieee = os.environ.get("LEV_DOT_IEEE", "1") != "0"
     # A full z register tile is safe for the paper default d_seed=128.  Keep
     # the proven two-pass path for d_seed=256 to avoid register spills.
@@ -697,6 +741,7 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
                 SAVE_Z=save_xh or bool(return_seed), EPS=NORM_EPS,
                 LOG_EPS=LOG_EPS,
                 SPLIT_HEAD=split_head,
+                COMPACT_SPLINE=compact_spline,
                 num_warps=cd.num_warps, num_stages=cd.num_stages)
         else:
             _lev_fused_auto.fn[grid_a](
@@ -741,7 +786,9 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
 
     saved = None
     if save_intermediates or return_seed:
-        saved = {"z": z}
+        saved = {"z": z, "compact_spline": compact_spline}
+        if compact_spline:
+            saved["knot_grid_source"] = params.get("knot_grid")
         if save_intermediates:
             saved.update({
                 "knot_grid": prep["knot_grid"],
