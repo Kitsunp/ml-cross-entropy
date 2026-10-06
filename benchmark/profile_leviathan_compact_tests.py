@@ -19,6 +19,7 @@ TEST_FILES = (
     "test_jtok_projection.py",
     "test_jtok_compact.py",
     "test_jtok_route_vjp.py",
+    "test_leviathan_jtok.py",
 )
 
 

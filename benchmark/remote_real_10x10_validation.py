@@ -1,4 +1,4 @@
-"""Run the real NeoLLM path for the fixed 10+10 validation contract.
+"""Run the real NeoLLM path for the current fixed 100+100 validation contract.
 
 This runner is deliberately read-only with respect to datasets.  It loads an
 already-tokenized Hugging Face dataset with ``load_from_disk`` and never calls
@@ -8,8 +8,8 @@ download one or silently switch to synthetic data.
 The runner imports the supplied training script and patches only the dataset
 loader and short-run controls.  Model construction, Leviathan/JToK dispatch,
 losses, ``torch.compile(max-autotune)``, the optimizer, and the other training
-policy remain in the supplied training script.  The short run is exactly ten
-optimizer steps followed by evaluation over exactly ten batches.  Synthetic
+policy remain in the supplied training script. The run is exactly 100
+optimizer steps followed by evaluation over exactly 100 batches. Synthetic
 inputs belong in a separate edge-case probe and are not accepted here.
 
 The JSON result intentionally contains no connection details, credentials,
@@ -34,8 +34,8 @@ from typing import Any, Callable
 
 from leviathan_candidate_provenance import CANDIDATE_FILES, verify_candidate
 
-REAL_TRAIN_STEPS = 10
-REAL_VALIDATION_STEPS = 10
+REAL_TRAIN_STEPS = 100
+REAL_VALIDATION_STEPS = 100
 REQUIRED_DATASET_COLUMNS = frozenset(("input_ids", "attention_mask"))
 CANONICAL_SOURCE_REPOSITORY = "ml-cross-entropy-jtok-pr"
 CANONICAL_SOURCE_COMMIT = "5a4072d"
@@ -147,6 +147,29 @@ def _load_training_module(path: Path):
     return module
 
 
+def _configure_dynamics_metrics(training: Any, enabled: bool, logging_steps: int) -> dict[str, Any]:
+    """Configure opt-in metrics without requiring their API on legacy controls."""
+    required = (
+        "USE_DYNAMICS_METRICS", "DYNAMICS_SAMPLE_TOKENS",
+        "DYNAMICS_PARAMETER_SAMPLES", "DYNAMICS_INTERVAL",
+    )
+    missing = [name for name in required if not hasattr(training, name)]
+    if enabled and missing:
+        raise RuntimeError("training script lacks the complete dynamics API: " + ", ".join(missing))
+    supported = not missing
+    if hasattr(training, "USE_DYNAMICS_METRICS"):
+        training.USE_DYNAMICS_METRICS = bool(enabled)
+    if supported:
+        training.DYNAMICS_INTERVAL = logging_steps
+    return {
+        "enabled": bool(enabled), "supported": supported, "logging_steps": logging_steps,
+        "sample_tokens": training.DYNAMICS_SAMPLE_TOKENS if supported else None,
+        "parameter_samples_per_tensor": training.DYNAMICS_PARAMETER_SAMPLES if supported else None,
+        "parameter_interval": training.DYNAMICS_INTERVAL if supported else None, "log_records": [],
+        "note": "private observability output; benchmark cadence is explicit, not the production default",
+    }
+
+
 def _load_from_disk(path: Path):
     # Import lazily so the local contract tests do not need the datasets
     # package, and keep the only permitted dataset operation explicit.
@@ -180,12 +203,16 @@ def _prepare_preexisting_splits(
     loader: Callable[[Path], object] | None = None,
     train_data_dir: Path | None = None,
     validation_data_dir: Path | None = None,
+    validation_from_train: bool = False,
 ) -> tuple[object, object]:
     """Load and truncate existing train/validation splits without writing.
 
-    The returned datasets contain exactly the number of rows needed for ten
+    The returned datasets contain exactly the number of rows needed for 100
     batches each.  The caller's ``HFTokenDataset`` and collator still perform
     the actual batch construction in the real training path.
+    Explicit validation_from_train selects the next, disjoint training-source
+    rows for evaluation; it never silently falls back to training data and is
+    not a measurement on the original held-out validation split.
     """
 
     if batch_size < 1:
@@ -225,19 +252,27 @@ def _prepare_preexisting_splits(
 
     needed_rows = REAL_TRAIN_STEPS * batch_size
     needed_validation_rows = REAL_VALIDATION_STEPS * batch_size
+    validation_offset = needed_rows if validation_from_train else 0
+    if validation_from_train:
+        validation_dataset = train_dataset
     for name, dataset, needed in (
         ("train", train_dataset, needed_rows),
-        ("validation", validation_dataset, needed_validation_rows),
+        ("validation", validation_dataset, validation_offset + needed_validation_rows),
     ):
         missing = REQUIRED_DATASET_COLUMNS - _dataset_columns(dataset)
         if missing:
             raise ValueError(f"{name} split is missing required token columns")
         if len(dataset) < needed:
-            raise ValueError(f"{name} split has fewer rows than the fixed 10-batch run")
+            steps = REAL_TRAIN_STEPS if name == "train" else REAL_VALIDATION_STEPS
+            raise ValueError(
+                f"{name} split has fewer rows than required: available={len(dataset)}, "
+                f"required={needed} ({steps} batches of {batch_size}"
+                f" plus {validation_offset if name == 'validation' else 0} preceding rows)"
+            )
 
     return (
         train_dataset.select(range(needed_rows)),
-        validation_dataset.select(range(needed_validation_rows)),
+        validation_dataset.select(range(validation_offset, validation_offset + needed_validation_rows)),
     )
 
 
@@ -248,10 +283,14 @@ def _parse_args() -> argparse.Namespace:
     data_group.add_argument("--data-dir", type=Path)
     data_group.add_argument("--train-data-dir", type=Path)
     parser.add_argument("--validation-data-dir", type=Path)
+    parser.add_argument("--validation-from-train", action="store_true",
+                        help="Evaluate the next disjoint training-source rows, not the original held-out split.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--train-script", type=Path, default=Path("/train.py"))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--candidate-manifest", type=Path)
+    parser.add_argument("--dynamics-metrics", action="store_true")
+    parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument(
         "--profile",
         type=Path,
@@ -307,6 +346,8 @@ def main() -> int:
     args = _parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive")
+    if not 1 <= args.logging_steps <= REAL_TRAIN_STEPS:
+        raise ValueError("--logging-steps must be between one and the train step count")
     if (args.train_data_dir is None) != (args.validation_data_dir is None):
         raise ValueError("--train-data-dir and --validation-data-dir must be supplied together")
 
@@ -321,7 +362,7 @@ def main() -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     result: dict[str, Any] = {
-        "schema": "neollm-remote-real-10x10-v1",
+        "schema": "neollm-remote-real-100x100-v1",
         "status": "started",
         "mode": args.mode,
         "backend": "triton",
@@ -338,6 +379,13 @@ def main() -> int:
             "source": "preexisting_tokenized_remote_data",
             "download_allowed": False,
             "synthetic_allowed_for_gate": False,
+            "validation_source": ("disjoint_preexisting_train_rows" if args.validation_from_train
+                                  else "preexisting_validation_split"),
+            "validation_is_original_heldout_split": not args.validation_from_train,
+            "training_row_range": [0, REAL_TRAIN_STEPS * args.batch_size],
+            "validation_row_range": [REAL_TRAIN_STEPS * args.batch_size,
+                                     (REAL_TRAIN_STEPS + REAL_VALIDATION_STEPS) * args.batch_size]
+                                    if args.validation_from_train else [0, REAL_VALIDATION_STEPS * args.batch_size],
         },
         "kernel_policy": {
             "jtok_route_vjp_factor": os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0"),
@@ -375,6 +423,8 @@ def main() -> int:
         torch.cuda.manual_seed_all(1729)
 
         training = _load_training_module(args.train_script)
+        result["dynamics"] = _configure_dynamics_metrics(
+            training, args.dynamics_metrics, args.logging_steps)
         result["runtime"] = _runtime_snapshot(torch)
         result["runtime_verification"] = {
             "leviathan_triton_required": True,
@@ -428,7 +478,7 @@ def main() -> int:
         # Make accidental calls to the original downloader fail loudly even if
         # a future training-script path calls its module-level symbol.
         def forbid_dataset_download(*_args: Any, **_kwargs: Any) -> None:
-            raise RuntimeError("dataset download is disabled by the 10x10 runner")
+            raise RuntimeError("dataset download is disabled by the real validation runner")
 
         training.load_dataset = forbid_dataset_download
 
@@ -443,12 +493,13 @@ def main() -> int:
         def existing_fineweb(tokenizer: Any, block_size: int = 512, **_kwargs: Any):
             del tokenizer
             if block_size != 512:
-                raise ValueError("training sequence length differs from fixed 10x10 contract")
+                raise ValueError("training sequence length differs from fixed 100+100 contract")
             return _prepare_preexisting_splits(
                 args.data_dir,
                 args.batch_size,
                 train_data_dir=args.train_data_dir,
                 validation_data_dir=args.validation_data_dir,
+                validation_from_train=args.validation_from_train,
             )
 
         training.load_and_process_fineweb = existing_fineweb
@@ -469,7 +520,7 @@ def main() -> int:
         def validation_training_args(output_dir: str, run_name: str):
             train_args = original_setup_args(output_dir, run_name)
             if train_args.gradient_accumulation_steps != 1:
-                raise ValueError("fixed 10x10 timing currently requires accumulation=1")
+                raise ValueError("fixed 100+100 timing currently requires accumulation=1")
             result["seed"] = int(train_args.seed)
             result["data_seed"] = int(train_args.data_seed)
             train_args.max_steps = REAL_TRAIN_STEPS
@@ -481,8 +532,8 @@ def main() -> int:
             train_args.load_best_model_at_end = False
             train_args.push_to_hub = False
             train_args.report_to = []
-            train_args.logging_steps = 1
-            train_args.logging_first_step = True
+            train_args.logging_steps = args.logging_steps
+            train_args.logging_first_step = False
             train_args.dataloader_num_workers = 0
             train_args.dataloader_persistent_workers = False
             train_args.dataloader_prefetch_factor = None
@@ -510,6 +561,12 @@ def main() -> int:
 
             def on_step_begin(self, args, state, control, **kwargs):
                 torch.cuda.synchronize()
+                if int(state.global_step) == 4:
+                    result["memory"] = {
+                        "cold_profile_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                        "cold_profile_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    }
+                    torch.cuda.reset_peak_memory_stats()
                 timing.setdefault("_step_starts", []).append(time.perf_counter())
                 return control
 
@@ -535,10 +592,10 @@ def main() -> int:
                 if not math.isfinite(loss):
                     raise RuntimeError("nonfinite training loss")
                 timing["train_losses"].append(float(loss))
-                result["memory"] = {
+                result.setdefault("memory", {}).update({
                     "train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
                     "train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-                }
+                })
                 result["timing"]["step_records"] = timing["step_records"]
                 _write_result(result_output_path, result)
                 profiler = profile_holder.get("profiler")
@@ -564,6 +621,11 @@ def main() -> int:
             def on_train_end(self, args, state, control, **kwargs):
                 torch.cuda.synchronize()
                 timing["train_end"] = time.perf_counter()
+                result.setdefault("memory", {}).update({
+                    "stable_train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                    "stable_train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                })
+                torch.cuda.reset_peak_memory_stats()
                 return control
 
         original_trainer_init = training.AdEMAMixTrainer.__init__
@@ -573,6 +635,27 @@ def main() -> int:
             original_batches = self.get_batch_samples
             original_step = self.training_step
             original_loss = self.compute_loss
+            original_log = self.log
+
+            def measured_log(logs, *log_args, **log_kwargs):
+                is_training_step = "loss" in logs
+                if is_training_step:
+                    torch.cuda.synchronize()
+                    start = time.perf_counter()
+                output = original_log(logs, *log_args, **log_kwargs)
+                if is_training_step:
+                    torch.cuda.synchronize()
+                    seconds = time.perf_counter() - start
+                    record = timing["step_records"][-1]
+                    record["logging_seconds"] = seconds
+                    record["compute_plus_logging_seconds"] = record["compute_seconds"] + seconds
+                    snapshot = {name: float(value) for name, value in logs.items()
+                                if name.startswith("dynamics/")}
+                    result["dynamics"]["log_records"].append({
+                        "optimizer_step": record["optimizer_step"], "logging_seconds": seconds,
+                        "metrics": snapshot,
+                    })
+                return output
 
             def measured_batches(*batch_args, **batch_kwargs):
                 torch.cuda.synchronize()
@@ -604,6 +687,7 @@ def main() -> int:
             self.get_batch_samples = measured_batches
             self.training_step = measured_step
             self.compute_loss = measured_loss
+            self.log = measured_log
             self.add_callback(TimingCallback())
 
         training.AdEMAMixTrainer.__init__ = timed_trainer_init
@@ -652,6 +736,28 @@ def main() -> int:
             )
 
         result["status"] = "ok"
+        result.setdefault("memory", {}).update({
+            "validation_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "validation_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        })
+        if args.dynamics_metrics:
+            snapshots = result["dynamics"]["log_records"]
+            if len(snapshots) != REAL_TRAIN_STEPS // args.logging_steps or any(
+                not record["metrics"] for record in snapshots
+            ):
+                raise RuntimeError("dynamics metrics were not exposed at the requested logging cadence")
+            for record in snapshots:
+                observed = record["metrics"]
+                if any(not math.isfinite(value) for value in observed.values()):
+                    raise RuntimeError("nonfinite dynamics observation")
+                prefix = "dynamics/leviathan/"
+                if sum(name.startswith(prefix) for name in observed) < 3:
+                    raise RuntimeError("missing Leviathan dynamics metrics")
+                if args.mode != "off" and not any(
+                    name.startswith("dynamics/" + args.mode + "/") and name.endswith("usage_index")
+                    for name in observed
+                ):
+                    raise RuntimeError("missing surface usage metric")
         train_step_median = statistics.median(timing["train_step_seconds"])
         train_step_median_after_first = statistics.median(
             timing["train_step_seconds"][1:]
@@ -670,6 +776,11 @@ def main() -> int:
             "stable": _stable_step_statistics(timing["step_records"]),
             "instrumentation": "host_cuda_sync_at_batch_fetch_compute_start_and_optimizer_end",
         }
+        stable_records = [r for r in timing["step_records"] if r["phase"] == "stable_unprofiled"]
+        result["timing"]["stable"]["compute_plus_logging"] = _step_statistics([
+            r.get("compute_plus_logging_seconds", r["compute_seconds"]) for r in stable_records])
+        result["timing"]["stable"]["logging_events"] = _step_statistics([
+            r["logging_seconds"] for r in stable_records if "logging_seconds" in r])
     except BaseException as error:
         result["status"] = "error"
         result["error_type"] = type(error).__name__

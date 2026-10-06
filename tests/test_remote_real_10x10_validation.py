@@ -36,9 +36,9 @@ class _FakeDataset:
         return result
 
 
-def test_contract_is_fixed_at_ten_train_and_validation_steps() -> None:
-    assert _RUNNER.REAL_TRAIN_STEPS == 10
-    assert _RUNNER.REAL_VALIDATION_STEPS == 10
+def test_contract_is_fixed_at_one_hundred_train_and_validation_steps() -> None:
+    assert _RUNNER.REAL_TRAIN_STEPS == 100
+    assert _RUNNER.REAL_VALIDATION_STEPS == 100
     assert _RUNNER.REQUIRED_DATASET_COLUMNS == {"input_ids", "attention_mask"}
 
 
@@ -92,20 +92,80 @@ def test_training_module_loader_exposes_sibling_modules(monkeypatch, tmp_path: P
     assert module.loaded_value == 17
 
 
-def test_existing_split_loader_selects_exactly_ten_batches(tmp_path: Path) -> None:
+def test_metrics_configuration_legacy_off_leaves_module_untouched() -> None:
+    training = SimpleNamespace(unrelated_setting=17)
+    before = vars(training).copy()
+    result = _RUNNER._configure_dynamics_metrics(training, False, 10)
+    assert vars(training) == before
+    assert result == {
+        "enabled": False, "supported": False, "logging_steps": 10,
+        "sample_tokens": None, "parameter_samples_per_tensor": None,
+        "parameter_interval": None, "log_records": [],
+        "note": "private observability output; benchmark cadence is explicit, not the production default",
+    }
+
+
+def test_metrics_configuration_legacy_on_rejects_without_mutation() -> None:
+    training = SimpleNamespace(unrelated_setting=17)
+    before = vars(training).copy()
+    with pytest.raises(RuntimeError, match="complete dynamics API.*USE_DYNAMICS_METRICS"):
+        _RUNNER._configure_dynamics_metrics(training, True, 10)
+    assert vars(training) == before
+
+
+@pytest.mark.parametrize("missing", [
+    "USE_DYNAMICS_METRICS", "DYNAMICS_SAMPLE_TOKENS",
+    "DYNAMICS_PARAMETER_SAMPLES", "DYNAMICS_INTERVAL",
+])
+def test_metrics_configuration_partial_on_rejects_before_mutation(missing: str) -> None:
+    training = SimpleNamespace(USE_DYNAMICS_METRICS=False, DYNAMICS_SAMPLE_TOKENS=64,
+                               DYNAMICS_PARAMETER_SAMPLES=128, DYNAMICS_INTERVAL=250)
+    delattr(training, missing)
+    before = vars(training).copy()
+    with pytest.raises(RuntimeError, match="complete dynamics API.*" + missing):
+        _RUNNER._configure_dynamics_metrics(training, True, 10)
+    assert vars(training) == before
+
+
+def test_metrics_configuration_partial_off_disables_existing_flag_without_new_attributes() -> None:
+    training = SimpleNamespace(USE_DYNAMICS_METRICS=True, DYNAMICS_INTERVAL=250)
+    result = _RUNNER._configure_dynamics_metrics(training, False, 10)
+    assert vars(training) == {"USE_DYNAMICS_METRICS": False, "DYNAMICS_INTERVAL": 250}
+    assert result["supported"] is False
+    assert result["parameter_interval"] is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_metrics_configuration_supported_sets_flag_and_cadence_only(enabled: bool) -> None:
+    training = SimpleNamespace(USE_DYNAMICS_METRICS=not enabled, DYNAMICS_SAMPLE_TOKENS=64,
+                               DYNAMICS_PARAMETER_SAMPLES=128, DYNAMICS_INTERVAL=250,
+                               unrelated_setting=17)
+    result = _RUNNER._configure_dynamics_metrics(training, enabled, 10)
+    assert vars(training) == {
+        "USE_DYNAMICS_METRICS": enabled, "DYNAMICS_SAMPLE_TOKENS": 64,
+        "DYNAMICS_PARAMETER_SAMPLES": 128, "DYNAMICS_INTERVAL": 10, "unrelated_setting": 17,
+    }
+    assert result["enabled"] is enabled
+    assert result["supported"] is True
+    assert result["sample_tokens"] == 64
+    assert result["parameter_samples_per_tensor"] == 128
+    assert result["parameter_interval"] == 10
+
+
+def test_existing_split_loader_selects_exactly_one_hundred_batches(tmp_path: Path) -> None:
     (tmp_path / "train").mkdir()
     (tmp_path / "validation").mkdir()
     datasets = {
-        "train": _FakeDataset(64),
-        "validation": _FakeDataset(64),
+        "train": _FakeDataset(640),
+        "validation": _FakeDataset(640),
     }
 
     def loader(path: Path):
         return datasets[path.name]
 
     train, validation = _RUNNER._prepare_preexisting_splits(tmp_path, 4, loader=loader)
-    assert len(train) == 40
-    assert len(validation) == 40
+    assert len(train) == 400
+    assert len(validation) == 400
 
 
 def test_loader_accepts_explicit_train_and_validation_directories(tmp_path: Path) -> None:
@@ -114,8 +174,8 @@ def test_loader_accepts_explicit_train_and_validation_directories(tmp_path: Path
     train_path.mkdir()
     validation_path.mkdir()
     datasets = {
-        train_path: _FakeDataset(64),
-        validation_path: _FakeDataset(64),
+        train_path: _FakeDataset(640),
+        validation_path: _FakeDataset(640),
     }
 
     train, validation = _RUNNER._prepare_preexisting_splits(
@@ -125,8 +185,8 @@ def test_loader_accepts_explicit_train_and_validation_directories(tmp_path: Path
         train_data_dir=train_path,
         validation_data_dir=validation_path,
     )
-    assert len(train) == 40
-    assert len(validation) == 40
+    assert len(train) == 400
+    assert len(validation) == 400
 
 
 def test_loader_rejects_missing_real_rows(tmp_path: Path) -> None:
@@ -134,7 +194,7 @@ def test_loader_rejects_missing_real_rows(tmp_path: Path) -> None:
     (tmp_path / "validation").mkdir()
 
     def loader(path: Path):
-        return _FakeDataset(39)
+        return _FakeDataset(399)
 
     with pytest.raises(ValueError, match="fewer rows"):
         _RUNNER._prepare_preexisting_splits(tmp_path, 4, loader=loader)
@@ -153,6 +213,14 @@ def test_loader_rejects_a_dataset_without_validation_split(tmp_path: Path) -> No
         )
 
 
+def test_loader_rejects_validation_5025_for_one_hundred_batches_of_64(tmp_path: Path) -> None:
+    (tmp_path / "train").mkdir()
+    (tmp_path / "validation").mkdir()
+    datasets = {"train": _FakeDataset(6400), "validation": _FakeDataset(5025)}
+    with pytest.raises(ValueError, match=r"validation.*available=5025.*required=6400.*100 batches of 64"):
+        _RUNNER._prepare_preexisting_splits(tmp_path, 64, loader=lambda path: datasets[path.name])
+
+
 def test_diagnostics_redact_hosts_paths_and_secrets() -> None:
     raw = (
         "host=192.0.2.4 path=C:\\Users\\private-user\\run "
@@ -163,6 +231,26 @@ def test_diagnostics_redact_hosts_paths_and_secrets() -> None:
     assert "private-user" not in redacted
     assert "do-not-store" not in redacted
     assert "example.invalid" not in redacted
+
+
+def test_loader_training_source_validation_is_explicit_disjoint_and_no_repetition(tmp_path: Path) -> None:
+    (tmp_path / "train").mkdir()
+    (tmp_path / "validation").mkdir()
+    datasets = {"train": _FakeDataset(12800), "validation": _FakeDataset(5025)}
+    train, validation = _RUNNER._prepare_preexisting_splits(
+        tmp_path, 64, loader=lambda path: datasets[path.name], validation_from_train=True)
+    assert train._rows == list(range(6400))
+    assert validation._rows == list(range(6400, 12800))
+    assert set(train._rows).isdisjoint(validation._rows)
+
+
+def test_loader_training_source_validation_rejects_overlap_when_rows_short(tmp_path: Path) -> None:
+    (tmp_path / "train").mkdir()
+    (tmp_path / "validation").mkdir()
+    datasets = {"train": _FakeDataset(12799), "validation": _FakeDataset(6400)}
+    with pytest.raises(ValueError, match=r"validation.*available=12799.*required=12800"):
+        _RUNNER._prepare_preexisting_splits(
+            tmp_path, 64, loader=lambda path: datasets[path.name], validation_from_train=True)
 
 
 def test_stable_timing_excludes_cold_warmup_and_profile_active_steps() -> None:
