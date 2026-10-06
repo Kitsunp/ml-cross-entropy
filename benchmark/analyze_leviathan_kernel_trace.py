@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -21,13 +22,64 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--kernel-trace", type=Path,
                         help="Export a minimal Chrome trace of the selected GPU kernels only")
+    parser.add_argument("--pair-first", help="First investigated kernel in a sequential GPU pair")
+    parser.add_argument("--pair-second", help="Second investigated kernel in a sequential GPU pair")
     parser.add_argument(
         "--target",
         action="append",
         dest="targets",
         help="kernel event name to summarize; may be repeated",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.pair_first is None) != (args.pair_second is None):
+        parser.error("both sequential pair names are required")
+    return args
+
+
+def sequential_pair_summary(
+    events: list[dict[str, Any]], first: str, second: str,
+) -> dict[str, Any]:
+    """Sum producer+reducer GPU durations, not a mixed median or CPU gaps.
+
+    Pair only exact names on the same GPU stream. Incomplete or misordered
+    pairs fail. Exported duration/start inconsistencies are reported, never
+    silently rounded away; a duration sum is not an interval union.
+    """
+    if first == second or any(not name.startswith(("_lev_", "_jtok_"))
+                              for name in (first, second)):
+        raise ValueError("sequential pair must name two investigated kernels")
+    streams: dict[tuple, list[dict[str, Any]]] = {}
+    for event in events:
+        if (event.get("name") in (first, second) and event.get("cat") == "kernel"
+                and event.get("ph") == "X"):
+            if any(not isinstance(event.get(key), (int, float))
+                   or not math.isfinite(event[key]) for key in ("ts", "dur")):
+                raise ValueError("sequential pair has invalid GPU timing")
+            streams.setdefault((event.get("pid"), event.get("tid")), []).append(event)
+    durations = []
+    apparent_overlaps = []
+    for stream in streams.values():
+        ordered = sorted(stream, key=lambda event: event["ts"])
+        if len(ordered) % 2:
+            raise ValueError("sequential kernel pair is incomplete")
+        for producer, reducer in zip(ordered[::2], ordered[1::2]):
+            if producer["name"] != first or reducer["name"] != second:
+                raise ValueError("sequential kernel pair is misordered")
+            if min(producer["dur"], reducer["dur"]) < 0:
+                raise ValueError("sequential kernel pair has negative duration")
+            overlap = producer["ts"] + producer["dur"] - reducer["ts"]
+            if overlap > 0:
+                apparent_overlaps.append(overlap)
+            durations.append(producer["dur"] + reducer["dur"])
+    result = {"first": first, "second": second, "count": len(durations),
+              "dur_us": durations, "cpu_gaps_included": False,
+              "duration_sum_is_not_interval_union": True,
+              "apparent_overlap_count": len(apparent_overlaps),
+              "max_apparent_overlap_us": max(apparent_overlaps, default=0.0)}
+    if durations:
+        result.update(median_us=statistics.median(durations), total_us=sum(durations),
+                      max_us=max(durations))
+    return result
 
 
 def _summary(events: list[dict[str, Any]], name: str) -> dict[str, Any]:
@@ -112,7 +164,14 @@ def main() -> int:
         args.kernel_trace.parent.mkdir(parents=True, exist_ok=True)
         args.kernel_trace.write_text(json.dumps(kernel_trace(args.trace, targets), indent=2)
                                      + "\n", encoding="utf-8")
-    print(json.dumps(analyze(args.trace, targets), indent=2, sort_keys=True))
+    result = analyze(args.trace, targets)
+    if args.pair_first is not None:
+        payload = json.loads(args.trace.read_text(encoding="utf-8"))
+        result["sequential_pair"] = sequential_pair_summary(
+            [event for event in payload["traceEvents"] if isinstance(event, dict)],
+            args.pair_first, args.pair_second,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 

@@ -340,6 +340,7 @@ def main() -> int:
             "synthetic_allowed_for_gate": False,
         },
         "kernel_policy": {
+            "jtok_projection_split": os.environ.get("JTOK_PROJECTION_SPLIT", "0"),
             "jtok_sparse_coeff_updates": os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0"),
             "compact_spline": os.environ.get("LEV_COMPACT_SPLINE", "0"),
             "d_delta_splits": os.environ.get("LEV_DDELTA_SPLITS", "1"),
@@ -391,7 +392,9 @@ def main() -> int:
 
         cce_origin = Path(cut_cross_entropy.__file__).resolve()
         from cut_cross_entropy.leviathan.runtime_policy import compact_spline_requested
-        native_jtok_candidate = os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
+        projection_candidate = os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
+        native_jtok_candidate = (os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
+                                 or projection_candidate)
 
         if (compact_spline_requested() or native_jtok_candidate) and args.candidate_manifest is None:
             raise ValueError("candidate validation requires --candidate-manifest")
@@ -402,6 +405,7 @@ def main() -> int:
                 cce_origin.parent,
                 json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
                 require_jtok=native_jtok_candidate,
+                require_projection=projection_candidate,
             )
             result["runtime_verification"]["candidate_sources_verified"] = True
         result["imports"] = {
@@ -632,6 +636,7 @@ def main() -> int:
                 cce_origin.parent,
                 json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
                 require_jtok=native_jtok_candidate,
+                require_projection=projection_candidate,
             )
 
         result["status"] = "ok"

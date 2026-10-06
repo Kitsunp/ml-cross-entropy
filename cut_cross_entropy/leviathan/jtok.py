@@ -64,12 +64,17 @@ from cut_cross_entropy.torch_2_14 import (
     cuda_kernel_region,
     mark_warmup_incomplete_once,
 )
+from .jtok_projection import projection_grad_plan
 
 try:  # Triton is an optional dependency on CPU/macOS installations.
     import triton
     import triton.language as tl
 
     _TRITON_AVAILABLE = True
+    from .jtok_projection import (
+        _jtok_projection_split_kernel,
+        _jtok_projection_split_reduce_kernel,
+    )
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - CPU optional path
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
@@ -190,6 +195,11 @@ def _can_use_vectorized_token_projection(
 def _sparse_coefficient_updates_requested() -> bool:
     """Opt-in zero-support atomic suppression, shared by JTok and JTok-M."""
     return os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
+
+
+def _projection_split_requested() -> bool:
+    """Keep the matrix reduction an explicit experiment, independent of sparse."""
+    return os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
 
 
 def _can_use_vectorized_mode_evaluation(
@@ -3201,6 +3211,13 @@ def _run_jtok_backward_triton(
     if modes_buffer.dtype != spline_out.dtype or modes_buffer.device != delta.device:
         raise ValueError("modes_buffer must match spline_out dtype and delta device")
     sparse_coefficient_updates = _sparse_coefficient_updates_requested()
+    projection_split = _projection_split_requested()
+    if projection_split and hidden < _SINGLE_TILE_HIDDEN_LIMIT:
+        raise ValueError("JTOK_PROJECTION_SPLIT=1 requires the wide projection VJP")
+    projection_plan = (
+        projection_grad_plan(n_tokens, experts, modes, d_seed, hidden)
+        if projection_split else None
+    )
     if sparse_coefficient_updates and (
         hidden < _SINGLE_TILE_HIDDEN_LIMIT
         or not _can_use_vectorized_token_projection(d_seed, knots, modes)
@@ -3217,10 +3234,11 @@ def _run_jtok_backward_triton(
     grad_coeff_accum = torch.zeros(
         spline_coeff.shape, device=delta.device, dtype=torch.float32
     )
-    grad_spline_out_accum = torch.zeros(
+    projection_allocator = torch.empty if projection_split and n_tokens else torch.zeros
+    grad_spline_out_accum = projection_allocator(
         spline_out.shape, device=delta.device, dtype=torch.float32
     )
-    grad_residual_out_accum = torch.zeros(
+    grad_residual_out_accum = projection_allocator(
         residual_out.shape, device=delta.device, dtype=torch.float32
     )
     grad_scaler_accum = torch.zeros(
@@ -3459,21 +3477,45 @@ def _run_jtok_backward_triton(
                 triton.cdiv(hidden, meta["BLOCK_H"]),
             )
 
-        _jtok_wrap_kernel(_jtok_backward_projection_grad_kernel)[projection_grid](
-            surface,
-            z,
-            modes_buffer,
-            expert_idx,
-            selected_weights,
-            grad_spline_out_accum,
-            grad_residual_out_accum,
-            n_tokens,
-            D_SEED=d_seed,
-            HIDDEN=hidden,
-            NUM_EXPERTS=experts,
-            NUM_MODES=modes,
-            TOP_K=top_k,
-        )
+        if projection_plan is not None:
+            partial = torch.empty(
+                (experts, projection_plan.splits, modes + d_seed, hidden),
+                device=delta.device, dtype=torch.float32,
+            )
+            tiles = (triton.cdiv(modes + d_seed, projection_plan.block_f)
+                     * triton.cdiv(hidden, projection_plan.block_h))
+            _jtok_wrap_kernel(_jtok_projection_split_kernel)[
+                (experts, projection_plan.splits, tiles)
+            ](
+                surface, z, modes_buffer, expert_idx, selected_weights, partial, n_tokens,
+                D_SEED=d_seed, NUM_MODES=modes, HIDDEN=hidden, TOP_K=top_k,
+                SPLITS=projection_plan.splits, BLOCK_F=projection_plan.block_f,
+                BLOCK_H=projection_plan.block_h, BLOCK_N=projection_plan.block_n,
+                num_warps=4, num_stages=1,
+            )
+            _jtok_wrap_kernel(_jtok_projection_split_reduce_kernel)[
+                (experts, triton.cdiv((modes + d_seed) * hidden, 1024))
+            ](
+                partial, grad_spline_out_accum, grad_residual_out_accum,
+                D_SEED=d_seed, NUM_MODES=modes, HIDDEN=hidden,
+                SPLITS=projection_plan.splits, BLOCK=1024, num_warps=4, num_stages=1,
+            )
+        else:
+            _jtok_wrap_kernel(_jtok_backward_projection_grad_kernel)[projection_grid](
+                surface,
+                z,
+                modes_buffer,
+                expert_idx,
+                selected_weights,
+                grad_spline_out_accum,
+                grad_residual_out_accum,
+                n_tokens,
+                D_SEED=d_seed,
+                HIDDEN=hidden,
+                NUM_EXPERTS=experts,
+                NUM_MODES=modes,
+                TOP_K=top_k,
+            )
     mark_warmup_incomplete_once(
         "jtok.mixture.backward" if mixture else "jtok.backward",
         (

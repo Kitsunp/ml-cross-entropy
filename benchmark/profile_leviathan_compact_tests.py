@@ -16,6 +16,7 @@ TEST_FILES = (
     "test_leviathan_kernel_trace.py",
     "test_leviathan_kernel_split.py",
     "test_jtok_sparse_updates.py",
+    "test_jtok_projection.py",
 )
 
 

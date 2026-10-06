@@ -1,0 +1,327 @@
+{
+  "schema": "jtok-projection-split-real-comparison-v1",
+  "data_kind": "real",
+  "mode": "jtok",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.2677534129470587,
+        "median_seconds": 0.26666313339956105,
+        "min_seconds": 0.26230434398166835,
+        "p95_seconds": 0.26764500071294606,
+        "population_stddev_seconds": 0.001981398674813802,
+        "steps_per_second": 3.7500496872270164
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.2647006579209119,
+        "median_seconds": 0.2633711900562048,
+        "min_seconds": 0.2602680930867791,
+        "p95_seconds": 0.26464174943976104,
+        "population_stddev_seconds": 0.0015147786586147934,
+        "steps_per_second": 3.79692250996244
+      },
+      "throughput_gain_percent": 1.2499253781910413,
+      "latency_reduction_percent": 1.2344951105122126
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.2782262680120766,
+        "median_seconds": 0.27685308433137834,
+        "min_seconds": 0.26496919500641525,
+        "p95_seconds": 0.27797055256087333,
+        "population_stddev_seconds": 0.004599403481177846,
+        "steps_per_second": 3.6120240538951465
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.27487790514715016,
+        "median_seconds": 0.27334971143864095,
+        "min_seconds": 0.26298354798927903,
+        "p95_seconds": 0.2748280033702031,
+        "population_stddev_seconds": 0.0041289794319180435,
+        "steps_per_second": 3.658317379363581
+      },
+      "throughput_gain_percent": 1.2816449939892394,
+      "latency_reduction_percent": 1.2654267158331622
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_jtok_backward_projection_grad_kernel": {
+        "count": 24,
+        "dur_us": [
+          507.039,
+          520.383,
+          510.623,
+          517.6,
+          523.36,
+          525.023,
+          526.335,
+          529.119,
+          521.471,
+          512.64,
+          515.072,
+          516.511,
+          512.191,
+          519.551,
+          511.359,
+          511.391,
+          524.128,
+          516.384,
+          514.656,
+          520.863,
+          516.575,
+          509.664,
+          520.928,
+          508.191
+        ],
+        "median_us": 516.543,
+        "total_us": 12411.057,
+        "max_us": 529.119,
+        "resources": [
+          {
+            "registers_per_thread": 166,
+            "shared_memory_bytes": 2048
+          }
+        ]
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 0,
+        "dur_us": []
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 0,
+        "dur_us": []
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8043.638,
+          8046.23
+        ],
+        "median_us": 8044.933999999999,
+        "total_us": 16089.867999999999,
+        "max_us": 8046.23,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_jtok_backward_projection_grad_kernel": {
+        "count": 0,
+        "dur_us": []
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 24,
+        "dur_us": [
+          294.911,
+          302.623,
+          304.767,
+          305.376,
+          308.928,
+          307.039,
+          309.535,
+          307.551,
+          306.432,
+          314.144,
+          313.311,
+          312.863,
+          296.064,
+          306.687,
+          306.783,
+          310.271,
+          306.784,
+          310.367,
+          303.679,
+          308.863,
+          312.319,
+          310.911,
+          314.912,
+          315.135
+        ],
+        "median_us": 308.207,
+        "total_us": 7390.255,
+        "max_us": 315.135,
+        "resources": [
+          {
+            "registers_per_thread": 179,
+            "shared_memory_bytes": 10240
+          }
+        ]
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 24,
+        "dur_us": [
+          1.6,
+          1.472,
+          1.6,
+          1.728,
+          1.856,
+          1.952,
+          1.696,
+          1.728,
+          1.696,
+          1.888,
+          1.632,
+          1.696,
+          1.472,
+          1.472,
+          1.536,
+          1.792,
+          1.824,
+          1.664,
+          1.632,
+          1.696,
+          1.76,
+          1.856,
+          1.632,
+          1.664
+        ],
+        "median_us": 1.696,
+        "total_us": 40.544,
+        "max_us": 1.952,
+        "resources": [
+          {
+            "registers_per_thread": 39,
+            "shared_memory_bytes": 0
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8063.469,
+          8063.662
+        ],
+        "median_us": 8063.565500000001,
+        "total_us": 16127.131000000001,
+        "max_us": 8063.662,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_optimizer_steps",
+    "no_repeated_run_confidence_interval"
+  ],
+  "variants": {
+    "control": "leviathan_compact_atomic_projection",
+    "candidate": "leviathan_compact_ieee_split_projection_sparse_disabled"
+  },
+  "acceptance_gate": {
+    "metric": "stable_compute_steps_per_second",
+    "required_steps_per_second": 4.5,
+    "achieved": false
+  },
+  "projection_family": {
+    "control": {
+      "count": 24,
+      "dur_us": [
+        507.039,
+        520.383,
+        510.623,
+        517.6,
+        523.36,
+        525.023,
+        526.335,
+        529.119,
+        521.471,
+        512.64,
+        515.072,
+        516.511,
+        512.191,
+        519.551,
+        511.359,
+        511.391,
+        524.128,
+        516.384,
+        514.656,
+        520.863,
+        516.575,
+        509.664,
+        520.928,
+        508.191
+      ],
+      "median_us": 516.543,
+      "total_us": 12411.057,
+      "max_us": 529.119,
+      "resources": [
+        {
+          "registers_per_thread": 166,
+          "shared_memory_bytes": 2048
+        }
+      ]
+    },
+    "candidate": {
+      "first": "_jtok_projection_split_kernel",
+      "second": "_jtok_projection_split_reduce_kernel",
+      "count": 24,
+      "dur_us": [
+        296.511,
+        304.09499999999997,
+        306.367,
+        307.104,
+        310.784,
+        308.991,
+        311.23100000000005,
+        309.279,
+        308.12800000000004,
+        316.032,
+        314.943,
+        314.559,
+        297.536,
+        308.159,
+        308.319,
+        312.063,
+        308.608,
+        312.031,
+        305.311,
+        310.559,
+        314.079,
+        312.767,
+        316.544,
+        316.799
+      ],
+      "cpu_gaps_included": false,
+      "duration_sum_is_not_interval_union": true,
+      "apparent_overlap_count": 22,
+      "max_apparent_overlap_us": 0.2239990234375,
+      "median_us": 309.919,
+      "total_us": 7430.799,
+      "max_us": 316.799
+    },
+    "median_latency_reduction_percent": 40.00131644412953,
+    "profiled_saving_ms_per_step": 2.4901290000000005,
+    "profiled_steps": 2,
+    "calls_per_step": 12,
+    "not_gate_population": true
+  },
+  "engineering_decision": "retain_opt_in_pending_broader_stability_and_contract_audit"
+}

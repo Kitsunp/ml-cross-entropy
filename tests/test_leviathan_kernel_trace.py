@@ -61,3 +61,51 @@ def test_kernel_trace_export_supports_investigated_jtok_only(tmp_path):
     assert result["traceEvents"][0]["name"] == target
     assert result["traceEvents"][0]["ts"] == 0
     assert "private_source" not in json.dumps(result)
+
+
+def test_projection_pairing_adds_reducer_without_cpu_gap_or_metadata():
+    first, second = "_jtok_projection_split_kernel", "_jtok_projection_split_reduce_kernel"
+    events = [
+        {"name": first, "cat": "kernel", "ph": "X", "ts": 100, "dur": 10,
+         "pid": 1, "tid": 7, "args": {"private": "do-not-export"}},
+        {"name": second, "cat": "kernel", "ph": "X", "ts": 200, "dur": 4,
+         "pid": 1, "tid": 7},
+        {"name": "outside_scope", "cat": "kernel", "ph": "X", "ts": 300, "dur": 90},
+    ]
+    result = module.sequential_pair_summary(events, first, second)
+    assert result["count"] == 1 and result["median_us"] == 14
+    assert result["cpu_gaps_included"] is False
+    assert "private" not in json.dumps(result)
+
+
+def test_projection_pairing_rejects_missing_or_cross_stream_reducer():
+    import pytest
+    first, second = "_jtok_projection_split_kernel", "_jtok_projection_split_reduce_kernel"
+    producer = {"name": first, "cat": "kernel", "ph": "X", "ts": 100, "dur": 10,
+                "pid": 1, "tid": 7}
+    with pytest.raises(ValueError, match="incomplete"):
+        module.sequential_pair_summary([producer], first, second)
+    reducer = dict(producer, name=second, ts=120, dur=4, tid=8)
+    with pytest.raises(ValueError, match="incomplete"):
+        module.sequential_pair_summary([producer, reducer], first, second)
+    with pytest.raises(ValueError, match="invalid GPU timing"):
+        module.sequential_pair_summary([dict(producer, dur=float("nan"))], first, second)
+
+
+def test_projection_pairing_records_apparent_overlap_without_inventing_gap():
+    import pytest
+    first, second = "_jtok_projection_split_kernel", "_jtok_projection_split_reduce_kernel"
+    # Reproduce the exported duration/start mismatch with a relative origin.
+    events = [
+        {"name": first, "cat": "kernel", "ph": "X", "ts": 100, "dur": 1192.572,
+         "pid": 1, "tid": 7},
+        {"name": second, "cat": "kernel", "ph": "X", "ts": 1292.316, "dur": 4,
+         "pid": 1, "tid": 7},
+    ]
+    result = module.sequential_pair_summary(events, first, second)
+    assert result["median_us"] == pytest.approx(1196.572)
+    assert result["apparent_overlap_count"] == 1
+    assert result["max_apparent_overlap_us"] == pytest.approx(.256)
+    assert result["duration_sum_is_not_interval_union"] is True
+    with pytest.raises(ValueError, match="negative duration"):
+        module.sequential_pair_summary([dict(events[0], dur=-1), events[1]], first, second)

@@ -26,10 +26,15 @@ CANDIDATE_FILES = (
 )
 SCHEMA = "leviathan-public-candidate-v1"
 JTOK_SOURCE = "leviathan/jtok.py"
+JTOK_PROJECTION_SOURCE = "leviathan/jtok_projection.py"
 
 
-def source_manifest(package_root: Path, *, include_jtok: bool = False) -> dict[str, Any]:
-    sources = (*CANDIDATE_FILES, JTOK_SOURCE) if include_jtok else CANDIDATE_FILES
+def source_manifest(
+    package_root: Path, *, include_jtok: bool = False, include_projection: bool = False,
+) -> dict[str, Any]:
+    sources = (*CANDIDATE_FILES, JTOK_SOURCE) if include_jtok or include_projection else CANDIDATE_FILES
+    if include_projection:
+        sources = (*sources, JTOK_PROJECTION_SOURCE)
     return {
         "schema": SCHEMA,
         "files": {
@@ -41,15 +46,19 @@ def source_manifest(package_root: Path, *, include_jtok: bool = False) -> dict[s
 
 def verify_candidate(
     package_root: Path, expected: dict[str, Any], *, require_jtok: bool = False,
+    require_projection: bool = False,
 ) -> None:
     if set(expected) != {"schema", "files"} or expected["schema"] != SCHEMA:
         raise ValueError("invalid public Leviathan candidate manifest")
     files = expected["files"]
-    permitted_sets = (set(CANDIDATE_FILES), set(CANDIDATE_FILES) | {JTOK_SOURCE})
+    permitted_sets = (set(CANDIDATE_FILES), set(CANDIDATE_FILES) | {JTOK_SOURCE},
+                      set(CANDIDATE_FILES) | {JTOK_SOURCE, JTOK_PROJECTION_SOURCE})
     if not isinstance(files, dict) or set(files) not in permitted_sets:
         raise ValueError("candidate manifest must contain exactly the public kernel files")
     if require_jtok and JTOK_SOURCE not in files:
         raise ValueError("native JTok candidate requires its public source fingerprint")
+    if require_projection and JTOK_PROJECTION_SOURCE not in files:
+        raise ValueError("projection candidate requires its public source fingerprint")
     for name, value in files.items():
         if not isinstance(value, str) or len(value) != 64:
             raise ValueError("invalid candidate source digest")
@@ -65,8 +74,10 @@ def main() -> int:
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--include-jtok", action="store_true")
+    parser.add_argument("--include-projection", action="store_true")
     args = parser.parse_args()
-    manifest = source_manifest(args.source_root / "cut_cross_entropy", include_jtok=args.include_jtok)
+    manifest = source_manifest(args.source_root / "cut_cross_entropy", include_jtok=args.include_jtok,
+                               include_projection=args.include_projection)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return 0

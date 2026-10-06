@@ -50,3 +50,19 @@ def test_native_jtok_manifest_is_required_and_rejects_stale_source(tmp_path: Pat
     (tmp_path / _PROVENANCE.JTOK_SOURCE).write_text("# changed kernel\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="source mismatch: leviathan/jtok.py"):
         _PROVENANCE.verify_candidate(tmp_path, native, require_jtok=True)
+
+
+def test_projection_manifest_requires_both_native_sources(tmp_path: Path) -> None:
+    for name in (*_PROVENANCE.CANDIDATE_FILES, _PROVENANCE.JTOK_SOURCE,
+                 _PROVENANCE.JTOK_PROJECTION_SOURCE):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# public kernel\n", encoding="utf-8")
+    old = _PROVENANCE.source_manifest(tmp_path, include_jtok=True)
+    with pytest.raises(ValueError, match="projection candidate requires"):
+        _PROVENANCE.verify_candidate(tmp_path, old, require_projection=True)
+    manifest = _PROVENANCE.source_manifest(tmp_path, include_projection=True)
+    _PROVENANCE.verify_candidate(tmp_path, manifest, require_projection=True)
+    del manifest["files"][_PROVENANCE.JTOK_SOURCE]
+    with pytest.raises(ValueError, match="exactly the public kernel files"):
+        _PROVENANCE.verify_candidate(tmp_path, manifest, require_projection=True)
