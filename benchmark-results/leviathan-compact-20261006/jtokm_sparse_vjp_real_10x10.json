@@ -1,0 +1,225 @@
+{
+  "schema": "jtok-sparse-coefficient-real-comparison-v1",
+  "data_kind": "real",
+  "mode": "jtokm",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.31253757304511964,
+        "median_seconds": 0.31046616996172816,
+        "min_seconds": 0.3067528458777815,
+        "p95_seconds": 0.3122041957685724,
+        "population_stddev_seconds": 0.0017980743419627957,
+        "steps_per_second": 3.220962851196548
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.3128718521911651,
+        "median_seconds": 0.310147697920911,
+        "min_seconds": 0.3040023969952017,
+        "p95_seconds": 0.312567399116233,
+        "population_stddev_seconds": 0.0027934606489224624,
+        "steps_per_second": 3.224270264469299
+      },
+      "throughput_gain_percent": 0.1026839931271617,
+      "latency_reduction_percent": 0.10257866126167636
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.3227270001079887,
+        "median_seconds": 0.3204923134762794,
+        "min_seconds": 0.3108816649764776,
+        "p95_seconds": 0.32249902456533164,
+        "population_stddev_seconds": 0.004058494468670049,
+        "steps_per_second": 3.1201996364696374
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.32302144705317914,
+        "median_seconds": 0.3203892920864746,
+        "min_seconds": 0.31102076289243996,
+        "p95_seconds": 0.3227994050248526,
+        "population_stddev_seconds": 0.004401211086780316,
+        "steps_per_second": 3.1212029387364644
+      },
+      "throughput_gain_percent": 0.032155066461148074,
+      "latency_reduction_percent": 0.03214473030174192
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 24,
+        "dur_us": [
+          1522.271,
+          1425.471,
+          1493.728,
+          1511.231,
+          1487.583,
+          1441.503,
+          1412.895,
+          1404.799,
+          1465.183,
+          1561.951,
+          1502.815,
+          1555.135,
+          1476.704,
+          1590.431,
+          1540.383,
+          1516.991,
+          1509.919,
+          1454.655,
+          1418.335,
+          1446.591,
+          1457.184,
+          1577.055,
+          1485.727,
+          1543.679
+        ],
+        "median_us": 1490.6555,
+        "total_us": 35802.219,
+        "max_us": 1590.431,
+        "resources": [
+          {
+            "registers_per_thread": 48,
+            "shared_memory_bytes": 8192
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8033.69,
+          8041.883
+        ],
+        "median_us": 8037.7865,
+        "total_us": 16075.573,
+        "max_us": 8041.883,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 24,
+        "dur_us": [
+          1533.569,
+          1521.185,
+          1519.041,
+          1532.513,
+          1523.458,
+          1520.833,
+          1514.401,
+          1514.37,
+          1521.282,
+          1527.617,
+          1520.897,
+          1518.85,
+          1510.69,
+          1512.29,
+          1515.073,
+          1517.698,
+          1507.074,
+          1512.321,
+          1505.409,
+          1509.794,
+          1505.921,
+          1514.049,
+          1503.073,
+          1498.722
+        ],
+        "median_us": 1514.737,
+        "total_us": 36380.13,
+        "max_us": 1533.569,
+        "resources": [
+          {
+            "registers_per_thread": 70,
+            "shared_memory_bytes": 512
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8094.151,
+          8091.911
+        ],
+        "median_us": 8093.031,
+        "total_us": 16186.062,
+        "max_us": 8094.151,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_optimizer_steps",
+    "no_repeated_run_confidence_interval"
+  ],
+  "variants": {
+    "control": "leviathan_compact_native_dense_coefficient_updates",
+    "candidate": "leviathan_compact_native_nonzero_coefficient_updates"
+  },
+  "acceptance_gate": {
+    "metric": "stable_compute_steps_per_second",
+    "required_steps_per_second": 4.2,
+    "achieved": false
+  },
+  "engineering_decision": "retain_opt_in_for_diagnostics_do_not_promote_default",
+  "performance_evidence": {
+    "full_step_gain": "small_observed_difference_not_confirmed_stable",
+    "native_vjp_median_latency_change_percent": 1.615497343282879,
+    "native_vjp_default_promotion_supported": false
+  },
+  "profile_step_diagnostics": {
+    "not_gate_population": true,
+    "first_active_step_is_perturbed": true,
+    "optimizer_steps": [
+      {
+        "optimizer_step": 3,
+        "events_per_arm": 12,
+        "control_vjp_sum_ms": 17.784564999999997,
+        "candidate_vjp_sum_ms": 18.268016,
+        "control_vjp_median_us": 1490.6555,
+        "candidate_vjp_median_us": 1521.041,
+        "control_full_compute_ms": 885.8014398720115,
+        "candidate_full_compute_ms": 901.9614728167653
+      },
+      {
+        "optimizer_step": 4,
+        "events_per_arm": 12,
+        "control_vjp_sum_ms": 18.017654,
+        "candidate_vjp_sum_ms": 18.112114000000002,
+        "control_vjp_median_us": 1497.823,
+        "candidate_vjp_median_us": 1510.2420000000002,
+        "control_full_compute_ms": 324.85422817990184,
+        "candidate_full_compute_ms": 325.339179020375
+      }
+    ]
+  }
+}

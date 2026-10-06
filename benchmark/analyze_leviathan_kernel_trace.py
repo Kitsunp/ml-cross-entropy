@@ -80,8 +80,8 @@ def kernel_trace(path: Path, targets: tuple[str, ...]) -> dict[str, Any]:
     Stream identifiers are remapped, and time starts at the first selected
     event. Gaps represent work outside this selected scope, not GPU idleness.
     """
-    if not targets or any(not name.startswith("_lev_") for name in targets):
-        raise ValueError("kernel-only export is restricted to investigated Leviathan kernels")
+    if not targets or any(not name.startswith(("_lev_", "_jtok_")) for name in targets):
+        raise ValueError("kernel-only export is restricted to investigated Leviathan/JToK kernels")
     payload = json.loads(path.read_text(encoding="utf-8"))
     selected = [event for event in payload["traceEvents"]
                 if isinstance(event, dict) and event.get("name") in targets

@@ -35,3 +35,18 @@ def test_candidate_manifest_cannot_include_private_modules(tmp_path: Path) -> No
     manifest["files"]["private_model.py"] = "a" * 64
     with pytest.raises(ValueError, match="exactly the public kernel files"):
         _PROVENANCE.verify_candidate(tmp_path, manifest)
+
+
+def test_native_jtok_manifest_is_required_and_rejects_stale_source(tmp_path: Path) -> None:
+    for name in (*_PROVENANCE.CANDIDATE_FILES, _PROVENANCE.JTOK_SOURCE):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# public kernel\n", encoding="utf-8")
+    old = _PROVENANCE.source_manifest(tmp_path)
+    with pytest.raises(ValueError, match="requires its public source"):
+        _PROVENANCE.verify_candidate(tmp_path, old, require_jtok=True)
+    native = _PROVENANCE.source_manifest(tmp_path, include_jtok=True)
+    _PROVENANCE.verify_candidate(tmp_path, native, require_jtok=True)
+    (tmp_path / _PROVENANCE.JTOK_SOURCE).write_text("# changed kernel\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source mismatch: leviathan/jtok.py"):
+        _PROVENANCE.verify_candidate(tmp_path, native, require_jtok=True)

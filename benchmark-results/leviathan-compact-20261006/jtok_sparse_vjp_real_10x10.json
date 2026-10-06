@@ -1,0 +1,225 @@
+{
+  "schema": "jtok-sparse-coefficient-real-comparison-v1",
+  "data_kind": "real",
+  "mode": "jtok",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.2677534129470587,
+        "median_seconds": 0.26666313339956105,
+        "min_seconds": 0.26230434398166835,
+        "p95_seconds": 0.26764500071294606,
+        "population_stddev_seconds": 0.001981398674813802,
+        "steps_per_second": 3.7500496872270164
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.266942678950727,
+        "median_seconds": 0.2662387030432001,
+        "min_seconds": 0.26112160296179354,
+        "p95_seconds": 0.2669356407132,
+        "population_stddev_seconds": 0.0022317069083495284,
+        "steps_per_second": 3.756027912432173
+      },
+      "throughput_gain_percent": 0.1594172265375393,
+      "latency_reduction_percent": 0.15916349251211548
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.2782262680120766,
+        "median_seconds": 0.27685308433137834,
+        "min_seconds": 0.26496919500641525,
+        "p95_seconds": 0.27797055256087333,
+        "population_stddev_seconds": 0.004599403481177846,
+        "steps_per_second": 3.6120240538951465
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.2773283759597689,
+        "median_seconds": 0.2764380120206624,
+        "min_seconds": 0.2640140310395509,
+        "p95_seconds": 0.2772307436680421,
+        "population_stddev_seconds": 0.004801274427932405,
+        "steps_per_second": 3.6174475163178887
+      },
+      "throughput_gain_percent": 0.15015022994915306,
+      "latency_reduction_percent": 0.14992511704117195
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 24,
+        "dur_us": [
+          838.175,
+          808.639,
+          842.207,
+          811.999,
+          811.518,
+          845.183,
+          823.871,
+          842.431,
+          801.087,
+          808.479,
+          913.15,
+          797.535,
+          840.831,
+          805.951,
+          836.255,
+          810.911,
+          804.223,
+          842.015,
+          822.239,
+          838.367,
+          803.615,
+          806.143,
+          912.447,
+          794.303
+        ],
+        "median_us": 817.119,
+        "total_us": 19861.574,
+        "max_us": 913.15,
+        "resources": [
+          {
+            "registers_per_thread": 48,
+            "shared_memory_bytes": 8192
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8043.638,
+          8046.23
+        ],
+        "median_us": 8044.933999999999,
+        "total_us": 16089.867999999999,
+        "max_us": 8046.23,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 24,
+        "dur_us": [
+          777.794,
+          775.169,
+          789.825,
+          788.993,
+          785.793,
+          778.433,
+          788.001,
+          781.089,
+          775.138,
+          781.602,
+          777.986,
+          780.546,
+          769.57,
+          769.249,
+          779.521,
+          775.489,
+          772.993,
+          767.809,
+          774.241,
+          767.393,
+          763.201,
+          771.809,
+          765.538,
+          768.354
+        ],
+        "median_us": 775.329,
+        "total_us": 18625.536,
+        "max_us": 789.825,
+        "resources": [
+          {
+            "registers_per_thread": 70,
+            "shared_memory_bytes": 512
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8031.854,
+          8028.238
+        ],
+        "median_us": 8030.046,
+        "total_us": 16060.092,
+        "max_us": 8031.854,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_optimizer_steps",
+    "no_repeated_run_confidence_interval"
+  ],
+  "variants": {
+    "control": "leviathan_compact_native_dense_coefficient_updates",
+    "candidate": "leviathan_compact_native_nonzero_coefficient_updates"
+  },
+  "acceptance_gate": {
+    "metric": "stable_compute_steps_per_second",
+    "required_steps_per_second": 4.5,
+    "achieved": false
+  },
+  "engineering_decision": "retain_opt_in_for_diagnostics_do_not_promote_default",
+  "performance_evidence": {
+    "full_step_gain": "small_observed_difference_not_confirmed_stable",
+    "native_vjp_median_latency_change_percent": -5.114310155558743,
+    "native_vjp_default_promotion_supported": false
+  },
+  "profile_step_diagnostics": {
+    "not_gate_population": true,
+    "first_active_step_is_perturbed": true,
+    "optimizer_steps": [
+      {
+        "optimizer_step": 3,
+        "events_per_arm": 12,
+        "control_vjp_sum_ms": 9.944274,
+        "candidate_vjp_sum_ms": 9.380369,
+        "control_vjp_median_us": 817.935,
+        "candidate_vjp_median_us": 780.8175000000001,
+        "control_full_compute_ms": 769.5690600667149,
+        "candidate_full_compute_ms": 761.5259399171919
+      },
+      {
+        "optimizer_step": 4,
+        "events_per_arm": 12,
+        "control_vjp_sum_ms": 9.9173,
+        "candidate_vjp_sum_ms": 9.245166999999999,
+        "control_vjp_median_us": 816.575,
+        "candidate_vjp_median_us": 769.4095,
+        "control_full_compute_ms": 280.93229583464563,
+        "candidate_full_compute_ms": 281.63426788523793
+      }
+    ]
+  }
+}

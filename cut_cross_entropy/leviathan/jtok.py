@@ -41,6 +41,7 @@ through the explicit ``backend="torch"`` oracle for comparison.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Literal, NamedTuple, Optional
 
 import torch
@@ -184,6 +185,11 @@ def _can_use_vectorized_token_projection(
         d_seed <= 128
         and d_seed * knot_pad * modes <= _TOKEN_PROJECTION_BLOCK_WORK_LIMIT
     )
+
+
+def _sparse_coefficient_updates_requested() -> bool:
+    """Opt-in zero-support atomic suppression, shared by JTok and JTok-M."""
+    return os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
 
 
 def _can_use_vectorized_mode_evaluation(
@@ -2572,6 +2578,7 @@ if _TRITON_AVAILABLE:
             "TOP_K",
             "BLOCK_D",
             "HAS_MASK",
+            "SPARSE_COEFF_UPDATES",
         ],
         reset_to_zero=["grad_z_ptr", "grad_coeff_ptr"],
     )
@@ -2595,6 +2602,7 @@ if _TRITON_AVAILABLE:
         KNOT_PAD: tl.constexpr,
         BLOCK_D: tl.constexpr,
         HAS_MASK: tl.constexpr,
+        SPARSE_COEFF_UPDATES: tl.constexpr = False,
     ):
         """Vectorized token-local spline gradients for the compact route.
 
@@ -2725,6 +2733,12 @@ if _TRITON_AVAILABLE:
             )
             grad_phi = tl.where(row_valid, grad_phi, 0.0)
             grad_z_value += grad_phi * dphi_dz
+            coefficient_mask = (row_mask & d_mask)[:, None] & knot_mask[None, :]
+            if SPARSE_COEFF_UPDATES:
+                # For finite VJPs, b_q=0 contributes exactly zero. Keep the
+                # same basis/contraction and skip only these atomic updates;
+                # no compact gather or change in reduction ownership here.
+                coefficient_mask = coefficient_mask & row_valid & (basis_raw != 0.0)
             tl.atomic_add(
                 grad_coeff_ptr
                 + ((expert * NUM_MODES + mode) * D_SEED) * NUM_KNOTS
@@ -2735,7 +2749,7 @@ if _TRITON_AVAILABLE:
                     grad_phi[:, None] * basis_raw / safe_sum[:, None],
                     0.0,
                 ),
-                mask=(row_mask & d_mask)[:, None] & knot_mask[None, :],
+                mask=coefficient_mask,
             )
 
         tl.atomic_add(
@@ -3186,6 +3200,14 @@ def _run_jtok_backward_triton(
         )
     if modes_buffer.dtype != spline_out.dtype or modes_buffer.device != delta.device:
         raise ValueError("modes_buffer must match spline_out dtype and delta device")
+    sparse_coefficient_updates = _sparse_coefficient_updates_requested()
+    if sparse_coefficient_updates and (
+        hidden < _SINGLE_TILE_HIDDEN_LIMIT
+        or not _can_use_vectorized_token_projection(d_seed, knots, modes)
+    ):
+        raise ValueError(
+            "JTOK_SPARSE_COEFF_UPDATES=1 requires the wide vectorized token VJP"
+        )
     grad_delta = torch.empty_like(delta)
     # The kernel accumulates all shared gradients in FP32.  This also avoids
     # dtype-dependent atomic behavior for BF16 parameter gradients.
@@ -3396,6 +3418,7 @@ def _run_jtok_backward_triton(
                 KNOT_PAD=triton.next_power_of_2(knots),
                 BLOCK_D=block_d,
                 HAS_MASK=bool(valid_mask.numel()),
+                SPARSE_COEFF_UPDATES=sparse_coefficient_updates,
             )
         else:
             token_projection_grid = (n_tokens, top_k, d_seed)

@@ -25,24 +25,31 @@ CANDIDATE_FILES = (
     "leviathan/spline_support_kernels.py",
 )
 SCHEMA = "leviathan-public-candidate-v1"
+JTOK_SOURCE = "leviathan/jtok.py"
 
 
-def source_manifest(package_root: Path) -> dict[str, Any]:
+def source_manifest(package_root: Path, *, include_jtok: bool = False) -> dict[str, Any]:
+    sources = (*CANDIDATE_FILES, JTOK_SOURCE) if include_jtok else CANDIDATE_FILES
     return {
         "schema": SCHEMA,
         "files": {
             name: hashlib.sha256((package_root / name).read_bytes()).hexdigest()
-            for name in CANDIDATE_FILES
+            for name in sources
         },
     }
 
 
-def verify_candidate(package_root: Path, expected: dict[str, Any]) -> None:
+def verify_candidate(
+    package_root: Path, expected: dict[str, Any], *, require_jtok: bool = False,
+) -> None:
     if set(expected) != {"schema", "files"} or expected["schema"] != SCHEMA:
         raise ValueError("invalid public Leviathan candidate manifest")
     files = expected["files"]
-    if not isinstance(files, dict) or set(files) != set(CANDIDATE_FILES):
+    permitted_sets = (set(CANDIDATE_FILES), set(CANDIDATE_FILES) | {JTOK_SOURCE})
+    if not isinstance(files, dict) or set(files) not in permitted_sets:
         raise ValueError("candidate manifest must contain exactly the public kernel files")
+    if require_jtok and JTOK_SOURCE not in files:
+        raise ValueError("native JTok candidate requires its public source fingerprint")
     for name, value in files.items():
         if not isinstance(value, str) or len(value) != 64:
             raise ValueError("invalid candidate source digest")
@@ -57,8 +64,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--include-jtok", action="store_true")
     args = parser.parse_args()
-    manifest = source_manifest(args.source_root / "cut_cross_entropy")
+    manifest = source_manifest(args.source_root / "cut_cross_entropy", include_jtok=args.include_jtok)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return 0

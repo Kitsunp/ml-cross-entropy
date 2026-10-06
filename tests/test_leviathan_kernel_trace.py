@@ -47,3 +47,17 @@ def test_unknown_resources_are_not_reported_as_zero():
     known = dict(event, args={"registers per thread": 40, "shared memory": 0})
     assert module._summary([known], TARGET)["resources"] == [
         {"registers_per_thread": 40, "shared_memory_bytes": 0}]
+
+
+def test_kernel_trace_export_supports_investigated_jtok_only(tmp_path):
+    target = "_jtok_backward_token_projection_grad_block_kernel"
+    trace = tmp_path / "raw.json"
+    trace.write_text(json.dumps({"traceEvents": [
+        {"name": target, "cat": "kernel", "ph": "X", "ts": 400, "dur": 20,
+         "args": {"private_source": "do-not-export", "registers per thread": 48}},
+        {"name": "outside_scope", "cat": "kernel", "ph": "X", "ts": 450, "dur": 90}]}))
+    result = module.kernel_trace(trace, (target,))
+    assert len(result["traceEvents"]) == 1
+    assert result["traceEvents"][0]["name"] == target
+    assert result["traceEvents"][0]["ts"] == 0
+    assert "private_source" not in json.dumps(result)
