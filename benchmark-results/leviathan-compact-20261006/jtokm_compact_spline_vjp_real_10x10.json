@@ -1,0 +1,441 @@
+{
+  "schema": "jtok-compact-spline-vjp-real-comparison-v1",
+  "data_kind": "real",
+  "mode": "jtokm",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.30144334584474564,
+        "median_seconds": 0.29950071044731885,
+        "min_seconds": 0.29620411107316613,
+        "p95_seconds": 0.30106046341825277,
+        "population_stddev_seconds": 0.0016507914479767956,
+        "steps_per_second": 3.338890243386907
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.29288777289912105,
+        "median_seconds": 0.29154916445259005,
+        "min_seconds": 0.2849834489170462,
+        "p95_seconds": 0.29269332566764206,
+        "population_stddev_seconds": 0.00261548862677649,
+        "steps_per_second": 3.42995323576931
+      },
+      "throughput_gain_percent": 2.7273430913988594,
+      "latency_reduction_percent": 2.6549339341642275
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.3117804368957877,
+        "median_seconds": 0.30976651201490313,
+        "min_seconds": 0.2989738960750401,
+        "p95_seconds": 0.31143827619962394,
+        "population_stddev_seconds": 0.004301719448568634,
+        "steps_per_second": 3.228237918603316
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.3032886639703065,
+        "median_seconds": 0.30134502751752734,
+        "min_seconds": 0.2926399048883468,
+        "p95_seconds": 0.30310380493756384,
+        "population_stddev_seconds": 0.004033391706288556,
+        "steps_per_second": 3.3184552877410143
+      },
+      "throughput_gain_percent": 2.794631976094575,
+      "latency_reduction_percent": 2.718655558535854
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 24,
+        "dur_us": [
+          1516.316,
+          1446.108,
+          1483.1,
+          1522.428,
+          1481.788,
+          1500.412,
+          1434.844,
+          1474.875,
+          1474.076,
+          1522.652,
+          1502.588,
+          1556.347,
+          1485.276,
+          1508.764,
+          1522.396,
+          1527.036,
+          1509.596,
+          1503.099,
+          1477.692,
+          1574.843,
+          1466.3,
+          1528.603,
+          1484.188,
+          1547.292
+        ],
+        "median_us": 1502.8435,
+        "total_us": 36050.619,
+        "max_us": 1574.843,
+        "resources": [
+          {
+            "registers_per_thread": 48,
+            "shared_memory_bytes": 8192
+          }
+        ]
+      },
+      "_jtok_compact_spline_vjp_kernel": {
+        "count": 0,
+        "dur_us": []
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 24,
+        "dur_us": [
+          1192.572,
+          1218.493,
+          1207.9,
+          1221.501,
+          1220.445,
+          1213.757,
+          1217.02,
+          1206.844,
+          1221.981,
+          1238.3,
+          1233.949,
+          1235.741,
+          1194.973,
+          1219.965,
+          1209.949,
+          1223.484,
+          1221.821,
+          1215.005,
+          1217.181,
+          1206.397,
+          1219.868,
+          1236.125,
+          1231.676,
+          1238.62
+        ],
+        "median_us": 1219.9164999999998,
+        "total_us": 29263.567,
+        "max_us": 1238.62,
+        "resources": [
+          {
+            "registers_per_thread": 179,
+            "shared_memory_bytes": 10240
+          }
+        ]
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 24,
+        "dur_us": [
+          3.104,
+          4.768,
+          4.768,
+          4.352,
+          4.48,
+          4.64,
+          4.736,
+          4.96,
+          4.544,
+          4.416,
+          4.256,
+          4.768,
+          2.912,
+          4.512,
+          4.448,
+          4.479,
+          4.512,
+          4.832,
+          4.832,
+          5.088,
+          4.672,
+          4.608,
+          4.287,
+          4.736
+        ],
+        "median_us": 4.576,
+        "total_us": 107.71,
+        "max_us": 5.088,
+        "resources": [
+          {
+            "registers_per_thread": 39,
+            "shared_memory_bytes": 0
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8044.554,
+          8046.698
+        ],
+        "median_us": 8045.626,
+        "total_us": 16091.252,
+        "max_us": 8046.698,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_jtok_backward_token_projection_grad_block_kernel": {
+        "count": 0,
+        "dur_us": []
+      },
+      "_jtok_compact_spline_vjp_kernel": {
+        "count": 24,
+        "dur_us": [
+          904.065,
+          764.577,
+          873.889,
+          851.585,
+          828.608,
+          725.856,
+          650.656,
+          653.472,
+          771.776,
+          848.705,
+          787.104,
+          767.969,
+          823.456,
+          814.336,
+          877.601,
+          805.312,
+          873.12,
+          779.84,
+          748.609,
+          722.881,
+          767.361,
+          826.433,
+          786.368,
+          740.673
+        ],
+        "median_us": 786.7360000000001,
+        "total_us": 18994.252,
+        "max_us": 904.065,
+        "resources": [
+          {
+            "registers_per_thread": 56,
+            "shared_memory_bytes": 512
+          }
+        ]
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 24,
+        "dur_us": [
+          1193.793,
+          1222.849,
+          1208.737,
+          1219.777,
+          1225.025,
+          1216.001,
+          1213.953,
+          1208.769,
+          1219.457,
+          1236.449,
+          1232.929,
+          1232.897,
+          1193.953,
+          1221.473,
+          1209.729,
+          1219.681,
+          1220.129,
+          1212.385,
+          1212.16,
+          1207.072,
+          1226.816,
+          1233.953,
+          1230.753,
+          1230.721
+        ],
+        "median_us": 1219.729,
+        "total_us": 29249.461,
+        "max_us": 1236.449,
+        "resources": [
+          {
+            "registers_per_thread": 179,
+            "shared_memory_bytes": 10240
+          }
+        ]
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 24,
+        "dur_us": [
+          2.88,
+          4.832,
+          4.64,
+          4.448,
+          4.8,
+          4.544,
+          4.608,
+          5.024,
+          4.672,
+          4.736,
+          4.321,
+          4.8,
+          2.912,
+          4.48,
+          4.736,
+          4.224,
+          4.928,
+          4.512,
+          4.896,
+          4.672,
+          4.705,
+          4.96,
+          4.352,
+          4.928
+        ],
+        "median_us": 4.672,
+        "total_us": 108.61,
+        "max_us": 5.024,
+        "resources": [
+          {
+            "registers_per_thread": 39,
+            "shared_memory_bytes": 0
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8043.334,
+          8041.926
+        ],
+        "median_us": 8042.63,
+        "total_us": 16085.26,
+        "max_us": 8043.334,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_optimizer_steps",
+    "no_repeated_run_confidence_interval",
+    "control_comparability_verified_by_private_effective_policy_audit",
+    "guard_grid_copy_included_in_full_step_not_in_spline_kernel_duration",
+    "no_hardware_spill_bandwidth_or_occupancy_counters"
+  ],
+  "variants": {
+    "control": "leviathan_compact_ieee_split_projection",
+    "candidate": "leviathan_compact_ieee_split_projection_compact_spline_vjp"
+  },
+  "acceptance_gate": {
+    "metric": "stable_compute_steps_per_second",
+    "required_steps_per_second": 4.2,
+    "achieved": false
+  },
+  "spline_vjp_family": {
+    "control": {
+      "count": 24,
+      "dur_us": [
+        1516.316,
+        1446.108,
+        1483.1,
+        1522.428,
+        1481.788,
+        1500.412,
+        1434.844,
+        1474.875,
+        1474.076,
+        1522.652,
+        1502.588,
+        1556.347,
+        1485.276,
+        1508.764,
+        1522.396,
+        1527.036,
+        1509.596,
+        1503.099,
+        1477.692,
+        1574.843,
+        1466.3,
+        1528.603,
+        1484.188,
+        1547.292
+      ],
+      "median_us": 1502.8435,
+      "total_us": 36050.619,
+      "max_us": 1574.843,
+      "resources": [
+        {
+          "registers_per_thread": 48,
+          "shared_memory_bytes": 8192
+        }
+      ]
+    },
+    "candidate": {
+      "count": 24,
+      "dur_us": [
+        904.065,
+        764.577,
+        873.889,
+        851.585,
+        828.608,
+        725.856,
+        650.656,
+        653.472,
+        771.776,
+        848.705,
+        787.104,
+        767.969,
+        823.456,
+        814.336,
+        877.601,
+        805.312,
+        873.12,
+        779.84,
+        748.609,
+        722.881,
+        767.361,
+        826.433,
+        786.368,
+        740.673
+      ],
+      "median_us": 786.7360000000001,
+      "total_us": 18994.252,
+      "max_us": 904.065,
+      "resources": [
+        {
+          "registers_per_thread": 56,
+          "shared_memory_bytes": 512
+        }
+      ]
+    },
+    "median_latency_reduction_percent": 47.65017115887316,
+    "profiled_saving_ms_per_step": 8.528183499999999,
+    "profiled_steps": 2,
+    "calls_per_step": 12,
+    "not_gate_population": true,
+    "guard_copy_cost_not_in_spline_kernel_duration": true
+  },
+  "engineering_decision": "retain_opt_in_pending_broader_stability_and_contract_audit"
+}

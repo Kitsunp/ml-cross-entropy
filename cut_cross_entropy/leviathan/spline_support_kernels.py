@@ -33,6 +33,7 @@ def _quadratic_weight(t, knot, SCALE: tl.constexpr, DERIVATIVE: tl.constexpr):
 @triton.jit
 def _compact_quadratic_geometry(
     t, grid_ptr, KAPPA: tl.constexpr, DERIVATIVE: tl.constexpr,
+    RETURN_RAW_SUM: tl.constexpr = False,
 ):
     """Return local support, normalized weights and d(weight)/dt.
 
@@ -42,6 +43,9 @@ def _compact_quadratic_geometry(
     fourth tiny boundary contribution, which must also enter normalization.
     The middle derivative is determined by partition of unity, so consumers
     can cancel coordinate-independent coefficient offsets before contraction.
+    RETURN_RAW_SUM exposes the unclamped sum for consumers that preserve an
+    explicit zero-derivative floor policy outside the unit interval. The
+    default return values and Leviathan arithmetic are unchanged.
     """
     left = tl.floor(t * (KAPPA - 1.0) - 0.5).to(tl.int32)
     left = tl.minimum(tl.maximum(left, 0), KAPPA - 3)
@@ -59,7 +63,8 @@ def _compact_quadratic_geometry(
     a3, da3 = _quadratic_weight(t, g3, KAPPA - 1.0, DERIVATIVE)
     a3 = tl.where(g3_valid, a3, 0.0)
     da3 = tl.where(g3_valid, da3, 0.0)
-    total = tl.maximum((a0 + a1) + (a2 + a3), 1e-12)
+    raw_total = (a0 + a1) + (a2 + a3)
+    total = tl.maximum(raw_total, 1e-12)
     b0, b1, b2 = a0 / total, a1 / total, a2 / total
     b3 = a3 / total
     db0 = tl.full(t.shape, 0.0, tl.float32)
@@ -72,7 +77,10 @@ def _compact_quadratic_geometry(
         db2 = (da2 - b2 * dtotal) / total
         db3 = (da3 - b3 * dtotal) / total
         db1 = -((db0 + db2) + db3)
-    return left, b0, b1, b2, b3, db0, db1, db2, db3
+    if RETURN_RAW_SUM:
+        return left, b0, b1, b2, b3, db0, db1, db2, db3, raw_total
+    else:
+        return left, b0, b1, b2, b3, db0, db1, db2, db3
 
 
 @triton.jit

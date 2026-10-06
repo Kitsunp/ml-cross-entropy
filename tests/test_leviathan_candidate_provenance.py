@@ -66,3 +66,20 @@ def test_projection_manifest_requires_both_native_sources(tmp_path: Path) -> Non
     del manifest["files"][_PROVENANCE.JTOK_SOURCE]
     with pytest.raises(ValueError, match="exactly the public kernel files"):
         _PROVENANCE.verify_candidate(tmp_path, manifest, require_projection=True)
+
+
+def test_compact_jtok_manifest_requires_local_support_consumer(tmp_path: Path) -> None:
+    for name in (*_PROVENANCE.CANDIDATE_FILES, _PROVENANCE.JTOK_SOURCE,
+                 _PROVENANCE.JTOK_PROJECTION_SOURCE, _PROVENANCE.JTOK_COMPACT_SOURCE):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# public kernel\n", encoding="utf-8")
+    old = _PROVENANCE.source_manifest(tmp_path, include_projection=True)
+    with pytest.raises(ValueError, match="compact JTok candidate requires"):
+        _PROVENANCE.verify_candidate(tmp_path, old, require_compact_jtok=True)
+    new = _PROVENANCE.source_manifest(tmp_path, include_compact_jtok=True)
+    _PROVENANCE.verify_candidate(tmp_path, new, require_jtok=True,
+                                 require_projection=True, require_compact_jtok=True)
+    (tmp_path / _PROVENANCE.JTOK_COMPACT_SOURCE).write_text("# stale\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source mismatch: leviathan/jtok_compact.py"):
+        _PROVENANCE.verify_candidate(tmp_path, new, require_compact_jtok=True)

@@ -340,6 +340,7 @@ def main() -> int:
             "synthetic_allowed_for_gate": False,
         },
         "kernel_policy": {
+            "jtok_compact_spline_vjp": os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0"),
             "jtok_projection_split": os.environ.get("JTOK_PROJECTION_SPLIT", "0"),
             "jtok_sparse_coeff_updates": os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0"),
             "compact_spline": os.environ.get("LEV_COMPACT_SPLINE", "0"),
@@ -393,8 +394,9 @@ def main() -> int:
         cce_origin = Path(cut_cross_entropy.__file__).resolve()
         from cut_cross_entropy.leviathan.runtime_policy import compact_spline_requested
         projection_candidate = os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
+        compact_jtok_candidate = os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0") == "1"
         native_jtok_candidate = (os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
-                                 or projection_candidate)
+                                 or projection_candidate or compact_jtok_candidate)
 
         if (compact_spline_requested() or native_jtok_candidate) and args.candidate_manifest is None:
             raise ValueError("candidate validation requires --candidate-manifest")
@@ -406,6 +408,7 @@ def main() -> int:
                 json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
                 require_jtok=native_jtok_candidate,
                 require_projection=projection_candidate,
+                require_compact_jtok=compact_jtok_candidate,
             )
             result["runtime_verification"]["candidate_sources_verified"] = True
         result["imports"] = {
@@ -492,6 +495,12 @@ def main() -> int:
 
         class TimingCallback(TrainerCallback):
             def on_train_begin(self, args, state, control, **kwargs):
+                if compact_jtok_candidate:
+                    from cut_cross_entropy.leviathan.jtok_compact import prepare_compact_jtok_grids
+                    count = prepare_compact_jtok_grids(kwargs["model"])
+                    if not count:
+                        raise RuntimeError("compact JTok candidate found no grids to prevalidate")
+                    result["runtime_verification"]["compact_jtok_grids_prevalidated"] = count
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 timing["train_begin"] = time.perf_counter()
@@ -637,6 +646,7 @@ def main() -> int:
                 json.loads(args.candidate_manifest.read_text(encoding="utf-8")),
                 require_jtok=native_jtok_candidate,
                 require_projection=projection_candidate,
+                require_compact_jtok=compact_jtok_candidate,
             )
 
         result["status"] = "ok"

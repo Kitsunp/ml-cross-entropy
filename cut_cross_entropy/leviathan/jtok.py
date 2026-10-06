@@ -65,6 +65,9 @@ from cut_cross_entropy.torch_2_14 import (
     mark_warmup_incomplete_once,
 )
 from .jtok_projection import projection_grad_plan
+from .spline_support import is_uniform_unit_grid
+from .jtok_compact import validated_compact_grid
+from torch._subclasses.fake_tensor import is_fake
 
 try:  # Triton is an optional dependency on CPU/macOS installations.
     import triton
@@ -75,6 +78,7 @@ try:  # Triton is an optional dependency on CPU/macOS installations.
         _jtok_projection_split_kernel,
         _jtok_projection_split_reduce_kernel,
     )
+    from .jtok_compact import _jtok_compact_spline_vjp_kernel
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - CPU optional path
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
@@ -200,6 +204,26 @@ def _sparse_coefficient_updates_requested() -> bool:
 def _projection_split_requested() -> bool:
     """Keep the matrix reduction an explicit experiment, independent of sparse."""
     return os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
+
+
+def _compact_spline_vjp_requested() -> bool:
+    """Independent experiment; never change the forward mode product."""
+    return os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0") == "1"
+
+
+def _validate_compact_spline_vjp(
+    hidden: int, d_seed: int, knots: int, modes: int, knot_grid: torch.Tensor,
+) -> None:
+    if hidden < _SINGLE_TILE_HIDDEN_LIMIT or knots < 3 or not _can_use_vectorized_token_projection(
+        d_seed, knots, modes
+    ):
+        raise ValueError("JTOK_COMPACT_SPLINE_VJP=1 requires the wide vectorized spline VJP")
+    if _sparse_coefficient_updates_requested():
+        raise ValueError("compact spline VJP already owns support-only updates; disable sparse")
+    # Fake/functional tensors have no data pointer. The opaque value guard
+    # below remains in the compiled backward and validates the real grid.
+    if not is_fake(knot_grid) and not is_uniform_unit_grid(knot_grid, knots):
+        raise ValueError("compact spline VJP requires a canonical stored unit knot grid")
 
 
 def _can_use_vectorized_mode_evaluation(
@@ -2929,6 +2953,9 @@ def _run_jtok_triton(
     experts, modes, d_seed, knots, hidden = _check_common_kernel_inputs(
         delta, z, spline_coeff, spline_out, residual_out, scaler, knot_grid
     )
+    if _compact_spline_vjp_requested():
+        # Validate/cache the frozen grid before CUDA Graph capture begins.
+        _validate_compact_spline_vjp(hidden, d_seed, knots, modes, knot_grid)
     del experts
     n_tokens = int(delta.shape[0])
     top_k = int(expert_idx.shape[1])
@@ -3211,6 +3238,9 @@ def _run_jtok_backward_triton(
     if modes_buffer.dtype != spline_out.dtype or modes_buffer.device != delta.device:
         raise ValueError("modes_buffer must match spline_out dtype and delta device")
     sparse_coefficient_updates = _sparse_coefficient_updates_requested()
+    compact_spline_vjp = _compact_spline_vjp_requested()
+    if compact_spline_vjp:
+        _validate_compact_spline_vjp(hidden, d_seed, knots, modes, knot_grid)
     projection_split = _projection_split_requested()
     if projection_split and hidden < _SINGLE_TILE_HIDDEN_LIMIT:
         raise ValueError("JTOK_PROJECTION_SPLIT=1 requires the wide projection VJP")
@@ -3412,7 +3442,17 @@ def _run_jtok_backward_triton(
         # multi-tile kernel has already reduced their token-local mode and
         # residual buffers.  The work-budget predicate keeps larger spline
         # geometries on the established scalar-grid path.
-        if _can_use_vectorized_token_projection(d_seed, knots, modes):
+        if compact_spline_vjp:
+            validated_grid = validated_compact_grid(knot_grid, knots)
+            _jtok_wrap_kernel(_jtok_compact_spline_vjp_kernel)[(n_tokens, top_k)](
+                z, spline_coeff, validated_grid, expert_idx, modes_buffer,
+                grad_mode_buffer, grad_residual_buffer, valid_mask,
+                grad_z_accum, grad_coeff_accum, n_tokens,
+                D_SEED=d_seed, NUM_KNOTS=knots, NUM_MODES=modes, TOP_K=top_k,
+                BLOCK_D=triton.next_power_of_2(d_seed), HAS_MASK=bool(valid_mask.numel()),
+                num_warps=4, num_stages=1,
+            )
+        elif _can_use_vectorized_token_projection(d_seed, knots, modes):
             block_d = triton.next_power_of_2(d_seed)
             token_projection_grid = (n_tokens, top_k)
             _jtok_wrap_kernel(_jtok_backward_token_projection_grad_block_kernel)[
