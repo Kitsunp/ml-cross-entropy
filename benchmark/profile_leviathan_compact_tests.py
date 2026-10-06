@@ -18,6 +18,7 @@ TEST_FILES = (
     "test_jtok_sparse_updates.py",
     "test_jtok_projection.py",
     "test_jtok_compact.py",
+    "test_jtok_route_vjp.py",
 )
 
 

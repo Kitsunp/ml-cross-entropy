@@ -211,6 +211,16 @@ def _compact_spline_vjp_requested() -> bool:
     return os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0") == "1"
 
 
+def _route_vjp_factor_requested() -> bool:
+    """Reuse unweighted output contractions, independently of spline geometry."""
+    return os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0") == "1"
+
+
+def _validate_route_vjp_factor(hidden: int) -> None:
+    if hidden < _SINGLE_TILE_HIDDEN_LIMIT:
+        raise ValueError("JTOK_ROUTE_VJP_FACTOR=1 requires the wide projection VJP")
+
+
 def _validate_compact_spline_vjp(
     hidden: int, d_seed: int, knots: int, modes: int, knot_grid: torch.Tensor,
 ) -> None:
@@ -2237,6 +2247,7 @@ if _TRITON_AVAILABLE:
             "MIXTURE",
             "HAS_MASK",
             "SINGLE_HIDDEN_TILE",
+            "ROUTE_VJP_FACTOR",
         ],
         reset_to_zero=[
             "grad_mode_ptr",
@@ -2281,6 +2292,7 @@ if _TRITON_AVAILABLE:
         MIXTURE: tl.constexpr,
         HAS_MASK: tl.constexpr,
         SINGLE_HIDDEN_TILE: tl.constexpr,
+        ROUTE_VJP_FACTOR: tl.constexpr = False,
     ):
         """Wide backward pass with token-local scalar reductions.
 
@@ -2373,8 +2385,13 @@ if _TRITON_AVAILABLE:
                 mask=row_mask,
                 other=0.0,
             ).to(tl.float32)
-            slot_values = tl.zeros((BLOCK_H,), dtype=tl.float32)
-            grad_value = weight * grad_surface
+            if ROUTE_VJP_FACTOR:
+                # G is unweighted: dividing weighted VJPs by p would lose
+                # bar_p at p=0 and amplify small-probability rounding.
+                grad_weight_value = tl.full((), 0.0, tl.float32)
+            else:
+                slot_values = tl.zeros((BLOCK_H,), dtype=tl.float32)
+                grad_value = weight * grad_surface
 
             for mode in tl.range(0, NUM_MODES):
                 mode_value = tl.load(
@@ -2389,8 +2406,13 @@ if _TRITON_AVAILABLE:
                     mask=active_mask,
                     other=0.0,
                 ).to(tl.float32)
-                slot_values += mode_value * out_weight
-                grad_mode_value = tl.sum(grad_value * out_weight, axis=0)
+                if ROUTE_VJP_FACTOR:
+                    unweighted_mode = tl.sum(grad_surface * out_weight, axis=0)
+                    grad_mode_value = weight * unweighted_mode
+                    grad_weight_value += mode_value * unweighted_mode
+                else:
+                    slot_values += mode_value * out_weight
+                    grad_mode_value = tl.sum(grad_value * out_weight, axis=0)
                 if SINGLE_HIDDEN_TILE:
                     tl.store(
                         grad_mode_ptr
@@ -2408,7 +2430,8 @@ if _TRITON_AVAILABLE:
                         mask=row_valid,
                     )
 
-            residual_value = tl.zeros((BLOCK_H,), dtype=tl.float32)
+            if not ROUTE_VJP_FACTOR:
+                residual_value = tl.zeros((BLOCK_H,), dtype=tl.float32)
             for d in tl.range(0, D_SEED):
                 z_value = tl.load(
                     z_ptr + row * D_SEED + d,
@@ -2420,8 +2443,13 @@ if _TRITON_AVAILABLE:
                     mask=active_mask,
                     other=0.0,
                 ).to(tl.float32)
-                residual_value += z_value * residual_weight
-                grad_residual_value = tl.sum(grad_value * residual_weight, axis=0)
+                if ROUTE_VJP_FACTOR:
+                    unweighted_residual = tl.sum(grad_surface * residual_weight, axis=0)
+                    grad_residual_value = weight * unweighted_residual
+                    grad_weight_value += z_value * unweighted_residual
+                else:
+                    residual_value += z_value * residual_weight
+                    grad_residual_value = tl.sum(grad_value * residual_weight, axis=0)
                 if SINGLE_HIDDEN_TILE:
                     tl.store(
                         grad_residual_ptr
@@ -2438,8 +2466,9 @@ if _TRITON_AVAILABLE:
                         grad_residual_value,
                         mask=row_valid,
                     )
-            slot_values += residual_value
-            grad_weight_value = tl.sum(grad_surface * slot_values, axis=0)
+            if not ROUTE_VJP_FACTOR:
+                slot_values += residual_value
+                grad_weight_value = tl.sum(grad_surface * slot_values, axis=0)
             if SINGLE_HIDDEN_TILE:
                 tl.store(
                     grad_weights_ptr + row * TOP_K + slot,
@@ -2956,6 +2985,8 @@ def _run_jtok_triton(
     if _compact_spline_vjp_requested():
         # Validate/cache the frozen grid before CUDA Graph capture begins.
         _validate_compact_spline_vjp(hidden, d_seed, knots, modes, knot_grid)
+    if _route_vjp_factor_requested():
+        _validate_route_vjp_factor(hidden)
     del experts
     n_tokens = int(delta.shape[0])
     top_k = int(expert_idx.shape[1])
@@ -3238,6 +3269,9 @@ def _run_jtok_backward_triton(
     if modes_buffer.dtype != spline_out.dtype or modes_buffer.device != delta.device:
         raise ValueError("modes_buffer must match spline_out dtype and delta device")
     sparse_coefficient_updates = _sparse_coefficient_updates_requested()
+    route_vjp_factor = _route_vjp_factor_requested()
+    if route_vjp_factor:
+        _validate_route_vjp_factor(hidden)
     compact_spline_vjp = _compact_spline_vjp_requested()
     if compact_spline_vjp:
         _validate_compact_spline_vjp(hidden, d_seed, knots, modes, knot_grid)
@@ -3436,6 +3470,7 @@ def _run_jtok_backward_triton(
             MIXTURE=bool(mixture),
             HAS_MASK=bool(valid_mask.numel()),
             SINGLE_HIDDEN_TILE=bool(single_hidden_tile),
+            ROUTE_VJP_FACTOR=bool(route_vjp_factor),
         )
         # Vectorizing the seed-coordinate reduction removes one tiny program
         # per coordinate.  It is safe for wide hidden rows too: the preceding

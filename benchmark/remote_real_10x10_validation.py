@@ -340,6 +340,7 @@ def main() -> int:
             "synthetic_allowed_for_gate": False,
         },
         "kernel_policy": {
+            "jtok_route_vjp_factor": os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0"),
             "jtok_compact_spline_vjp": os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0"),
             "jtok_projection_split": os.environ.get("JTOK_PROJECTION_SPLIT", "0"),
             "jtok_sparse_coeff_updates": os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0"),
@@ -395,8 +396,9 @@ def main() -> int:
         from cut_cross_entropy.leviathan.runtime_policy import compact_spline_requested
         projection_candidate = os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
         compact_jtok_candidate = os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0") == "1"
+        route_vjp_candidate = os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0") == "1"
         native_jtok_candidate = (os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
-                                 or projection_candidate or compact_jtok_candidate)
+                                 or projection_candidate or compact_jtok_candidate or route_vjp_candidate)
 
         if (compact_spline_requested() or native_jtok_candidate) and args.candidate_manifest is None:
             raise ValueError("candidate validation requires --candidate-manifest")

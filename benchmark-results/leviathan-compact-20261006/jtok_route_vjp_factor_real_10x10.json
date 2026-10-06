@@ -1,0 +1,543 @@
+{
+  "schema": "jtok-route-vjp-factor-real-comparison-v1",
+  "data_kind": "real",
+  "mode": "jtok",
+  "training_steps": 10,
+  "validation_batches": 10,
+  "stable_steps": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "profile_publication_policy": {
+    "raw_trace_included": false,
+    "published_scope": "investigated_kernel_aggregate_and_full_step_time_only"
+  },
+  "full_step_timing": {
+    "compute": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.25993698206730187,
+        "median_seconds": 0.25908558955416083,
+        "min_seconds": 0.25427360413596034,
+        "p95_seconds": 0.2599065870163031,
+        "population_stddev_seconds": 0.0021118787366064596,
+        "steps_per_second": 3.8597283689950417
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.25992037495598197,
+        "median_seconds": 0.25917421700432897,
+        "min_seconds": 0.2573566541541368,
+        "p95_seconds": 0.2599027042160742,
+        "population_stddev_seconds": 0.0010313141084755879,
+        "steps_per_second": 3.8584084927834357
+      },
+      "throughput_gain_percent": -0.03419609064224671,
+      "latency_reduction_percent": -0.034207788368556535
+    },
+    "e2e": {
+      "control": {
+        "count": 6,
+        "max_seconds": 0.2705670811701566,
+        "median_seconds": 0.26921615994069725,
+        "min_seconds": 0.25722917704842985,
+        "p95_seconds": 0.2703811198589392,
+        "population_stddev_seconds": 0.004685337401186687,
+        "steps_per_second": 3.7144872737961916
+      },
+      "candidate": {
+        "count": 6,
+        "max_seconds": 0.27043809299357235,
+        "median_seconds": 0.26931790937669575,
+        "min_seconds": 0.2586108730174601,
+        "p95_seconds": 0.27025784796569496,
+        "population_stddev_seconds": 0.004070724515175603,
+        "steps_per_second": 3.713083924921224
+      },
+      "throughput_gain_percent": -0.037780419517585706,
+      "latency_reduction_percent": -0.037794698513238245
+    }
+  },
+  "trace_summary": {
+    "control": {
+      "_jtok_backward_multi_tile_fast_kernel": {
+        "count": 24,
+        "dur_us": [
+          707.68,
+          741.216,
+          729.408,
+          738.304,
+          699.808,
+          738.24,
+          716.384,
+          728.256,
+          752.48,
+          787.104,
+          766.496,
+          769.216,
+          713.088,
+          742.144,
+          733.536,
+          737.728,
+          704.096,
+          738.336,
+          718.176,
+          727.104,
+          746.592,
+          788.128,
+          758.72,
+          771.488
+        ],
+        "median_us": 738.2719999999999,
+        "total_us": 17753.728,
+        "max_us": 788.128,
+        "resources": [
+          {
+            "registers_per_thread": 56,
+            "shared_memory_bytes": 2048
+          }
+        ]
+      },
+      "_jtok_compact_spline_vjp_kernel": {
+        "count": 24,
+        "dur_us": [
+          443.04,
+          412.0,
+          468.032,
+          473.12,
+          455.04,
+          456.384,
+          465.376,
+          440.352,
+          429.92,
+          441.92,
+          461.343,
+          454.112,
+          434.048,
+          401.632,
+          459.488,
+          462.88,
+          445.152,
+          442.912,
+          455.2,
+          431.584,
+          424.448,
+          431.808,
+          455.136,
+          444.992
+        ],
+        "median_us": 445.072,
+        "total_us": 10689.919,
+        "max_us": 473.12,
+        "resources": [
+          {
+            "registers_per_thread": 56,
+            "shared_memory_bytes": 512
+          }
+        ]
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 24,
+        "dur_us": [
+          298.144,
+          304.256,
+          309.216,
+          311.136,
+          310.24,
+          305.728,
+          304.992,
+          307.072,
+          306.944,
+          318.592,
+          315.072,
+          315.872,
+          292.64,
+          310.688,
+          312.832,
+          309.728,
+          304.544,
+          312.96,
+          305.472,
+          307.328,
+          309.792,
+          312.192,
+          314.144,
+          314.912
+        ],
+        "median_us": 309.76,
+        "total_us": 7414.496,
+        "max_us": 318.592,
+        "resources": [
+          {
+            "registers_per_thread": 179,
+            "shared_memory_bytes": 10240
+          }
+        ]
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 24,
+        "dur_us": [
+          1.503,
+          1.664,
+          1.728,
+          1.921,
+          1.888,
+          1.664,
+          1.696,
+          1.76,
+          1.856,
+          1.856,
+          1.664,
+          1.728,
+          1.504,
+          1.664,
+          1.632,
+          1.76,
+          1.92,
+          1.696,
+          1.728,
+          1.728,
+          1.824,
+          1.664,
+          1.664,
+          1.696
+        ],
+        "median_us": 1.712,
+        "total_us": 41.408,
+        "max_us": 1.921,
+        "resources": [
+          {
+            "registers_per_thread": 39,
+            "shared_memory_bytes": 0
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8064.352,
+          8070.687
+        ],
+        "median_us": 8067.5195,
+        "total_us": 16135.039,
+        "max_us": 8070.687,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    },
+    "candidate": {
+      "_jtok_backward_multi_tile_fast_kernel": {
+        "count": 24,
+        "dur_us": [
+          640.447,
+          663.583,
+          662.175,
+          666.815,
+          639.775,
+          659.775,
+          641.023,
+          659.199,
+          663.615,
+          717.759,
+          686.847,
+          708.479,
+          645.535,
+          664.735,
+          667.167,
+          663.359,
+          642.751,
+          656.671,
+          641.919,
+          662.111,
+          667.071,
+          712.51,
+          682.591,
+          713.504
+        ],
+        "median_us": 663.471,
+        "total_us": 16029.416,
+        "max_us": 717.759,
+        "resources": [
+          {
+            "registers_per_thread": 55,
+            "shared_memory_bytes": 2048
+          }
+        ]
+      },
+      "_jtok_compact_spline_vjp_kernel": {
+        "count": 24,
+        "dur_us": [
+          443.135,
+          411.52,
+          470.591,
+          471.903,
+          453.28,
+          457.119,
+          466.88,
+          440.64,
+          432.48,
+          441.28,
+          466.015,
+          460.192,
+          431.808,
+          404.256,
+          461.504,
+          461.92,
+          440.8,
+          444.032,
+          454.176,
+          431.04,
+          422.656,
+          432.095,
+          456.32,
+          451.552
+        ],
+        "median_us": 447.79200000000003,
+        "total_us": 10707.194,
+        "max_us": 471.903,
+        "resources": [
+          {
+            "registers_per_thread": 56,
+            "shared_memory_bytes": 512
+          }
+        ]
+      },
+      "_jtok_projection_split_kernel": {
+        "count": 24,
+        "dur_us": [
+          298.944,
+          303.231,
+          308.831,
+          310.847,
+          306.879,
+          305.312,
+          301.504,
+          305.823,
+          300.543,
+          315.231,
+          318.207,
+          316.159,
+          293.76,
+          307.583,
+          305.439,
+          307.135,
+          308.799,
+          306.303,
+          306.879,
+          306.911,
+          305.632,
+          314.784,
+          311.967,
+          314.719
+        ],
+        "median_us": 306.895,
+        "total_us": 7381.4220000000005,
+        "max_us": 318.207,
+        "resources": [
+          {
+            "registers_per_thread": 179,
+            "shared_memory_bytes": 10240
+          }
+        ]
+      },
+      "_jtok_projection_split_reduce_kernel": {
+        "count": 24,
+        "dur_us": [
+          1.696,
+          1.824,
+          1.728,
+          1.728,
+          1.824,
+          1.888,
+          2.048,
+          2.016,
+          1.824,
+          1.728,
+          1.696,
+          1.824,
+          1.504,
+          1.888,
+          1.568,
+          1.76,
+          1.728,
+          1.856,
+          1.792,
+          1.664,
+          1.568,
+          1.664,
+          1.536,
+          1.728
+        ],
+        "median_us": 1.728,
+        "total_us": 42.08,
+        "max_us": 2.048,
+        "resources": [
+          {
+            "registers_per_thread": 39,
+            "shared_memory_bytes": 0
+          }
+        ]
+      },
+      "_lev_bwd_ddelta_dot_kernel": {
+        "count": 2,
+        "dur_us": [
+          8057.141,
+          8074.133
+        ],
+        "median_us": 8065.637,
+        "total_us": 16131.274,
+        "max_us": 8074.133,
+        "resources": [
+          {
+            "registers_per_thread": 227,
+            "shared_memory_bytes": 20480
+          }
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "one_pair_of_short_real_runs",
+    "two_profiled_optimizer_steps",
+    "no_repeated_run_confidence_interval",
+    "same_recorded_launch_geometry_not_hardware_counter_evidence",
+    "backward_only_change_no_inference_speedup_claim"
+  ],
+  "variants": {
+    "control": "leviathan_compact_split_projection_compact_spline_vjp",
+    "candidate": "same_plus_unweighted_route_vjp_factor"
+  },
+  "route_vjp_family": {
+    "control": {
+      "count": 24,
+      "dur_us": [
+        707.68,
+        741.216,
+        729.408,
+        738.304,
+        699.808,
+        738.24,
+        716.384,
+        728.256,
+        752.48,
+        787.104,
+        766.496,
+        769.216,
+        713.088,
+        742.144,
+        733.536,
+        737.728,
+        704.096,
+        738.336,
+        718.176,
+        727.104,
+        746.592,
+        788.128,
+        758.72,
+        771.488
+      ],
+      "median_us": 738.2719999999999,
+      "total_us": 17753.728,
+      "max_us": 788.128,
+      "resources": [
+        {
+          "registers_per_thread": 56,
+          "shared_memory_bytes": 2048
+        }
+      ]
+    },
+    "candidate": {
+      "count": 24,
+      "dur_us": [
+        640.447,
+        663.583,
+        662.175,
+        666.815,
+        639.775,
+        659.775,
+        641.023,
+        659.199,
+        663.615,
+        717.759,
+        686.847,
+        708.479,
+        645.535,
+        664.735,
+        667.167,
+        663.359,
+        642.751,
+        656.671,
+        641.919,
+        662.111,
+        667.071,
+        712.51,
+        682.591,
+        713.504
+      ],
+      "median_us": 663.471,
+      "total_us": 16029.416,
+      "max_us": 717.759,
+      "resources": [
+        {
+          "registers_per_thread": 55,
+          "shared_memory_bytes": 2048
+        }
+      ]
+    },
+    "median_latency_reduction_percent": 10.13190260500194,
+    "profiled_saving_ms_per_step": 0.8621559999999999,
+    "profiled_steps": 2,
+    "calls_per_step": 12,
+    "not_gate_population": true,
+    "launch_geometry": {
+      "control": [
+        {
+          "calls": 24,
+          "block": [
+            64,
+            1,
+            1
+          ],
+          "grid": [
+            32768,
+            1,
+            1
+          ],
+          "registers per thread": 56,
+          "shared memory": 2048
+        }
+      ],
+      "candidate": [
+        {
+          "calls": 24,
+          "block": [
+            64,
+            1,
+            1
+          ],
+          "grid": [
+            32768,
+            1,
+            1
+          ],
+          "registers per thread": 55,
+          "shared memory": 2048
+        }
+      ]
+    }
+  },
+  "acceptance_gate": {
+    "metric": "stable_compute_steps_per_second",
+    "required_steps_per_second": 4.5,
+    "achieved": false
+  },
+  "engineering_decision": "diagnostic_opt_in_no_observed_full_step_gain"
+}
