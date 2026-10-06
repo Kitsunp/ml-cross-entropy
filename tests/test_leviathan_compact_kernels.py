@@ -91,6 +91,25 @@ def test_compact_compiler_forward_rejection_cannot_use_reference(monkeypatch) ->
         compiler._saved_or_reference(torch.tensor([0]), {}, object())
 
 
+@pytest.mark.parametrize("native_result", ["unavailable", "rejected", "incomplete"])
+def test_observed_compiler_requires_native_checkpoints_without_compact_flag(monkeypatch, native_result) -> None:
+    monkeypatch.setenv("LEV_COMPACT_SPLINE", "0")
+
+    def native(*args, **kwargs):
+        if native_result == "rejected":
+            raise ValueError("unsupported observed metadata")
+        return torch.zeros(1, 4), {"z": torch.zeros(1, 2)}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("observed forward entered the reference fallback")
+
+    monkeypatch.setattr(compiler, "_leviathan_forward", None if native_result == "unavailable" else native)
+    monkeypatch.setattr(compiler, "leviathan_forward_ref", forbidden)
+    error = ValueError if native_result == "rejected" else RuntimeError
+    with pytest.raises(error):
+        compiler._saved_or_reference(torch.tensor([0]), {}, object(), require_native_checkpoints=True)
+
+
 def test_compact_compiler_backward_rejection_cannot_use_reference(monkeypatch) -> None:
     monkeypatch.setattr(compiler, "_leviathan_backward_triton", lambda *a, **kw: None)
 

@@ -1358,3 +1358,38 @@ def test_jtokm_routing_metrics_support_all_top_k(top_k: int) -> None:
     assert output.shape == values["delta"].shape
     assert math.isfinite(float(stats["load_cv"]))
     assert 0 <= float(stats["active_experts"]) <= 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mixture", [False, True], ids=["plain", "mixture"])
+def test_native_dynamics_checkpoints_borrow_existing_autograd_storage(mixture):
+    """Exposing observations must not allocate duplicate mode/route buffers."""
+    values = _inputs(device="cuda", dtype=torch.bfloat16, n=5, hidden=257,
+                     d_seed=7, modes=3, experts=3 if mixture else 1)
+    delta = values["delta"].requires_grad_()
+    common = (values["coeff"], values["spline_out"], values["residual_out"], values["scaler"])
+    if mixture:
+        output, stats = jtokm_apply(delta, values["z"], values["router_state"], *common,
+                                    values["router_weight"], values["grid"], top_k=2,
+                                    backend="triton", return_dynamics_checkpoints=True)
+        checkpoints = stats["dynamics_checkpoints"]
+    else:
+        output, checkpoints = jtok_apply(delta, values["z"], *common, values["grid"],
+                                         backend="triton", return_dynamics_checkpoints=True)
+    # The final reshape borrows storage too. Find the registered custom-op
+    # node rather than assuming an implementation-specific ViewBackward depth.
+    node = output.grad_fn
+    while not hasattr(node, "saved_tensors"):
+        node = node.next_functions[0][0]
+    pointers = {tensor.data_ptr() for tensor in node.saved_tensors}
+    assert len(checkpoints) == 3
+    assert all(not tensor.requires_grad and tensor.data_ptr() in pointers for tensor in checkpoints)
+
+
+def test_native_dynamics_checkpoints_reject_unavailable_cpu_checkpoints():
+    from cut_cross_entropy.leviathan import compiler
+    for entrypoint in (compiler.leviathan_embedding_compiler_safe,
+                       compiler.leviathan_embedding_with_seed_compiler_safe):
+        with pytest.raises(RuntimeError, match="CUDA training checkpoints"):
+            entrypoint(torch.tensor([0]), {"codebooks": torch.ones(1, 1, 1)},
+                       object(), torch.zeros(1), return_dynamics_checkpoints=True)

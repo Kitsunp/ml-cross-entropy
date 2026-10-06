@@ -79,6 +79,7 @@ def _saved_or_reference(
     fuse_gather: bool | None = None,
     mask_embedding: torch.Tensor | None = None,
     mask_token_id: int | None = None,
+    require_native_checkpoints: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Run LEV and optionally return the lean tensors required for backward."""
     if _leviathan_forward is not None:
@@ -97,9 +98,13 @@ def _saved_or_reference(
             if not save_intermediates and not return_seed:
                 return embeds, {}
             if saved is not None:
+                if require_native_checkpoints and any(
+                    saved.get(name) is None for name in ("z", "x_hat_por_head", "modes_por_head")
+                ):
+                    raise RuntimeError("native training checkpoints were not produced")
                 return embeds, saved
         except (TypeError, ValueError, AttributeError):
-            if compact_spline_requested():
+            if compact_spline_requested() or require_native_checkpoints:
                 raise
             # The reference path is the semantic fallback for unsupported
             # metadata/configurations. Do not catch CUDA launch failures here:
@@ -107,7 +112,7 @@ def _saved_or_reference(
             # surrounding CUDA-graph/FlashAttention partition.
             pass
 
-    if compact_spline_requested():
+    if compact_spline_requested() or require_native_checkpoints:
         raise RuntimeError("compact Leviathan forward requires Triton checkpoints")
     with torch.no_grad():
         embeds, saved = leviathan_forward_ref(
@@ -152,6 +157,7 @@ def _leviathan_forward_impl(
     *,
     return_seed: bool = False,
     fuse_gather: bool | None = None,
+    require_native_checkpoints: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -185,6 +191,7 @@ def _leviathan_forward_impl(
     forward_kwargs = {
         "return_seed": return_seed,
         "fuse_gather": fuse_gather,
+        "require_native_checkpoints": require_native_checkpoints,
         "mask_embedding": mask_embedding.detach() if has_meap else None,
         "mask_token_id": mask_token_id if has_meap else None,
     }
@@ -1164,6 +1171,75 @@ torch.library.register_autograd(
 )
 
 
+@torch.library.custom_op(
+    "cut_cross_entropy::leviathan_observed_forward",
+    mutates_args=(), device_types="cuda", tags=(torch.Tag.cudagraph_unsafe,),
+)
+def _leviathan_observed_forward_op(
+    ids: torch.Tensor,
+    codebooks: torch.Tensor,
+    head_proj_weight: torch.Tensor,
+    head_norm_weight: torch.Tensor,
+    head_norm_bias: torch.Tensor,
+    head_spline_delta: torch.Tensor,
+    head_out_weight: torch.Tensor,
+    knot_grid: torch.Tensor,
+    mask_embedding: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    hidden_size: int,
+    d_seed: int,
+    num_modes: int,
+    num_knots: int,
+    spline_degree: int,
+    generator_k: int,
+    krank: int,
+    with_seed: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose existing training intermediates, with no reference placeholders.
+
+    The caller owns any read-only observation. Native forward math, gather
+    policy, checkpoint layouts and gradient ownership match the selected op.
+    """
+    return _leviathan_forward_impl(
+        ids, codebooks, head_proj_weight, head_norm_weight, head_norm_bias,
+        head_spline_delta, head_out_weight, knot_grid, mask_embedding, mask_token_id,
+        vocab_size, hidden_size, d_seed, num_modes, num_knots, spline_degree,
+        generator_k, krank, return_seed=with_seed,
+        fuse_gather=True if with_seed else None, require_native_checkpoints=True,
+    )
+
+
+@_leviathan_observed_forward_op.register_fake
+def _leviathan_observed_forward_fake(*args):
+    return _leviathan_forward_fake(*args[:-1])
+
+
+def _leviathan_observed_setup_context(ctx, inputs, output):
+    ctx.with_seed = bool(inputs[-1])
+    setup = _leviathan_with_seed_setup_context if ctx.with_seed else _leviathan_setup_context
+    setup(ctx, inputs[:-1], output)
+
+
+def _leviathan_observed_backward(ctx, *grads):
+    backward = _leviathan_with_seed_backward if ctx.with_seed else _leviathan_backward
+    return (*backward(ctx, *grads), None)
+
+
+torch.library.register_autograd(_leviathan_observed_forward_op, _leviathan_observed_backward,
+                                setup_context=_leviathan_observed_setup_context)
+
+
+def _validate_dynamics_checkpoints(ids, params) -> None:
+    if not ids.is_cuda or not params["codebooks"].is_cuda:
+        raise RuntimeError("Leviathan dynamics require CUDA training checkpoints")
+    if not torch.is_grad_enabled() or not any(
+        tensor.requires_grad for name, tensor in params.items() if name != "knot_grid"
+    ):
+        raise RuntimeError("Leviathan dynamics require CUDA training checkpoints")
+
+
 def leviathan_embedding_compiler_safe(
     ids: torch.Tensor,
     params: dict[str, torch.Tensor],
@@ -1172,13 +1248,16 @@ def leviathan_embedding_compiler_safe(
     *,
     mask_embedding: torch.Tensor | None = None,
     mask_token_id: int | None = None,
-) -> torch.Tensor:
+    return_dynamics_checkpoints: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Run LEV through the opaque CUDA boundary or the model fallback.
 
     When both MEAP arguments are present, the CUDA path selects the dedicated
     vector in Leviathan's final GEMM epilogue. The backward sends masked rows
     only to ``mask_embedding`` and zeroes them before the LEV parameter path.
     """
+    if return_dynamics_checkpoints:
+        _validate_dynamics_checkpoints(ids, params)
     has_meap = mask_embedding is not None or mask_token_id is not None
     if has_meap:
         if mask_embedding is None or mask_token_id is None:
@@ -1213,7 +1292,8 @@ def leviathan_embedding_compiler_safe(
     )
     mask_needs_backward = grad_enabled and has_meap and mask_embedding.requires_grad
     needs_backward = leviathan_needs_backward
-    op = _leviathan_forward_op if needs_backward else _leviathan_inference_op
+    op = (_leviathan_observed_forward_op if return_dynamics_checkpoints
+          else _leviathan_forward_op if needs_backward else _leviathan_inference_op)
     external_mask_grad = mask_needs_backward and not leviathan_needs_backward
     fuse_mask_in_kernel = has_meap and not external_mask_grad
     kernel_mask_embedding = (
@@ -1243,6 +1323,7 @@ def leviathan_embedding_compiler_safe(
         int(cfg.generator_spline_degree),
         int(cfg.generator_k),
         int(getattr(cfg, "generator_krank", params["head_spline_delta"].shape[-1])),
+        *((False,) if return_dynamics_checkpoints else ()),
     )
     output = result[0] if needs_backward else result
     if external_mask_grad:
@@ -1255,6 +1336,8 @@ def leviathan_embedding_compiler_safe(
             mask_embedding.to(device=output.device, dtype=output.dtype),
             output,
         )
+    if return_dynamics_checkpoints:
+        return output, (result[1].detach(), result[2].detach(), result[5].detach())
     return output
 
 
@@ -1295,7 +1378,10 @@ def leviathan_embedding_with_seed_compiler_safe(
     *,
     mask_embedding: torch.Tensor | None = None,
     mask_token_id: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_dynamics_checkpoints: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[
+    torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+]:
     """Run Leviathan and expose the *same* kernel-produced seed to JTok.
 
     CUDA training uses a multi-output custom op.  Leviathan's A stage writes
@@ -1305,6 +1391,8 @@ def leviathan_embedding_with_seed_compiler_safe(
     retain the differentiable bridge because the Triton custom op is CUDA
     only.
     """
+    if return_dynamics_checkpoints:
+        _validate_dynamics_checkpoints(ids, params)
     has_meap = mask_embedding is not None or mask_token_id is not None
     if has_meap:
         if mask_embedding is None or mask_token_id is None:
@@ -1367,7 +1455,8 @@ def leviathan_embedding_with_seed_compiler_safe(
         int(getattr(cfg, "generator_krank", params["head_spline_delta"].shape[-1])),
     )
     if needs_backward:
-        result = _leviathan_forward_with_seed_op(*args)
+        result = (_leviathan_observed_forward_op(*args, True) if return_dynamics_checkpoints
+                  else _leviathan_forward_with_seed_op(*args))
         embedding, seed = result[0], result[1]
     else:
         embedding, seed = _leviathan_inference_with_seed_op(*args)
@@ -1377,6 +1466,9 @@ def leviathan_embedding_with_seed_compiler_safe(
             mask_embedding.to(device=embedding.device, dtype=embedding.dtype),
             embedding,
         )
+    if return_dynamics_checkpoints:
+        checkpoints = (result[1].detach(), result[2].detach(), result[5].detach())
+        return embedding, seed.reshape(*ids.shape, int(cfg.generator_d_seed)), checkpoints
     return embedding, seed.reshape(*ids.shape, int(cfg.generator_d_seed))
 
 

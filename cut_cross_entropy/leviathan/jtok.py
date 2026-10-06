@@ -4265,7 +4265,8 @@ def jtok_apply(
     valid_mask: Optional[torch.Tensor] = None,
     norm_eps: float = _DEFAULT_NORM_EPS,
     backend: Backend = "auto",
-) -> torch.Tensor:
+    return_dynamics_checkpoints: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Apply JTok using the explicit Torch or strict Triton backend."""
     if spline_coeff.shape[0] != 1:
         raise ValueError("plain JTok requires exactly one expert")
@@ -4283,7 +4284,7 @@ def jtok_apply(
         (dm, z, coeff, out_weight, residual, scale, grid),
     )
     if use_kernel:
-        output, _ = _jtok_forward_op(
+        output, modes_buffer = _jtok_forward_op(
             dm,
             z,
             coeff,
@@ -4297,6 +4298,8 @@ def jtok_apply(
             float(norm_eps),
         )
     else:
+        if return_dynamics_checkpoints:
+            raise RuntimeError("native JToK dynamics require the Triton backend")
         output = jtok_reference(
             dm,
             z,
@@ -4308,6 +4311,8 @@ def jtok_apply(
             valid_mask=(mask if mask.numel() else None),
             norm_eps=norm_eps,
         )
+    if return_dynamics_checkpoints:
+        return output.reshape(orig_shape), (modes_buffer.detach(), expert_idx, selected_weights.detach())
     return output.reshape(orig_shape)
 
 
@@ -4328,7 +4333,8 @@ def jtokm_apply(
     residual_scale: float = 1.0,
     compute_aux: bool = False,
     backend: Backend = "auto",
-) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
+    return_dynamics_checkpoints: bool = False,
+) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]]:
     """Apply JTok-M and optionally return compact balance diagnostics."""
     dm, z, orig_shape = _flatten_inputs(delta_m, z_tilde, delta_m.shape[-1])
     h = _flatten_aux_input(
@@ -4366,7 +4372,7 @@ def jtokm_apply(
         (dm, z, coeff, out_weight, residual, scale, router_weight, grid),
     )
     if use_kernel:
-        output, _ = _jtokm_forward_op(
+        output, modes_buffer = _jtokm_forward_op(
             dm,
             z,
             coeff,
@@ -4381,6 +4387,8 @@ def jtokm_apply(
             float(residual_scale),
         )
     else:
+        if return_dynamics_checkpoints:
+            raise RuntimeError("native JToK-M dynamics require the Triton backend")
         # Keep ``backend='torch'`` as the fair torch.compile baseline.  It
         # deliberately follows the model's dense reference path, including
         # the all-expert surface tensor.  The external Triton path below is
@@ -4410,6 +4418,9 @@ def jtokm_apply(
         if compute_aux
         else None
     )
+    if return_dynamics_checkpoints:
+        stats = {} if stats is None else stats
+        stats["dynamics_checkpoints"] = (modes_buffer.detach(), expert_idx, selected_weights.detach())
     return output.reshape(orig_shape), stats
 
 

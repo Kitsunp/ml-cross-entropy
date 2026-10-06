@@ -116,9 +116,14 @@ def apply_neollm_jtok(
     valid_mask: torch.Tensor | None = None,
     compute_aux: bool = False,
     backend: str = "auto",
+    return_dynamics_checkpoints: bool = False,
 ) -> tuple[
     torch.Tensor,
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+] | tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
     """Dispatch a NeoLLM ``LeviathanJTok`` module to the external kernel.
 
@@ -173,6 +178,7 @@ def apply_neollm_jtok(
             residual_scale=float(jtok_module.jtokm_residual_scale),
             compute_aux=compute_aux,
             backend=backend,  # type: ignore[arg-type]
+            return_dynamics_checkpoints=return_dynamics_checkpoints,
         )
         # NeoLLM's decoder-layer output contract predates the richer kernel
         # diagnostics and consumes exactly (P_sum, n_sum, T).  Keep that
@@ -180,9 +186,11 @@ def apply_neollm_jtok(
         # jtokm_apply directly, which returns the complete metrics mapping.
         compact_stats = (
             (stats["p_sum"], stats["f_sum"], stats["valid_tokens"])
-            if stats is not None
+            if stats is not None and compute_aux
             else None
         )
+        if return_dynamics_checkpoints:
+            return output, compact_stats, stats["dynamics_checkpoints"]
         return output, compact_stats
 
     output = jtok_apply(
@@ -196,7 +204,11 @@ def apply_neollm_jtok(
         valid_mask=valid_mask,
         norm_eps=float(jtok_module.norm_eps),
         backend=backend,  # type: ignore[arg-type]
+        return_dynamics_checkpoints=return_dynamics_checkpoints,
     )
+    if return_dynamics_checkpoints:
+        output, checkpoints = output
+        return output, None, checkpoints
     return output, None
 
 
