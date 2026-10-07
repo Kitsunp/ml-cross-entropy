@@ -6,6 +6,11 @@ the Triton custom-op, autograd, ``torch.compile`` and ``opcheck`` boundaries.
 The tests keep MEAP validity separate from CCE/MiLe masks; the model-level
 integration owns that distinction, while this package only consumes the
 already-computed ``valid_mask``.
+
+Normalization regressions cover finite products, additive epsilon, and expert
+cancellation. The external foreach-norm limitation remains a strict xfail;
+the kernel cannot repair an optimizer's reduction. These synthetic cases do
+not identify the first failing batch of a particular training run.
 """
 
 from __future__ import annotations
@@ -1393,3 +1398,322 @@ def test_native_dynamics_checkpoints_reject_unavailable_cpu_checkpoints():
         with pytest.raises(RuntimeError, match="CUDA training checkpoints"):
             entrypoint(torch.tensor([0]), {"codebooks": torch.ones(1, 1, 1)},
                        object(), torch.zeros(1), return_dynamics_checkpoints=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("hidden", [13, 513, 1025])
+@pytest.mark.parametrize("mixture", [False, True], ids=["jtok", "jtokm"])
+def test_normalization_forward_handles_finite_surface_near_fp32_limit(hidden, mixture):
+    """The direction is representable even when the true norm exceeds FP32."""
+    import triton
+    surface = torch.full((1, hidden), 3e38, device="cuda")
+    delta = torch.full((1, hidden), 0.125, device="cuda", dtype=torch.bfloat16)
+    scaler = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    valid = torch.ones(1, device="cuda", dtype=torch.bool)
+    output = torch.empty_like(delta)
+    jtok_impl._jtok_finalize_kernel[(1,)](
+        delta, surface, scaler, valid, output, 1, HIDDEN=hidden,
+        BLOCK_N=min(1024, triton.next_power_of_2(hidden)), NORM_EPS=1e-6,
+        RESIDUAL_SCALE=1.0, MIXTURE=mixture, HAS_MASK=True,
+        num_warps=4, num_stages=1,
+    )
+    direction = 1.0 / math.sqrt(hidden)
+    expected = 0.125 + direction if mixture else 0.125 * (1.0 + direction)
+    torch.testing.assert_close(output.float(), torch.full_like(output.float(), expected),
+                               rtol=5e-3, atol=5e-4)
+
+
+def _normalization_vjp_oracle(
+    surface: torch.Tensor, factor: torch.Tensor, eps: float,
+) -> torch.Tensor:
+    """Differentiate the actual additive-epsilon forward, independently in FP64.
+
+    This intentionally does not copy the package's manual VJP: copying that
+    expression into the oracle would hide both its epsilon mismatch and its
+    overflow-prone intermediate products.  Inputs are finite; no NaN repair or
+    clipping is applied.  The exact failing training batch is not reconstructed.
+    """
+    surface64 = surface.detach().cpu().double()
+    factor64 = factor.detach().cpu().double()
+    radius = surface64.norm(dim=-1, keepdim=True)
+    unit = surface64 / torch.where(radius > 0, radius, torch.ones_like(radius))
+    radial_factor = (factor64 * unit).sum(-1, keepdim=True)
+    tangent = factor64 - unit * radial_factor
+    denominator = radius + eps
+    # The radial eigenvalue eps/(r+eps)^2 must not be recovered by subtracting
+    # two nearly equal 1/r terms. Even naive FP64 autograd loses it for r>>eps.
+    return tangent / denominator + unit * radial_factor * (eps / denominator.square())
+
+
+def test_normalization_oracle_matches_autograd_at_resolvable_radii():
+    surface = torch.tensor([[0.0, 0.0], [1e-6, 0.0], [1e-3, 2e-3], [1.0, 0.0]],
+                           dtype=torch.float64, requires_grad=True)
+    factor = torch.tensor([[1.0, 0.25]] * 4, dtype=torch.float64)
+    direction = surface / (surface.norm(dim=-1, keepdim=True) + 1e-6)
+    autograd = torch.autograd.grad((direction * factor).sum(), surface)[0]
+    torch.testing.assert_close(_normalization_vjp_oracle(surface, factor, 1e-6),
+                               autograd, rtol=1e-8, atol=1e-12)
+
+
+@pytest.mark.parametrize("mixture", [False, True], ids=["jtok", "jtokm"])
+@pytest.mark.parametrize("radius", [0.0, 1e-6, 1e13, 1e20],
+                         ids=["zero_radius", "epsilon_radius", "finite_cubed_norm_overflow", "finite_large_surface"])
+def test_normalization_formula_breakpoint_matches_forward_derivative(
+    mixture: bool, radius: float,
+) -> None:
+    """CPU reproduction of the shared formula's defects, not a training gate."""
+    eps = 1e-6
+    delta = torch.full((1, 1), 0.125)
+    z = torch.zeros(1, 1)
+    coeff = torch.ones(1, 1, 1, 1)
+    surface = torch.full((1, 1), radius)
+    factor = torch.ones_like(surface) if mixture else delta
+    expected = _normalization_vjp_oracle(surface, factor, eps)
+    gradients = jtok_impl._run_jtok_backward_formula(
+        torch.ones_like(delta), delta, z, coeff, surface.reshape(1, 1, 1),
+        torch.zeros(1, 1, 1), torch.ones(1),
+        torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1),
+        torch.zeros(1), torch.ones(1, dtype=torch.bool),
+        norm_eps=eps, residual_scale=1.0, mixture=mixture,
+    )
+    actual = gradients[3].reshape_as(surface)  # One unit mode: dW_out == du.
+    assert torch.isfinite(surface).all() and torch.isfinite(expected).all()
+    assert torch.isfinite(actual).all(), "Finite inputs produced a nonfinite normalization VJP"
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-5,
+                               atol=torch.finfo(torch.float32).tiny * torch.finfo(torch.float32).eps)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tiled", [False, True], ids=["complete_row", "tiled"])
+@pytest.mark.parametrize("mixture", [False, True], ids=["jtok", "jtokm"])
+@pytest.mark.parametrize("radius", [0.0, 1e-6, 1e13, 1e20],
+                         ids=["zero_radius", "epsilon_radius", "finite_cubed_norm_overflow", "finite_large_surface"])
+def test_normalization_triton_breakpoint_matches_forward_derivative(
+    mixture: bool, radius: float, tiled: bool,
+) -> None:
+    """Isolate the real 512-wide VJP kernel with a fixed, non-autotuned launch.
+
+    The surface is supplied at the projection/normalization boundary rather
+    than derived from spline coefficients, so the first failing operation can
+    be attributed to normalization.  This is not an end-to-end reproduction of
+    the training failure.  Geometry matches H=512, d_seed=128, M=4, E=5, K=2
+    for JToK-M; JToK uses its single-route contract.  Production flags, weights,
+    and optimizer state are never changed.
+    """
+    n, hidden, d_seed, modes = 1, 512, 128, 4
+    experts, top_k, eps = (5, 2, 1e-6) if mixture else (1, 1, 1e-6)
+    delta = torch.full((n, hidden), 0.125, device="cuda", dtype=torch.bfloat16)
+    z = torch.zeros(n, d_seed, device="cuda", dtype=torch.bfloat16)
+    out = torch.ones(experts, modes, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.zeros(experts, d_seed, hidden, device="cuda", dtype=torch.bfloat16)
+    scaler = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    routes = torch.arange(top_k, device="cuda").reshape(n, top_k)
+    weights = torch.full((n, top_k), 1.0 / top_k, device="cuda")
+    mode_values = torch.ones(n, top_k, modes, device="cuda")
+    grad_mode = torch.empty_like(mode_values)
+    grad_residual = torch.empty(n, top_k, d_seed, device="cuda")
+    grad_out = torch.zeros_like(delta)
+    grad_out[:, 0] = 1
+    surface = torch.zeros(n, hidden, device="cuda")
+    surface[:, 0] = radius
+    factor = grad_out.float() if mixture else grad_out.float() * delta.float()
+    expected = _normalization_vjp_oracle(surface, factor, eps)
+    norm_stats = torch.empty(2 * n, device="cuda")
+    norm_dot = torch.empty(n, device="cuda")
+    valid = torch.ones(n, device="cuda", dtype=torch.bool)
+    grad_delta = torch.empty_like(delta)
+    grad_scaler = torch.zeros(hidden, device="cuda")
+    grad_weights = torch.empty_like(weights)
+    block_h = 256 if tiled else hidden
+    if tiled:
+        jtok_impl._jtok_backward_norm_dot_kernel[(n,)](
+            surface, delta, scaler, grad_out, valid, norm_dot, norm_stats, n,
+            HIDDEN=hidden, BLOCK_H=block_h, NUM_TILES=2, NORM_EPS=eps,
+            RESIDUAL_SCALE=1.0, MIXTURE=mixture, HAS_MASK=True,
+            num_warps=4, num_stages=1,
+        )
+        grad_mode.zero_()
+        grad_residual.zero_()
+        grad_weights.zero_()
+    # The production kernel writes its FP32 surface VJP back to this workspace.
+    jtok_impl._jtok_backward_multi_tile_fast_kernel.fn[(n, 2 if tiled else 1)](
+        delta, z, out, residual, routes, weights, mode_values,
+        grad_mode, grad_residual, scaler, surface, norm_stats, norm_dot,
+        grad_out, valid, grad_delta, grad_scaler, grad_weights, n,
+        D_SEED=d_seed, NUM_MODES=modes, TOP_K=top_k, HIDDEN=hidden,
+        BLOCK_H=block_h, NORM_EPS=eps, RESIDUAL_SCALE=1.0,
+        MIXTURE=mixture, HAS_MASK=True, SINGLE_HIDDEN_TILE=not tiled,
+        ROUTE_VJP_FACTOR=False, num_warps=4, num_stages=1,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(expected).all()
+    assert torch.isfinite(surface).all(), "Real Triton VJP is nonfinite for finite surface input"
+    torch.testing.assert_close(surface.cpu().double(), expected, rtol=2e-5,
+                               atol=torch.finfo(torch.float32).tiny * torch.finfo(torch.float32).eps)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("hidden", [13, 512, 1025], ids=["narrow", "wide", "streamed"])
+@pytest.mark.parametrize("mixture", [False, True], ids=["jtok", "jtokm"])
+@pytest.mark.parametrize("coefficient", [
+    pytest.param(1.0, id="finite_control"),
+    pytest.param(1.25, id="finite_cubic_norm_overflow"),
+    pytest.param(1.5, id="finite_squared_norm_overflow"),
+])
+def test_native_finite_spline_products_do_not_poison_backward(monkeypatch, mixture, coefficient, hidden):
+    """Regress the numerical failure through the public native API, not a mock.
+
+    Constant coefficients and a partition-of-unity basis give finite modes
+    near coefficient**128. Previously 1.25 overflowed the cubed norm and
+    introduced a spurious radial gradient; 1.5 overflowed the squared norm,
+    silently dropping the normalized branch and poisoning backward. Both use the
+    same positive surfaces;
+    the mixture has neither router saturation nor expert cancellation here.
+    This synthetic edge is not proof that the training run reached this state.
+    """
+    for name in ("JTOK_SPARSE_COEFF_UPDATES", "JTOK_PROJECTION_SPLIT",
+                 "JTOK_COMPACT_SPLINE_VJP", "JTOK_ROUTE_VJP_FACTOR"):
+        monkeypatch.setenv(name, "0")
+    n, d_seed, knots, modes = 1, 128, 16, 4
+    experts = 5 if mixture else 1
+    dtype, device = torch.bfloat16, "cuda"
+    values = {
+        "delta": torch.full((n, hidden), 0.125, device=device, dtype=dtype),
+        "z": torch.full((n, d_seed), 0.5, device=device, dtype=dtype),
+        "coeff": torch.full((experts, modes, d_seed, knots), coefficient, device=device, dtype=dtype),
+        "out": torch.full((experts, modes, hidden), 0.125, device=device, dtype=dtype),
+        "residual": torch.zeros(experts, d_seed, hidden, device=device, dtype=dtype),
+        "scaler": torch.ones(hidden, device=device, dtype=dtype),
+    }
+    if mixture:
+        values["router_state"] = torch.ones(n, hidden, device=device, dtype=dtype)
+        values["router_weight"] = torch.zeros(experts, hidden, device=device, dtype=dtype)
+    values = {k: v.requires_grad_() for k, v in values.items()}
+    grid = torch.linspace(0.0, 1.0, knots, device=device)
+    common = (values["coeff"], values["out"], values["residual"], values["scaler"])
+    if mixture:
+        output, stats = jtokm_apply(
+            values["delta"], values["z"], values["router_state"], *common,
+            values["router_weight"], grid, top_k=2, backend="triton",
+            return_dynamics_checkpoints=True,
+        )
+        checkpoints = stats["dynamics_checkpoints"]
+    else:
+        output, checkpoints = jtok_apply(
+            values["delta"], values["z"], *common, grid, backend="triton",
+            return_dynamics_checkpoints=True,
+        )
+    assert all(torch.isfinite(v).all() for v in values.values())
+    assert torch.isfinite(checkpoints[0]).all(), "Product overflow preceded normalization"
+    assert torch.isfinite(output).all(), "The first observed failure is already in forward"
+    (output.float() * 1e-5).sum().backward()
+    nonfinite_gradients = [k for k, v in values.items()
+                          if v.grad is not None and not torch.isfinite(v.grad).all()]
+    direction = 1.0 / math.sqrt(hidden)
+    expected = (0.125 + direction) if mixture else (0.125 * (1.0 + direction))
+    correct_forward = torch.allclose(output.float(), torch.full_like(output.float(), expected),
+                                     rtol=5e-3, atol=2e-3)
+    coefficient_gradient_max = values["coeff"].grad.float().abs().max().item()
+    # All surfaces and the probe are parallel to the all-ones vector. The
+    # exact radial response is O(eps/r^2), not O(1/r). At coefficient=1.25
+    # roundoff is safely below this absolute budget, whereas losing the
+    # projector's cancellation introduces gradients around 1e-5.
+    radial_gradient_correct = coefficient > 1.25 or coefficient_gradient_max < 1e-8
+    assert not nonfinite_gradients and correct_forward and radial_gradient_correct, {
+        "inputs_finite": True, "product_modes_finite": True, "forward_finite": True,
+        "forward_has_correct_normalized_branch": correct_forward,
+        "nonfinite_gradient_inputs": nonfinite_gradients,
+        "coefficient_gradient_max": coefficient_gradient_max,
+        "radial_gradient_correct": radial_gradient_correct,
+    }
+
+
+def _cancelled_mixture_fixture(coefficient: float, *, near: bool = False,
+                               saturated: bool = False, hidden: int = 512):
+    """Two finite opposite expert surfaces; all other experts are unselected."""
+    values = _inputs(device="cuda", dtype=torch.bfloat16, n=1, hidden=hidden,
+                     d_seed=128, knots=16, modes=4, experts=5)
+    values["delta"].fill_(0.125)
+    values["z"].fill_(0.5)
+    values["coeff"].fill_(coefficient)
+    values["spline_out"].zero_()
+    values["spline_out"][0].fill_(0.125)
+    values["spline_out"][1].fill_(-0.125)
+    values["residual_out"].zero_()
+    values["scaler"].fill_(1.0)
+    values["router_state"].fill_(1.0)
+    values["router_weight"].fill_(-0.125)
+    values["router_weight"][:2].zero_()
+    if near:
+        values["router_weight"][0].fill_(2.0 ** -27)
+    if saturated:
+        values["router_weight"].fill_(-1.0)
+    for key, value in values.items():
+        if key != "grid":
+            value.requires_grad_()
+    output, stats = jtokm_apply(
+        values["delta"], values["z"], values["router_state"], values["coeff"],
+        values["spline_out"], values["residual_out"], values["scaler"],
+        values["router_weight"], values["grid"], top_k=2, backend="triton",
+        return_dynamics_checkpoints=True,
+    )
+    return values, output, stats["dynamics_checkpoints"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("saturated", [False, True], ids=["exact_cancel", "zero_router_mass"])
+def test_jtokm_finite_cancellation_and_saturated_router_controls(saturated, record_property):
+    values, output, checkpoints = _cancelled_mixture_fixture(1.0, saturated=saturated)
+    (output.float() * 1e-5).sum().backward()
+    assert torch.isfinite(output).all() and torch.equal(output, values["delta"])
+    assert all(torch.isfinite(v.grad).all() for v in values.values() if v.grad is not None)
+    router_max = values["router_weight"].grad.float().abs().max().item()
+    weight_sum = checkpoints[2].sum().item()
+    record_property("numerical_diagnosis", {"router_gradient_max": router_max,
+                                           "selected_weight_sum": weight_sum})
+    assert weight_sum == (0.0 if saturated else 1.0)
+    assert router_max == 0.0 if saturated else router_max > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("hidden", [512, 1025], ids=["complete_row", "streamed"])
+def test_jtokm_nearly_cancelled_experts_match_independent_vjp(record_property, hidden):
+    """Unit coefficients can reach the sensitive epsilon regime via routing."""
+    values, output, checkpoints = _cancelled_mixture_fixture(1.0, near=True, hidden=hidden)
+    (output.float() * 1e-5).sum().backward()
+    routes, weights = checkpoints[1].cpu(), checkpoints[2].cpu().double()
+    signs = torch.where(routes == 0, 1.0, -1.0).double()
+    surface = (0.5 * (weights * signs).sum(-1, keepdim=True)).expand(1, hidden)
+    incoming = torch.full((1, hidden), 1e-5, dtype=torch.bfloat16).float()
+    expected_surface_vjp = _normalization_vjp_oracle(surface, incoming, 1e-6)
+    expected = torch.zeros_like(values["spline_out"], device="cpu", dtype=torch.float64)
+    for slot in range(2):
+        expected[int(routes[0, slot])] = weights[0, slot] * expected_surface_vjp
+    actual = values["spline_out"].grad.detach().cpu().double()
+    relative_error = ((actual - expected).abs().max() / expected.abs().max()).item()
+    record_property("numerical_diagnosis", {
+        "mixed_surface_norm": surface.norm().item(), "selected_weight_sum": weights.sum().item(),
+        "projection_gradient_relative_error": relative_error,
+    })
+    assert torch.isfinite(actual).all() and torch.isfinite(output).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.xfail(strict=True, reason="External foreach-norm overflow: not repaired by the JToK kernel")
+def test_jtokm_large_cancelled_experts_keep_gradient_norm_representable(record_property):
+    """Audit the exact foreach-norm operation consumed by GradientStabilizer."""
+    values, output, checkpoints = _cancelled_mixture_fixture(1.5)
+    (output.float() * 1e-5).sum().backward()
+    gradients = [v.grad for v in values.values() if v.grad is not None]
+    assert torch.isfinite(output).all() and torch.isfinite(checkpoints[0]).all()
+    assert all(torch.isfinite(g).all() for g in gradients)
+    norms = torch.stack(torch._foreach_norm(gradients, 2)).float()
+    norms64 = torch.stack([g.double().norm() for g in gradients])
+    record_property("numerical_diagnosis", {
+        "gradient_elements_finite": True, "nonfinite_norm_count": int((~norms.isfinite()).sum()),
+        "largest_gradient_norm_fp64": norms64.max().item(),
+        "largest_observed_norm": str(norms.max().item()),
+    })
+    assert torch.isfinite(norms64).all() and norms64.max() < torch.finfo(torch.float32).max
+    assert torch.isfinite(norms).all(), "Finite, representable norms overflow in the stabilizer reduction"

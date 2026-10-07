@@ -1051,3 +1051,103 @@ The result is nevertheless sufficient to reject this implementation for
 performance: the complete step became `74.1%` slower and VRAM did not
 decrease. The grouped code was therefore removed from the accepted source;
 only this negative result and its reproduction protocol are committed.
+
+## Range-safe additive-epsilon normalization
+
+JToK and JToK-M share `q(u) = u / (||u||_2 + eps)`, with positive `eps`.
+JToK multiplies the base contribution by `1 + scaler*q(u)`; JToK-M adds
+`eta*scaler*q(u)` after mixing the selected experts. The correction below
+does not change these equations, routing, product coefficients, or optimizer
+policy. It is always active: no environment-specific flag is required.
+
+For incoming gradient `a`, write `r=||u||`, `n=u/r` (zero at `u=0`),
+`a_parallel=n*(n dot a)`, and `a_perp=a-a_parallel`. The exact VJP is
+
+```text
+VJP = a_perp/(r+eps) + a_parallel * eps/(r+eps)^2.
+At u=0: VJP = a/eps.
+```
+
+The former expression `a/(r+eps) - u*(u dot a)/(r+eps)^3` was not this
+derivative. Its radial response was wrong by `(2r+eps)/(r+eps)` even without
+overflow. Cubing the norm could also overflow before the surface or its norm
+became nonfinite. Independently, summing the unscaled surface squares could
+overflow while every surface element remained finite.
+
+Both native paths now set `s=max(max(abs(u)),eps)`, evaluate `v=u/s`, and
+compute `t=||v||`. They use `q=v/(t+eps/s)` and the factored VJP above, never
+constructing the large original squares, norm cube, or `u*(u dot a)`.
+The scale cancels algebraically; this is not clipping the surface or replacing
+additive epsilon by `sqrt(r^2+eps)`. Normalization remains FP32 through the
+final activation write-back. The narrow fused path now rounds there too,
+rather than rounding its numerator before normalization; mode-product dtype
+boundaries remain unchanged. Small numerical differences are expected.
+
+Complete-row backward programs compute their own statistics. For tiled rows,
+one row owner computes the global scale, scaled radius, and dot against the
+unit direction; no tile-local approximation is allowed. The row-wise forward
+finalizer streams rows wider than its bounded vector width. No additional
+kernel launch, dense expert expansion, host synchronization, or optimizer
+dependency is introduced. The multi-tile backward statistics use one extra
+FP32 scalar per token; forward no longer allocates/initializes an atomic
+squared-norm buffer.
+
+### Regression coverage and interpretation
+
+`tests/test_leviathan_jtok.py` covers zero/epsilon radii, finite surfaces whose
+old squares/cubes overflowed, complete/tiled VJPs, finite product coefficients
+`1.0`, `1.25`, and `1.5`, and expert cancellation. Those coefficient values
+are controlled fixtures with 128 factors, not universal training limits.
+The oracle uses an independent FP64 radial/tangential decomposition and is
+checked against autograd where the tiny radial term is resolvable. Tests allow
+FP32 subnormal underflow only below its minimum representable value.
+
+`tests/test_jtok_route_vjp.py` independently checks the corrected derivative
+with zero/tiny routing weights, repeated/empty experts, odd tails, compact VJP,
+split projection, and full-graph compilation. These synthetic tests establish
+functionality and edge behavior, not pretraining quality or throughput.
+
+The kernel cannot repair an external gradient-norm reduction or optimizer
+which squares large finite gradients without scaling. That separate foreach
+limitation stays explicitly marked as an expected failure. Nor does this fix
+make an already-overflowed product/projection, an unrepresentable gradient, or
+a contaminated checkpoint recoverable. A small mixed residual does not imply
+small individual experts or small parameter gradients. Numerical correction
+is not a promise of better loss, universal NaN immunity, or faster training.
+
+Run the public regressions on the target CUDA environment:
+
+```text
+python -m pytest tests/test_leviathan_jtok.py tests/test_jtok_route_vjp.py
+```
+
+For a real-data gate, reuse `benchmark/remote_real_10x10_validation.py`: 100
+optimizer steps and 100 evaluation batches, strict Triton dispatch, existing
+tokenized data, and a requested profile. Keep the full-model source hashes,
+logs and traces private. Evaluation from disjoint training rows is a smoke
+test, not a held-out quality claim. Short execution cannot establish stability
+at the historical late-failure point.
+
+The correction passed 109 distinct CPU/CUDA checks across the numerical,
+integration, and route-factorization suites. Added cases include a finite
+surface near the FP32 limit whose mathematical norm exceeds that limit,
+narrow/streamed rows, and a streamed near-cancelled expert mixture. No known
+successful check was repeated solely to rename a parameterized case.
+
+Both variants also completed the real-data 100+100 gate with finite recorded
+training and evaluation values and native kernels confirmed in the profiles:
+
+| variant | complete-step compute median | compute steps/s | complete-step E2E median | stable allocated peak | stable reserved peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JToK | 236.90 ms | 4.221 | 246.92 ms | 3.144 GiB | 19.770 GiB |
+| JToK-M | 281.93 ms | 3.547 | 292.01 ms | 3.227 GiB | 20.359 GiB |
+
+Compute includes forward, loss, backward, and optimizer update; E2E also
+includes batch preparation. Medians cover the 96 unprofiled stable steps,
+excluding cold/profile phases. Reserved memory includes allocator retention
+after cold compilation, not just live training tensors. These are full-model
+aggregate times/memory only; private component details and full traces are
+not published. There is no same-configuration pre-fix control, so these values
+do not establish a speedup or memory improvement. The prior throughput targets
+are not met by these measurements. The short gate does not establish late-run
+stability or downstream quality.

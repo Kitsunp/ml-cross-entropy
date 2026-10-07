@@ -517,6 +517,23 @@ def _all_surfaces_reference(
     )
 
 
+def _normalization_terms(surface: torch.Tensor, eps: float):
+    """FP32 scaled norm; never square the unscaled surface or cube its norm.
+
+    Scaling is algebraically cancelled, not a clamp on the normalized function.
+    At zero the direction is zero and its VJP is a/eps. Keep normalization in
+    FP32 and round only at the output boundary, as in the wide native path.
+    """
+    value = surface.float()
+    scale = value.abs().amax(dim=-1, keepdim=True).clamp_min(float(eps))
+    scaled = value / scale
+    radius = torch.linalg.vector_norm(scaled, dim=-1, keepdim=True)
+    denominator = radius + float(eps) / scale
+    unit = scaled / torch.where(radius > 0, radius, torch.ones_like(radius))
+    inverse = (1.0 / scale) / denominator
+    return scaled / denominator, unit, inverse, (float(eps) / scale) / denominator
+
+
 def jtok_reference(
     delta_m: torch.Tensor,
     z_tilde: torch.Tensor,
@@ -552,7 +569,7 @@ def jtok_reference(
         residual_out,
         dm.dtype,
     )[:, 0, :]
-    direction = surfaces / (surfaces.norm(dim=-1, keepdim=True) + float(norm_eps))
+    direction = _normalization_terms(surfaces, norm_eps)[0].to(dm.dtype)
     gate = 1.0 + scaler.to(dm.dtype) * direction
     output = dm * gate
     output = torch.where(mask.unsqueeze(-1), output, dm)
@@ -642,7 +659,7 @@ def jtokm_reference(
     mixed = (selected_weights.to(dm.dtype).unsqueeze(-1) * surfaces.gather(1, gather_idx)).sum(
         dim=1
     )
-    direction = mixed / (mixed.norm(dim=-1, keepdim=True) + float(norm_eps))
+    direction = _normalization_terms(mixed, norm_eps)[0].to(dm.dtype)
     delta_r = float(residual_scale) * scaler.to(dm.dtype) * direction
     output = torch.where(mask.unsqueeze(-1), dm + delta_r, dm)
     # The router statistics are calculated by jtokm_apply, where logits are
@@ -1121,6 +1138,23 @@ if _TRITON_AVAILABLE:
         )
 
     @triton.jit
+    def _jtok_scaled_normalization(mixed, NORM_EPS: tl.constexpr):
+        scale = tl.maximum(tl.max(tl.abs(mixed), axis=0), NORM_EPS)
+        scaled = mixed / scale
+        radius = tl.sqrt(tl.sum(scaled * scaled, axis=0))
+        denominator = radius + NORM_EPS / scale
+        unit = scaled / tl.where(radius > 0.0, radius, 1.0)
+        inverse = (1.0 / scale) / denominator
+        return scaled / denominator, unit, inverse, (NORM_EPS / scale) / denominator
+
+    @triton.jit
+    def _jtok_normalization_vjp(factor, unit, inverse, eps_fraction, dot):
+        # Radial eigenvalue eps/(r+eps)^2; at r=0 unit=0 and VJP=a/eps.
+        # Do not obtain the tiny radial term by subtracting two 1/r terms.
+        radial = unit * dot
+        return (factor - radial) * inverse + radial * (inverse * eps_fraction)
+
+    @triton.jit
     def _jtok_project_kernel(
         z_ptr,
         modes_ptr,
@@ -1129,7 +1163,6 @@ if _TRITON_AVAILABLE:
         expert_idx_ptr,
         selected_weights_ptr,
         surface_ptr,
-        norm_ptr,
         N,
         D_SEED: tl.constexpr,
         HIDDEN: tl.constexpr,
@@ -1172,14 +1205,12 @@ if _TRITON_AVAILABLE:
             mixed += weight * (values + residual)
         mixed = tl.where(row_mask & col_mask, mixed, 0.0)
         tl.store(surface_ptr + pid_row * HIDDEN + cols, mixed.to(surface_ptr.dtype.element_ty), mask=row_mask & col_mask)
-        tl.atomic_add(norm_ptr + pid_row, tl.sum(mixed * mixed, axis=0), mask=row_mask)
 
     @triton.jit
     def _jtok_finalize_kernel(
         delta_ptr,
         surface_ptr,
         scaler_ptr,
-        norm_ptr,
         valid_ptr,
         output_ptr,
         N,
@@ -1191,16 +1222,39 @@ if _TRITON_AVAILABLE:
         HAS_MASK: tl.constexpr,
     ):
         row = tl.program_id(0)
-        block = tl.program_id(1)
-        cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask = (row < N) & (cols < HIDDEN)
+        # A row owner makes the scaled reduction global, including odd tails.
+        # Bound the vector width; very wide rows are streamed, not expanded.
+        scale = tl.full((), NORM_EPS, tl.float32)
+        for block in range(tl.cdiv(HIDDEN, BLOCK_N)):
+            cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+            surface = tl.load(surface_ptr + row * HIDDEN + cols,
+                              mask=(row < N) & (cols < HIDDEN), other=0.0).to(tl.float32)
+            scale = tl.maximum(scale, tl.max(tl.abs(surface), axis=0))
+        squared = tl.full((), 0.0, tl.float32)
+        for block in range(tl.cdiv(HIDDEN, BLOCK_N)):
+            cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+            surface = tl.load(surface_ptr + row * HIDDEN + cols,
+                              mask=(row < N) & (cols < HIDDEN), other=0.0).to(tl.float32)
+            scaled = surface / scale
+            squared += tl.sum(scaled * scaled, axis=0)
+        denominator = tl.sqrt(squared) + NORM_EPS / scale
         valid = row < N
         if HAS_MASK:
             valid = valid & tl.load(valid_ptr + row, mask=row < N, other=0).to(tl.int1)
-        norm = tl.sqrt(tl.load(norm_ptr + row, mask=row < N, other=0.0)) + NORM_EPS
+        for block in range(tl.cdiv(HIDDEN, BLOCK_N)):
+            cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+            _jtok_finalize_tile(delta_ptr, surface_ptr, scaler_ptr, output_ptr,
+                                row, cols, N, HIDDEN, scale, denominator,
+                                valid, RESIDUAL_SCALE, MIXTURE)
+
+    @triton.jit
+    def _jtok_finalize_tile(delta_ptr, surface_ptr, scaler_ptr, output_ptr,
+                            row, cols, N, HIDDEN: tl.constexpr, scale, denominator,
+                            valid, RESIDUAL_SCALE: tl.constexpr, MIXTURE: tl.constexpr):
+        mask = (row < N) & (cols < HIDDEN)
         surface = tl.load(surface_ptr + row * HIDDEN + cols, mask=mask, other=0.0).to(tl.float32)
         scaler = tl.load(scaler_ptr + cols, mask=cols < HIDDEN, other=0.0).to(tl.float32)
-        direction = surface / norm
+        direction = (surface / scale) / denominator
         delta = tl.load(delta_ptr + row * HIDDEN + cols, mask=mask, other=0.0).to(tl.float32)
         if MIXTURE:
             value = delta + RESIDUAL_SCALE * scaler * direction
@@ -1220,7 +1274,6 @@ if _TRITON_AVAILABLE:
         selected_weights_ptr,
         valid_ptr,
         surface_ptr,
-        norm_ptr,
         N,
         D_SEED: tl.constexpr,
         NUM_KNOTS: tl.constexpr,
@@ -1239,7 +1292,7 @@ if _TRITON_AVAILABLE:
         the selected output and residual projections.  A tile may recompute
         the inexpensive mode product when ``HIDDEN > BLOCK_N``; the caller
         chooses a larger tile for this fused path to keep that duplication
-        bounded.  The output and norm contracts are unchanged.
+        bounded. The caller owns normalization of the FP32 surface.
         """
         row = tl.program_id(0)
         block = tl.program_id(1)
@@ -1344,7 +1397,6 @@ if _TRITON_AVAILABLE:
             mixed.to(surface_ptr.dtype.element_ty),
             mask=active_mask,
         )
-        tl.atomic_add(norm_ptr + row, tl.sum(mixed * mixed, axis=0), mask=row_mask)
 
     @triton.jit
     def _jtok_project_finalize_fused_kernel(
@@ -1482,10 +1534,8 @@ if _TRITON_AVAILABLE:
             mixed += weight * (values + residual)
 
         mixed = tl.where(row_valid, mixed, 0.0)
-        norm = tl.sqrt(tl.sum(mixed * mixed, axis=0)) + NORM_EPS
-        surface = mixed.to(output_ptr.dtype.element_ty).to(tl.float32)
+        direction, _, _, _ = _jtok_scaled_normalization(mixed, NORM_EPS)
         scaler = tl.load(scaler_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
-        direction = surface / norm
         delta = tl.load(delta_ptr + row * HIDDEN + cols, mask=active_mask, other=0.0).to(
             tl.float32
         )
@@ -1539,10 +1589,8 @@ if _TRITON_AVAILABLE:
         below, so the registered external path remains kernel-only for every
         supported hidden size.
 
-        The forward casts the surface to the activation dtype before dividing
-        by the FP32 norm.  The backward mirrors that boundary: ``surface`` is
-        the cast value while the norm derivative uses the pre-cast ``mixed``
-        accumulator.
+        Normalization and its derivative use the FP32 surface; activation
+        rounding happens only at output, matching the wide native route.
         """
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK_H)
@@ -1639,8 +1687,7 @@ if _TRITON_AVAILABLE:
             mixed += weight * (values + residual_value)
 
         mixed = tl.where(row_valid, mixed, 0.0)
-        norm = tl.sqrt(tl.sum(mixed * mixed, axis=0)) + NORM_EPS
-        surface = mixed.to(grad_delta_ptr.dtype.element_ty).to(tl.float32)
+        direction, unit, inverse, eps_fraction = _jtok_scaled_normalization(mixed, NORM_EPS)
         grad_out = tl.load(
             grad_out_ptr + row * HIDDEN + cols,
             mask=active_mask,
@@ -1659,22 +1706,14 @@ if _TRITON_AVAILABLE:
 
         if MIXTURE:
             surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
             grad_delta = grad_out
-            grad_scaler = RESIDUAL_SCALE * grad_out * surface / norm
+            grad_scaler = RESIDUAL_SCALE * grad_out * direction
         else:
             surface_grad_factor = grad_out * delta_value * scaler_value
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
-            grad_delta = grad_out * (1.0 + scaler_value * surface / norm)
-            grad_scaler = grad_out * delta_value * surface / norm
+            grad_delta = grad_out * (1.0 + scaler_value * direction)
+            grad_scaler = grad_out * delta_value * direction
+        dot = tl.sum(surface_grad_factor * unit, axis=0)
+        grad_surface = _jtok_normalization_vjp(surface_grad_factor, unit, inverse, eps_fraction, dot)
 
         valid_active = active_mask & row_valid
         grad_surface = tl.where(valid_active, grad_surface, 0.0)
@@ -1921,8 +1960,9 @@ if _TRITON_AVAILABLE:
     ):
         """Backward for rows whose hidden dimension spans multiple tiles.
 
-        ``_jtok_project_kernel`` has already written the pre-cast FP32 surface
-        and the row-wise squared-norm reduction.  This pass consumes
+        ``_jtok_project_kernel`` has already written the FP32 surface; the
+        row-owned normalization pass supplies its scaled statistics and dot.
+        This pass consumes
         one hidden tile at a time and accumulates token-local gradients with
         atomics.  Projection-parameter gradients are disabled here for the
         wide path and reduced by ``_jtok_backward_projection_grad_kernel``
@@ -1954,7 +1994,13 @@ if _TRITON_AVAILABLE:
             mask=active_mask,
             other=0.0,
         ).to(tl.float32)
-        norm = tl.sqrt(tl.load(norm_ptr + row, mask=row_mask, other=0.0)) + NORM_EPS
+        scale = tl.load(norm_ptr + row, mask=row_mask, other=NORM_EPS)
+        radius = tl.load(norm_ptr + N + row, mask=row_mask, other=0.0)
+        denominator = radius + NORM_EPS / scale
+        unit = (mixed / scale) / tl.where(radius > 0.0, radius, 1.0)
+        direction = (mixed / scale) / denominator
+        inverse = (1.0 / scale) / denominator
+        eps_fraction = (NORM_EPS / scale) / denominator
         grad_out = tl.load(
             grad_out_ptr + row * HIDDEN + cols,
             mask=active_mask,
@@ -1973,22 +2019,14 @@ if _TRITON_AVAILABLE:
 
         if MIXTURE:
             surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
-            dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
             grad_delta = grad_out
-            grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
+            grad_scaler = RESIDUAL_SCALE * grad_out * direction
         else:
             surface_grad_factor = grad_out * delta_value * scaler_value
-            dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
-            grad_surface = (
-                surface_grad_factor / norm
-                - mixed * dot / (norm * norm * norm)
-            )
-            grad_delta = grad_out * (1.0 + scaler_value * mixed / norm)
-            grad_scaler = grad_out * delta_value * mixed / norm
+            grad_delta = grad_out * (1.0 + scaler_value * direction)
+            grad_scaler = grad_out * delta_value * direction
+        dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
+        grad_surface = _jtok_normalization_vjp(surface_grad_factor, unit, inverse, eps_fraction, dot)
 
         valid_active = active_mask & row_valid
         grad_surface = tl.where(valid_active, grad_surface, 0.0)
@@ -2181,10 +2219,12 @@ if _TRITON_AVAILABLE:
         grad_out_ptr,
         valid_ptr,
         dot_ptr,
+        norm_ptr,
         N,
         HIDDEN: tl.constexpr,
         BLOCK_H: tl.constexpr,
         NUM_TILES: tl.constexpr,
+        NORM_EPS: tl.constexpr,
         RESIDUAL_SCALE: tl.constexpr,
         MIXTURE: tl.constexpr,
         HAS_MASK: tl.constexpr,
@@ -2192,7 +2232,7 @@ if _TRITON_AVAILABLE:
         """Reduce the normalization dot product over the complete hidden row.
 
         For ``y = s / (||s|| + eps)``, the backward contains
-        ``dot(a, s)`` over *all* hidden coordinates.  The tiled projection
+        ``dot(a, unit(s))`` over *all* hidden coordinates. The tiled projection
         backward cannot form that scalar independently in each tile without
         changing the derivative.  This token-owned reduction writes one
         scalar per row, so the following tile pass can compute the exact same
@@ -2204,6 +2244,22 @@ if _TRITON_AVAILABLE:
             row_valid = tl.load(valid_ptr + row, mask=row_mask, other=0).to(tl.int1)
         else:
             row_valid = row_mask
+        scale = tl.full((), NORM_EPS, tl.float32)
+        for tile in range(NUM_TILES):
+            cols = tile * BLOCK_H + tl.arange(0, BLOCK_H)
+            mixed = tl.load(surface_ptr + row * HIDDEN + cols,
+                            mask=row_mask & (cols < HIDDEN), other=0.0).to(tl.float32)
+            scale = tl.maximum(scale, tl.max(tl.abs(mixed), axis=0))
+        squared = tl.full((), 0.0, tl.float32)
+        for tile in range(NUM_TILES):
+            cols = tile * BLOCK_H + tl.arange(0, BLOCK_H)
+            mixed = tl.load(surface_ptr + row * HIDDEN + cols,
+                            mask=row_mask & (cols < HIDDEN), other=0.0).to(tl.float32)
+            scaled = mixed / scale
+            squared += tl.sum(scaled * scaled, axis=0)
+        radius = tl.sqrt(squared)
+        tl.store(norm_ptr + row, scale, mask=row_mask)
+        tl.store(norm_ptr + N + row, radius, mask=row_mask)
         dot = tl.zeros((), dtype=tl.float32)
         for tile in tl.range(0, NUM_TILES):
             cols = tile * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -2232,7 +2288,8 @@ if _TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.float32)
                 factor = grad_out * delta * scaler
-            dot += tl.sum(tl.where(active, factor * mixed, 0.0), axis=0)
+            unit = (mixed / scale) / tl.where(radius > 0.0, radius, 1.0)
+            dot += tl.sum(tl.where(active, factor * unit, 0.0), axis=0)
         tl.store(dot_ptr + row, dot, mask=row_mask)
 
     @triton.autotune(
@@ -2319,7 +2376,16 @@ if _TRITON_AVAILABLE:
             mask=active_mask,
             other=0.0,
         ).to(tl.float32)
-        norm = tl.sqrt(tl.load(norm_ptr + row, mask=row_mask, other=0.0)) + NORM_EPS
+        if SINGLE_HIDDEN_TILE:
+            direction, unit, inverse, eps_fraction = _jtok_scaled_normalization(mixed, NORM_EPS)
+        else:
+            scale = tl.load(norm_ptr + row, mask=row_mask, other=NORM_EPS)
+            radius = tl.load(norm_ptr + N + row, mask=row_mask, other=0.0)
+            denominator = radius + NORM_EPS / scale
+            unit = (mixed / scale) / tl.where(radius > 0.0, radius, 1.0)
+            direction = (mixed / scale) / denominator
+            inverse = (1.0 / scale) / denominator
+            eps_fraction = (NORM_EPS / scale) / denominator
         grad_out = tl.load(
             grad_out_ptr + row * HIDDEN + cols,
             mask=active_mask,
@@ -2339,23 +2405,20 @@ if _TRITON_AVAILABLE:
         if MIXTURE:
             surface_grad_factor = RESIDUAL_SCALE * scaler_value * grad_out
             grad_delta = grad_out
-            grad_scaler = RESIDUAL_SCALE * grad_out * mixed / norm
+            grad_scaler = RESIDUAL_SCALE * grad_out * direction
         else:
             surface_grad_factor = grad_out * delta_value * scaler_value
-            grad_delta = grad_out * (1.0 + scaler_value * mixed / norm)
-            grad_scaler = grad_out * delta_value * mixed / norm
+            grad_delta = grad_out * (1.0 + scaler_value * direction)
+            grad_scaler = grad_out * delta_value * direction
 
         if SINGLE_HIDDEN_TILE:
             # One program owns the complete hidden reduction, so the local
             # dot is mathematically global.  Multi-tile rows receive the
             # token-owned reduction produced by _jtok_backward_norm_dot_kernel.
-            dot = tl.sum(surface_grad_factor * mixed, axis=0)
+            dot = tl.sum(surface_grad_factor * unit, axis=0)
         else:
             dot = tl.load(norm_dot_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
-        grad_surface = (
-            surface_grad_factor / norm
-            - mixed * dot / (norm * norm * norm)
-        )
+        grad_surface = _jtok_normalization_vjp(surface_grad_factor, unit, inverse, eps_fraction, dot)
 
         valid_active = active_mask & row_valid
         grad_surface = tl.where(valid_active, grad_surface, 0.0)
@@ -3045,8 +3108,7 @@ def _run_jtok_triton(
             )
         return output, modes_buffer
 
-    # Keep the wide-path surface in FP32.  The forward kernel reduces its
-    # squared norm before the activation-dtype write-back; retaining the
+    # Keep the wide-path surface in FP32. Retaining the
     # pre-cast surface here lets the tiled backward use the same value for the
     # normalization derivative without rebuilding a Torch reference graph.
     # A compact [tokens, top_k, modes] mode buffer is much smaller than the
@@ -3129,7 +3191,6 @@ def _run_jtok_triton(
     surface = torch.empty(
         (n_tokens, hidden), device=delta.device, dtype=torch.float32
     )
-    norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
     output = torch.empty_like(delta)
     # The wide path keeps only the compact [tokens, top_k, modes] mode
     # activation.  It is negligible relative to a dense expert surface and
@@ -3146,7 +3207,6 @@ def _run_jtok_triton(
         expert_idx,
         selected_weights,
         surface,
-        norm,
         n_tokens,
         D_SEED=d_seed,
         HIDDEN=hidden,
@@ -3157,17 +3217,16 @@ def _run_jtok_triton(
         num_warps=4,
         num_stages=1,
     )
-    final_grid = (n_tokens, triton.cdiv(hidden, block_n))
+    final_grid = (n_tokens,)
     _jtok_wrap_kernel(_jtok_finalize_kernel)[final_grid](
         delta,
         surface,
         scaler,
-        norm,
         valid_mask,
         output,
         n_tokens,
         HIDDEN=hidden,
-        BLOCK_N=block_n,
+        BLOCK_N=min(1024, triton.next_power_of_2(hidden)),
         NORM_EPS=float(norm_eps),
         RESIDUAL_SCALE=float(residual_scale),
         MIXTURE=bool(mixture),
@@ -3234,8 +3293,8 @@ def _run_jtok_backward_triton(
     use the geometry planner: a complete-row program is selected when the
     hidden width and combined seed/mode work fit the resource budget;
     otherwise the established 256-lane two-pass tiled reduction is used.  The
-    tiled path's first pass writes the selected FP32 surface and row norm, and
-    its second pass accumulates parameter gradients per hidden tile.  There
+    tiled path first writes the FP32 surface, then computes global scaled
+    normalization statistics before accumulating gradients per hidden tile. There
     is deliberately no Torch/autograd fallback in this registered
     external-kernel path.
     """
@@ -3392,7 +3451,9 @@ def _run_jtok_backward_triton(
         surface = torch.empty(
             (n_tokens, hidden), device=delta.device, dtype=torch.float32
         )
-        norm = torch.zeros(n_tokens, device=delta.device, dtype=torch.float32)
+        # Two scalars per row (scale and scaled radius), only read by tiled
+        # backward. Complete-row programs compute them locally.
+        norm = torch.empty(2 * n_tokens, device=delta.device, dtype=torch.float32)
         project_grid = (n_tokens, triton.cdiv(hidden, block_h))
         _jtok_wrap_kernel(_jtok_project_kernel)[project_grid](
             z,
@@ -3402,7 +3463,6 @@ def _run_jtok_backward_triton(
             expert_idx,
             selected_weights,
             surface,
-            norm,
             n_tokens,
             D_SEED=d_seed,
             HIDDEN=hidden,
@@ -3421,7 +3481,7 @@ def _run_jtok_backward_triton(
         # computes the complete reduction locally.  Reuse ``norm`` there so
         # the optimization does not introduce a dead FP32 allocation; only
         # genuinely multi-tile rows receive a second per-token scalar buffer.
-        norm_dot = norm if single_hidden_tile else torch.empty_like(norm)
+        norm_dot = norm if single_hidden_tile else torch.empty(n_tokens, device=delta.device, dtype=torch.float32)
         if not single_hidden_tile:
             _jtok_wrap_kernel(_jtok_backward_norm_dot_kernel)[(n_tokens,)](
                 surface,
@@ -3430,10 +3490,12 @@ def _run_jtok_backward_triton(
                 grad_out,
                 valid_mask,
                 norm_dot,
+                norm,
                 n_tokens,
                 HIDDEN=hidden,
                 BLOCK_H=block_h,
                 NUM_TILES=tile_plan.num_tiles,
+                NORM_EPS=float(norm_eps),
                 RESIDUAL_SCALE=float(residual_scale),
                 MIXTURE=bool(mixture),
                 HAS_MASK=bool(valid_mask.numel()),
@@ -3705,9 +3767,7 @@ def _run_jtok_backward_formula(
     )
     mixed = (weights_f.unsqueeze(-1) * selected_values).sum(dim=1)
     mixed_f = mixed.float()
-    surface = mixed.to(dtype).float()
-    norm = torch.sqrt((mixed_f * mixed_f).sum(dim=-1, keepdim=True)) + float(norm_eps)
-    direction = surface / norm
+    direction, unit, inverse, eps_fraction = _normalization_terms(mixed_f, norm_eps)
 
     if mixture:
         grad_surface_factor = (
@@ -3715,22 +3775,21 @@ def _run_jtok_backward_formula(
         )
         grad_delta_f = grad_out_f
         grad_scaler = (
-            float(residual_scale) * grad_out_f * surface / norm * valid_f
+            float(residual_scale) * grad_out_f * direction * valid_f
         ).sum(dim=0)
     else:
         grad_surface_factor = grad_out_f * delta_f * scaler_f.unsqueeze(0)
         grad_delta_f = grad_out_f * (
-            1.0 + scaler_f.unsqueeze(0) * surface / norm
+            1.0 + scaler_f.unsqueeze(0) * direction
         )
         grad_scaler = (
-            grad_out_f * delta_f * surface / norm * valid_f
+            grad_out_f * delta_f * direction * valid_f
         ).sum(dim=0)
     grad_surface_factor = grad_surface_factor * valid_f
-    dot = (grad_surface_factor * mixed_f).sum(dim=-1, keepdim=True)
-    grad_surface = (
-        grad_surface_factor / norm
-        - mixed_f * dot / (norm * norm * norm)
-    ) * valid_f
+    dot = (grad_surface_factor * unit).sum(dim=-1, keepdim=True)
+    radial = unit * dot
+    grad_surface = ((grad_surface_factor - radial) * inverse
+                    + radial * (inverse * eps_fraction)) * valid_f
     grad_value = grad_surface.unsqueeze(1) * weights_f.unsqueeze(-1)
 
     # Shared projection gradients and the gradient of the selected mixture
@@ -4401,7 +4460,7 @@ def jtokm_apply(
         )
         selected = all_surfaces.gather(1, gather_idx)
         mixed = (selected_weights.to(dm.dtype).unsqueeze(-1) * selected).sum(dim=1)
-        direction = mixed / (mixed.norm(dim=-1, keepdim=True) + float(norm_eps))
+        direction = _normalization_terms(mixed, norm_eps)[0].to(dm.dtype)
         output = dm + float(residual_scale) * scale.to(dm.dtype) * direction
         output = torch.where(
             (mask if mask.numel() else torch.ones(dm.shape[0], device=dm.device, dtype=torch.bool)).unsqueeze(-1),

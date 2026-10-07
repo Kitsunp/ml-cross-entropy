@@ -49,17 +49,15 @@ def test_route_vjp_factor_matches_double_with_zero_tiny_weights(
                 + torch.einsum("nd,nrdh->nrh", values["z"].double(), wr))
     mixed = (surfaces * weights.double()[..., None]).sum(1).float()
     mixed[~valid] = 0
-    norm_squared = mixed.square().sum(1)
-    factor = (scale * values["scaler"] * g if mixture
-              else g * values["delta"] * values["scaler"])
-    norm_dot = (factor * mixed).sum(1)
-    denominator = norm_squared.double().sqrt()[:, None] + eps
+    radius = mixed.double().norm(dim=1, keepdim=True)
+    unit = mixed.double() / torch.where(radius > 0, radius, torch.ones_like(radius))
+    denominator = radius + eps
     # Independent Double contractions at the supplied FP32 surface and the
-    # existing normalization-VJP contract; that contract is not changed here.
+    # exact additive-epsilon normalization derivative (independent of Triton).
     factor_ref = (scale * values["scaler"].double() * g.double() if mixture
                   else g.double() * values["delta"].double() * values["scaler"].double())
-    gs = (factor_ref / denominator
-          - mixed.double() * (factor_ref * mixed.double()).sum(1)[:, None] / denominator.pow(3))
+    radial = unit * (factor_ref * unit).sum(1, keepdim=True)
+    gs = (factor_ref - radial) / denominator + radial * (eps / denominator.square())
     gs = torch.where(valid[:, None], gs, 0)
     a = torch.einsum("nh,nrmh->nrm", gs, ws)
     b = torch.einsum("nh,nrdh->nrd", gs, wr)
@@ -83,6 +81,14 @@ def test_route_vjp_factor_matches_double_with_zero_tiny_weights(
             _assert_finite_relative(got[row], want[row].float(), 3e-5)
 
     answers = []
+    norm_stats = torch.empty(2 * n, device="cuda")
+    norm_dot = torch.empty(n, device="cuda")
+    if hidden > block_h:
+        implementation._jtok_backward_norm_dot_kernel[(n,)](
+            mixed, values["delta"], values["scaler"], g, valid, norm_dot, norm_stats, n,
+            HIDDEN=hidden, BLOCK_H=block_h, NUM_TILES=triton.cdiv(hidden, block_h),
+            NORM_EPS=eps, RESIDUAL_SCALE=scale, MIXTURE=mixture, HAS_MASK=True,
+            num_warps=4, num_stages=1)
     for enabled in (False, True):
         grad_mode, grad_residual = torch.zeros_like(modes), torch.zeros(n, top_k, d, device="cuda")
         grad_delta, grad_scaler = torch.empty_like(g), torch.zeros(hidden, device="cuda")
@@ -93,7 +99,7 @@ def test_route_vjp_factor_matches_double_with_zero_tiny_weights(
             (n, triton.cdiv(hidden, block_h))
         ](values["delta"], values["z"], values["spline_out"], values["residual_out"],
           routes, weights, modes, grad_mode, grad_residual, values["scaler"],
-          surface_workspace, norm_squared, norm_dot, g, valid,
+          surface_workspace, norm_stats, norm_dot, g, valid,
           grad_delta, grad_scaler, grad_weights, n, D_SEED=d, NUM_MODES=m,
           TOP_K=top_k, HIDDEN=hidden, BLOCK_H=block_h, NORM_EPS=eps,
           RESIDUAL_SCALE=scale, MIXTURE=mixture, HAS_MASK=True,
