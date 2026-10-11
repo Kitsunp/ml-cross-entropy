@@ -43,6 +43,18 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
     :param return_loss_metrics: Return compact scalar diagnostics for unweighted NTP cross
         entropy, the MiLe reweighting delta, and mu loss. Supported by CCE implementations
         with ``reduction="mean"`` only; no token-by-vocabulary tensor is materialized.
+    :param return_topk: Add detached ``topk_counts`` to the loss-metrics dictionary.
+        Requires ``return_loss_metrics=True``, CCE, mean reduction, and no vocabulary
+        parallelism. Counts are ``(hits@1, hits@3, hits@5, valid_targets, nonfinite_targets)``;
+        divide the first three by the fourth to obtain accuracies. Every valid supervised
+        target is measured using the actual rounded CCE logits, with lower vocabulary ID
+        breaking ties. Ignored targets and positions excluded by causal shift do not count.
+        Accuracy is unweighted even with MiLe; under input corruption it measures prediction
+        from the corrupted context, not a clean-context accuracy. Nonfinite logits are
+        reported, not silently accepted as correct. Native tile selection avoids another
+        projection and dense logits, but has nonzero register, workspace and execution cost.
+        Applications should enable this only for ordinary token prediction; patch accuracy
+        is not defined by this API's token-accuracy interpretation.
     :param mile_enabled: Explicitly enable MiLe loss with detached, mean-normalized entropy weights.
         Supported by CCE implementations only.
     :param mile_gamma: Non-negative MiLe entropy-weight exponent, used only when MiLe is enabled.
@@ -59,6 +71,15 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
         across patch and token phases; represent inactive slots with ``ignore_index`` to
         preserve shapes and the compiled graph. Supported by CCE implementations with
         ``reduction="mean"``, ``shift=0``, no softcap, and no vocabulary parallelism.
+    :param mile_group_fraction: Optional detached floating population metadata shaped
+        like ``e.shape[:-1]``, requiring patch training and MiLe. Each value in [0, 1]
+        is the corrupted fraction of the CURRENT input patch, not its future targets.
+        Generalizes independent clean/corrupted MiLe normalization to mixed patches;
+        binary values at K=1 reproduce the token grouping policy. Mutually exclusive
+        with ``mile_group_mask``. Reductions use FP32 and group-local log rescaling.
+        Values must be finite and representable in FP32. Invalid active fractions
+        produce NaN rather than being clamped; excluded rows are neutral. Metadata
+        validation does not synchronize the device or read values on the host.
 """
 
 CCE_OPTS_DOC = [

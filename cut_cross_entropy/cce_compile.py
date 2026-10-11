@@ -348,6 +348,8 @@ def _cce_forward_op(
     patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
+    mile_group_fraction: torch.Tensor | None = None,
+    return_topk: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -364,9 +366,7 @@ def _cce_forward_op(
         e, targets, ignore_index, shift, patch_training_enabled, c.size(0)
     )
     prepared_mile_group_mask = (
-        _prepare_mile_group_mask(mile_group_mask, valids)
-        if mile_group_mask.numel() != 0
-        else None
+        _prepare_mile_group_mask(mile_group_mask, valids) if mile_group_mask.numel() != 0 else None
     )
     # Custom-op backend implementations run below Autograd.  Recreate only the
     # metadata used by the existing kernel driver; no input storage is mutated.
@@ -392,6 +392,12 @@ def _cce_forward_op(
         auto_mixed_grad_accum=auto_mixed_grad_accum,
         mile_gamma=mile_gamma if mile_enabled else None,
         mile_group_mask=prepared_mile_group_mask,
+        return_topk=return_topk,
+        mile_group_fraction=(
+            mile_group_fraction.to(torch.float32).contiguous().flatten()
+            if mile_group_fraction is not None
+            else None
+        ),
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
         patch_training_enabled=patch_training_enabled,
     )
@@ -488,6 +494,8 @@ def _cce_forward_fake(
     patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
+    mile_group_fraction: torch.Tensor | None = None,
+    return_topk: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -502,6 +510,7 @@ def _cce_forward_fake(
     del (
         ignore_index,
         mile_group_mask,
+        mile_group_fraction,
         softcap,
         accum_e_fp32,
         accum_c_fp32,
@@ -543,7 +552,7 @@ def _cce_forward_fake(
         e.new_empty((), dtype=torch.float32) if mu_loss_enabled else _empty(e, dtype=torch.float32)
     )
     metrics = (
-        e.new_empty((3,), dtype=torch.float32)
+        e.new_empty((8 if return_topk else 3,), dtype=torch.float32)
         if return_loss_metrics
         else _empty(e, dtype=torch.float32)
     )
@@ -590,6 +599,8 @@ def _setup_context(ctx, inputs, output) -> None:
         patch_training_enabled,
         _compute_dtype_is_bf16,
         forward_used_autocast,
+        _mile_group_fraction,
+        _return_topk,
     ) = inputs
     (
         _loss,
@@ -709,6 +720,8 @@ def _backward(ctx, *grads):
         None,
         None,
         None,
+        None,  # Detached fractional population metadata (last forward argument).
+        None,  # Top-k is read-only forward telemetry.
     )
 
 
@@ -738,6 +751,8 @@ def compiler_cce_linear_cross_entropy(
     patch_training_enabled: bool,
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
+    mile_group_fraction: torch.Tensor | None = None,
+    return_topk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the supported training subset as one compiler-visible custom op."""
     outputs = _cce_forward_op(
@@ -766,5 +781,7 @@ def compiler_cce_linear_cross_entropy(
         patch_training_enabled,
         compute_dtype_is_bf16,
         forward_used_autocast,
+        mile_group_fraction,
+        return_topk,
     )
     return outputs[0], outputs[1] if return_loss_metrics else None
