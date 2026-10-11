@@ -11,6 +11,186 @@ from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
 @triton.jit
+def _topk5_keys(
+    logits, ids, valid, SCORE_DTYPE: tl.constexpr = tl.float32, PACKED_GLOBAL: tl.constexpr = False
+):
+    # Lexicographic score-descending/ID-ascending order, including signed-zero
+    # ties. Reuse the actual projected/rounded CCE logits, not another GEMM.
+    # Keep the full tile at 32 bits. Widen only winners when the global
+    # score/ID order cannot also be represented losslessly in 32 bits.
+    columns = tl.arange(0, logits.shape[1])
+    vocab_offset = tl.min(ids, 1)
+    tl.static_assert(not PACKED_GLOBAL or SCORE_DTYPE == tl.bfloat16 or SCORE_DTYPE == tl.float16)
+    if (SCORE_DTYPE == tl.bfloat16 or SCORE_DTYPE == tl.float16) and logits.shape[1] <= 65536:
+        # The *actual* logits have 16 significant storage bits. Pack their
+        # monotone score and local tie-break ID into one scalar reduction;
+        # unlike quantizing FP32, this loses no information. Widen only the
+        # five winners only when a global score/ID key needs 64 bits.
+        bits16 = logits.to(SCORE_DTYPE).to(tl.uint16, bitcast=True).to(tl.uint32)
+        bits16 = tl.where(logits == 0.0, 0, bits16)
+        ordered16 = tl.where((bits16 & 0x8000) != 0, (~bits16) & 0xFFFF, bits16 ^ 0x8000)
+        packed = (ordered16 << 16) | (0xFFFF - columns[None, :])
+        packed = tl.where(valid, packed, 0)
+        packed = tl.where(
+            valid & ~(tl.abs(logits) < float("inf")),
+            0xFFFF0000 | (0xFFFF - columns[None, :]).to(tl.uint32),
+            packed,
+        )
+        bad_key: tl.constexpr = 0xFFFFFFFF if PACKED_GLOBAL else 0xFFFFFFFFFFFFFFFF
+        winners = ()
+        for _ in tl.static_range(5):
+            winner = tl.max(packed, 1)
+            column = 0xFFFF - (winner & 0xFFFF)
+            score = winner >> 16
+            if PACKED_GLOBAL:
+                key = (score << 16) | (0xFFFF - (vocab_offset + column).to(tl.uint32))
+            else:
+                score_bits = tl.where((score & 0x8000) != 0, score ^ 0x8000, (~score) & 0xFFFF)
+                value = score_bits.to(tl.uint16).to(SCORE_DTYPE, bitcast=True).to(tl.float32)
+                bits = value.to(tl.uint32, bitcast=True)
+                ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+                key = (ordered.to(tl.uint64) << 32) | (
+                    0xFFFFFFFF - (vocab_offset + column).to(tl.uint64)
+                )
+            key = tl.where(winner == 0, 0, key)
+            key = tl.where(score == 0xFFFF, bad_key, key)
+            winners += (key,)
+            packed = tl.where(packed == winner[:, None], 0, packed)
+        return winners
+
+    else:
+        bits = tl.where(logits == 0.0, 0, logits.to(tl.uint32, bitcast=True))
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+        ordered = tl.where(valid, ordered, 0)
+        ordered = tl.where(valid & ~(tl.abs(logits) < float("inf")), 0xFFFFFFFF, ordered)
+        winners = ()
+        for _ in tl.static_range(5):
+            value, column = tl.max(
+                ordered, 1, return_indices=True, return_indices_tie_break_left=True
+            )
+            key = (value.to(tl.uint64) << 32) | (0xFFFFFFFF - (vocab_offset + column).to(tl.uint64))
+            key = tl.where(value == 0, 0, key)
+            key = tl.where(value == 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF, key)
+            winners += (key,)
+            ordered = tl.where(columns[None, :] == column[:, None], 0, ordered)
+        return winners
+
+
+@triton.jit
+def _merge_topk5(a, b, c, d, e, incoming):
+    # Both inputs are descending. The r-th order statistic is
+    # max(A[r], B[r], max_i min(A[i], B[r-1-i])). Independent balanced
+    # outputs replace 45 serial compare/exchanges with 25 comparisons,
+    # especially important while holding the shared LSE lock.
+    u, v, w, x, y = incoming
+    return (
+        tl.maximum(a, u),
+        tl.maximum(tl.maximum(b, v), tl.minimum(a, u)),
+        tl.maximum(tl.maximum(c, w), tl.maximum(tl.minimum(a, v), tl.minimum(b, u))),
+        tl.maximum(
+            tl.maximum(d, x),
+            tl.maximum(tl.maximum(tl.minimum(a, w), tl.minimum(b, v)), tl.minimum(c, u)),
+        ),
+        tl.maximum(
+            tl.maximum(e, y),
+            tl.maximum(
+                tl.maximum(tl.minimum(a, x), tl.minimum(b, w)),
+                tl.maximum(tl.minimum(c, v), tl.minimum(d, u)),
+            ),
+        ),
+    )
+
+
+@triton.jit
+def _topk_counts_kernel(
+    Keys,
+    Targets,
+    Valids,
+    Out,
+    B,
+    BMax,
+    V,
+    shift: tl.constexpr,
+    STRIDE_T: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    HAS_VALIDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    original = tl.load(Valids + rows, rows < B, BMax) if HAS_VALIDS else rows
+    slot = tl.arange(0, BK)
+    y = tl.load(
+        Targets + (original + shift)[:, None] * STRIDE_T + slot[None, :] * STRIDE_K,
+        (rows[:, None] < B) & (original[:, None] + shift < BMax) & (slot[None, :] < K),
+        V,
+    )
+    valid = (rows[:, None] < B) & (y >= 0) & (y < V)
+    id_mask: tl.constexpr = 0xFFFF if Keys.dtype.element_ty == tl.uint32 else 0xFFFFFFFF
+    bad_key: tl.constexpr = 0xFFFFFFFF if Keys.dtype.element_ty == tl.uint32 else 0xFFFFFFFFFFFFFFFF
+    hit = tl.full((BLOCK, BK), False, tl.int1)
+    for rank in tl.static_range(5):
+        key = tl.load(Keys + rows * 5 + rank, rows < B, 0)
+        hit |= ((id_mask - (key & id_mask)).to(tl.int64)[:, None] == y) & (key[:, None] != 0)
+        if rank == 0:
+            tl.store(Out + tl.program_id(0) * 5, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0))
+            tl.store(
+                Out + tl.program_id(0) * 5 + 4,
+                tl.sum(tl.sum(((key[:, None] == bad_key) & valid).to(tl.float32), 1), 0),
+            )
+        if rank == 2:
+            tl.store(
+                Out + tl.program_id(0) * 5 + 1, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0)
+            )
+        if rank == 4:
+            tl.store(
+                Out + tl.program_id(0) * 5 + 2, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0)
+            )
+    tl.store(Out + tl.program_id(0) * 5 + 3, tl.sum(tl.sum(valid.to(tl.float32), 1), 0))
+
+
+def _topk_key_dtype(
+    e: torch.Tensor, c: torch.Tensor, bias: torch.Tensor | None, softcap: float | None
+) -> torch.dtype:
+    # Conservative proof of the *post-bias* score dtype, without executing a
+    # tensor operation or assuming E alone implies low-precision logits.
+    if (
+        e.dtype in (torch.float16, torch.bfloat16)
+        and c.size(0) <= 65536
+        and softcap is None
+        and (bias is None or bias.dtype == e.dtype)
+    ):
+        return torch.uint32
+    return torch.uint64
+
+
+def _topk_counts(keys, targets, valids, shift, bmax, vocab_size):
+    b = keys.size(0)
+    if not b:
+        return keys.new_zeros(5, dtype=torch.float32)
+    partials = keys.new_empty((triton.cdiv(b, 256), 5), dtype=torch.float32)
+    k = targets.size(1) if targets.ndim == 2 else 1
+    _topk_counts_kernel[(triton.cdiv(b, 256),)](
+        keys,
+        targets,
+        valids,
+        partials,
+        b,
+        bmax,
+        vocab_size,
+        shift,
+        targets.stride(0),
+        targets.stride(1) if targets.ndim == 2 else 1,
+        k,
+        triton.next_power_of_2(k),
+        valids is not None,
+        256,
+    )
+    return partials.sum(0)
+
+
+@triton.jit
 def _sum_pair(left_sum, left_weighted_sum, right_sum, right_weighted_sum):
     return left_sum + right_sum, left_weighted_sum + right_weighted_sum
 
@@ -250,6 +430,7 @@ def _cce_lse_forward_kernel(
     MeanLogit,
     LA,
     NegCorrectLogit,
+    TopK,
     Locks,
     Valids,
     Targets,
@@ -287,6 +468,8 @@ def _cce_lse_forward_kernel(
     HAS_TARGETS: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     PATCH_SIZE: tl.constexpr,
+    HAS_TOPK: tl.constexpr,
+    VOCAB_OFFSET: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_b = tl.cdiv(B, BLOCK_B)
@@ -347,6 +530,7 @@ def _cce_lse_forward_kernel(
     logits = accum
     if HAS_SOFTCAP:
         logits = tl_softcapping(logits, softcap)
+    score_dtype: tl.constexpr = logits.dtype
     if not EVEN_V:
         logits = tl.where(offs_v[None, :] < V, logits, -float("inf"))
     logits = logits.cast(tl.float32)
@@ -394,6 +578,14 @@ def _cce_lse_forward_kernel(
     else:
         this_exp_sum = tl.sum(this_exp, axis=1)
     this_lse = this_mx + tl.log(this_exp_sum)
+    if HAS_TOPK:
+        tile_topk = _topk5_keys(
+            logits,
+            offs_v[None, :] + VOCAB_OFFSET,
+            offs_v[None, :] < V,
+            score_dtype,
+            TopK.dtype.element_ty == tl.uint32,
+        )
 
     o_mask = None if FULL_B else offs_b < B
 
@@ -431,6 +623,13 @@ def _cce_lse_forward_kernel(
     else:
         new_lse = tl_logaddexp(old_lse, this_lse)
     tl.store(lse_ptrs, new_lse, mask=o_mask, eviction_policy="evict_last")
+    if HAS_TOPK:
+        previous = ()
+        for rank in tl.static_range(5):
+            previous += (tl.load(TopK + offs_b * 5 + rank, mask=offs_b < B, other=0),)
+        merged = _merge_topk5(*previous, tile_topk)
+        for rank in tl.static_range(5):
+            tl.store(TopK + offs_b * 5 + rank, merged[rank], mask=o_mask)
 
     tl.atomic_xchg(this_locks, 0, sem="release", scope="gpu")
 
@@ -459,6 +658,7 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
             else ("tf32" if torch.get_float32_matmul_precision() == "high" else "ieee")
         ),
         "HAS_TARGETS": lambda args: args["Targets"] is not None,
+        "HAS_TOPK": lambda args: args["TopK"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
     }
 )(_cce_lse_forward_kernel)
@@ -471,6 +671,7 @@ class LSEReturn:
     logit_avg: torch.Tensor | None
     neg_correct_logit: torch.Tensor | None
     mean_logit: torch.Tensor | None
+    topk_counts: torch.Tensor | None = None
 
 
 def cce_lse_forward_kernel(
@@ -483,6 +684,7 @@ def cce_lse_forward_kernel(
     shift: int = 0,
     return_logit_avg: bool = False,
     return_mean_logit: bool = False,
+    return_topk: bool = False,
 ) -> LSEReturn:
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
@@ -498,6 +700,8 @@ def cce_lse_forward_kernel(
         assert c.shape[0] == bias.shape[0]
 
     V, D = c.shape
+    if return_topk and targets is None:
+        raise ValueError("Top-k metrics require supervised targets.")
     if targets is not None:
         assert targets.ndim in (1, 2)
         patch_size = targets.size(1) if targets.ndim == 2 else 1
@@ -507,6 +711,21 @@ def cce_lse_forward_kernel(
         patch_size = 1
         target_stride_b = 1
         target_stride_k = 1
+
+    if B == 0:
+        empty = e.new_empty((0,), dtype=torch.float32)
+        correct = (
+            e.new_empty((0, patch_size) if targets.ndim == 2 else (0,), dtype=torch.float32)
+            if targets is not None
+            else None
+        )
+        return LSEReturn(
+            empty,
+            e.new_zeros(V, dtype=torch.float32) if return_logit_avg else None,
+            correct,
+            e.new_empty(0, dtype=torch.float32) if return_mean_logit else None,
+            e.new_zeros(5, dtype=torch.float32) if return_topk else None,
+        )
 
     reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
     if reduction not in {"auto", "lock", "split"}:
@@ -532,11 +751,13 @@ def cce_lse_forward_kernel(
                 shift,
                 return_logit_avg,
                 return_mean_logit,
+                return_topk,
             )
         )
 
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
+    topk = e.new_zeros((B, 5), dtype=_topk_key_dtype(e, c, bias, softcap)) if return_topk else None
     mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
     # The fixed K=32 single-target path reconstructs targets with a diagonal
     # tl.dot. Patch targets stay fused because every slot must observe the exact
@@ -577,6 +798,7 @@ def cce_lse_forward_kernel(
         lse_slice: torch.Tensor,
         mean_logit_slice: torch.Tensor | None,
         locks_slice: torch.Tensor,
+        vocab_offset: int,
     ) -> None:
         slice_v = c_slice.size(0)
 
@@ -591,6 +813,7 @@ def cce_lse_forward_kernel(
             mean_logit_slice,
             logit_avg_slice,
             kernel_neg_correct_logit,
+            topk,
             locks_slice,
             valids_slice,
             kernel_targets,
@@ -617,10 +840,12 @@ def cce_lse_forward_kernel(
                 | (return_mean_logit << 2)
                 | ((logit_avg_slice is not None) << 3)
                 | ((kernel_targets is not None) << 4)
+                | (return_topk << 5)
             ),
             B_BIN=b_bin_fn(slice_b),
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
             PATCH_SIZE=patch_size,
+            VOCAB_OFFSET=vocab_offset,
         )
 
     fixed_tile_v = 128
@@ -643,6 +868,7 @@ def cce_lse_forward_kernel(
             lse,
             mean_logit,
             locks,
+            vocab_start,
         )
 
     logit_avg = _linear_logit_avg(e, c, bias, valids) if use_linear_logit_avg else kernel_logit_avg
@@ -662,4 +888,10 @@ def cce_lse_forward_kernel(
         if use_indexed_target
         else kernel_neg_correct_logit
     )
-    return LSEReturn(lse, logit_avg, neg_correct_logit, mean_logit)
+    return LSEReturn(
+        lse,
+        logit_avg,
+        neg_correct_logit,
+        mean_logit,
+        _topk_counts(topk, targets, valids, shift, e.size(0), V) if return_topk else None,
+    )

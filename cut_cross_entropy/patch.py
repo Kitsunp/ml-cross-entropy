@@ -20,15 +20,107 @@ def _integer(value: int, name: str) -> int:
         raise TypeError(f"{name} must be an integer, got {type(value).__name__}.") from error
 
 
+def pool_patch_inputs(
+    embeddings: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    patch_size: int,
+    coordinates: torch.Tensor | None = None,
+    corruption_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool effective embeddings and optional clean token geometry.
+
+    Inputs end in ``[raw_tokens, features]`` and masks in ``[raw_tokens]``.
+    Embeddings must already include every composition and MEAP override. For
+    each K-token patch, average embeddings over valid slots, but coordinates
+    only over valid, uncorrupted slots. This preserves the existing exclusion
+    of MEAP positions from JToK/JToK-M geometry gradients and router counts.
+    It is an explicit curriculum extension, not equivalence to token training.
+
+    Return ``(embedding, coordinate, core_valid, geometry_valid, fraction)``.
+    All leading output domains have ``raw_tokens // K`` rows. ``fraction`` is
+    the fraction of valid current input slots corrupted by MEAP, not a mask
+    on future target slots. Empty embeddings/coordinates are zero and their
+    corresponding validity is false. The coordinate placeholder must never
+    enter a router or auxiliary population when ``geometry_valid`` is false.
+
+    Sums use FP32 for FP16/BF16 inputs and preserve FP64 for reference tests;
+    pooled values return to their own input dtype. The VJP distributes each
+    pooled cotangent uniformly over its contributing slots, with no detach.
+    Tensor values do not control Python branches. This helper does not form
+    labels, run an embedding generator, or claim full-model compile stability.
+    """
+    patch_size = _integer(patch_size, "patch_size")
+    if patch_size < 1:
+        raise ValueError("patch_size must be positive.")
+    if embeddings.ndim < 2 or not embeddings.is_floating_point():
+        raise ValueError("embeddings must be floating point with a token and feature dimension.")
+    raw_tokens = embeddings.size(-2)
+    if raw_tokens == 0 or raw_tokens % patch_size:
+        raise ValueError("raw token count must be positive and divisible by patch_size.")
+    domain = embeddings.shape[:-1]
+    for name, mask in (("valid_mask", valid_mask), ("corruption_mask", corruption_mask)):
+        if mask is None:
+            continue
+        if mask.shape != domain or mask.dtype != torch.bool or mask.device != embeddings.device:
+            raise ValueError(f"{name} must be boolean and match the embedding token domain/device.")
+    if coordinates is not None:
+        if (
+            coordinates.shape[:-1] != domain
+            or not coordinates.is_floating_point()
+            or coordinates.device != embeddings.device
+        ):
+            raise ValueError(
+                "coordinates must be floating point and match the token domain/device."
+            )
+
+    rows = raw_tokens // patch_size
+    grouped_valid = valid_mask.unflatten(-1, (rows, patch_size))
+    counts = grouped_valid.sum(dim=-1)
+    if corruption_mask is None:
+        grouped_clean = grouped_valid
+        fraction = counts.new_zeros(counts.shape, dtype=torch.float32)
+    else:
+        grouped_corrupt = corruption_mask.unflatten(-1, (rows, patch_size)) & grouped_valid
+        grouped_clean = grouped_valid & ~grouped_corrupt
+        fraction = grouped_corrupt.sum(dim=-1).float() / counts.clamp_min(1).float()
+    clean_counts = grouped_clean.sum(dim=-1)
+
+    def pool(values, members, member_counts):
+        grouped = values.unflatten(-2, (rows, patch_size))
+        accumulation_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
+        # Selection before summation avoids 0 * NaN at an excluded slot.
+        total = torch.where(members.unsqueeze(-1), grouped, 0).sum(dim=-2, dtype=accumulation_dtype)
+        return (total / member_counts.clamp_min(1).unsqueeze(-1)).to(values.dtype).contiguous()
+
+    pooled_embeddings = pool(embeddings, grouped_valid, counts)
+    pooled_coordinates = (
+        None if coordinates is None else pool(coordinates, grouped_clean, clean_counts)
+    )
+    return (
+        pooled_embeddings,
+        pooled_coordinates,
+        counts.gt(0).contiguous(),
+        clean_counts.gt(0).contiguous(),
+        fraction.contiguous(),
+    )
+
+
 @dataclass(frozen=True)
 class PatchTrainingSchedule:
     """Select the patch or token phase outside the compiled model.
 
-    Steps are zero-based: with ``patch_training_steps=90_000``, steps
-    ``0..89_999`` use patch targets and step ``90_000`` is the first token
-    step. The CCE flag remains enabled in both phases; token targets are packed
-    into a fixed final dimension so changing phases does not change the loss
-    signature.
+    ``global_step`` is the number of completed optimizer updates before the
+    next update, not a microbatch, example or token counter. All microbatches
+    accumulated into that update must receive the same value. With
+    ``patch_training_steps=90_000``, values ``0..89_999`` use patch targets and
+    value ``90_000`` selects the first token update. On resume, supply the
+    restored update count, not a new counter starting at zero.
+
+    The CCE flag remains enabled in both phases; token targets are packed into
+    a fixed final dimension so changing phases does not change the loss
+    signature. Data consumption can be logged independently but cannot change
+    this schedule's phase boundary.
     """
 
     patch_training_steps: int
@@ -48,7 +140,7 @@ class PatchTrainingSchedule:
         object.__setattr__(self, "ignore_index", ignore_index)
 
     def phase(self, global_step: int) -> PatchTrainingPhase:
-        """Return the phase for a zero-based optimizer step."""
+        """Select the next update from the completed optimizer-update count."""
         step = _integer(global_step, "global_step")
         if step < 0:
             raise ValueError("global_step must be non-negative.")

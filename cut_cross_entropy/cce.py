@@ -48,6 +48,8 @@ class CCEParams:
     mile_group_mask: torch.Tensor | None
     mu_loss_lambda: float | None
     patch_training_enabled: bool
+    mile_group_fraction: torch.Tensor | None = None
+    return_topk: bool = False
 
 
 @torch.compiler.assume_constant_result
@@ -68,6 +70,7 @@ def _validate_cce_inputs(
     mu_loss_lambda: float,
     patch_training_enabled: bool,
     mile_group_mask: torch.Tensor | None = None,
+    mile_group_fraction: torch.Tensor | None = None,
 ) -> None:
     """Keep eager and compiler-boundary input validation identical."""
     if patch_training_enabled:
@@ -97,6 +100,23 @@ def _validate_cce_inputs(
             raise TypeError("mile_group_mask must be boolean.")
         if mile_group_mask.device != targets.device:
             raise ValueError("mile_group_mask and targets must share a device.")
+    if mile_group_fraction is not None:
+        if not patch_training_enabled or not mile_enabled:
+            raise ValueError(
+                "mile_group_fraction requires patch_training_enabled=True and mile_enabled=True."
+            )
+        if mile_group_mask is not None:
+            raise ValueError("mile_group_fraction and mile_group_mask are mutually exclusive.")
+        if mile_group_fraction.shape != e.shape[:-1]:
+            raise ValueError("mile_group_fraction must match e.shape[:-1], not the target slots.")
+        if not mile_group_fraction.is_floating_point():
+            raise TypeError("mile_group_fraction must be floating point.")
+        if mile_group_fraction.device != e.device:
+            raise ValueError("mile_group_fraction and embeddings must share a device.")
+        if mile_group_fraction.requires_grad:
+            raise ValueError("mile_group_fraction is detached population metadata.")
+        if mile_gamma > torch.finfo(torch.float32).max:
+            raise ValueError("Fractional MiLe requires mile_gamma representable in float32.")
     if mu_loss_enabled and (not math.isfinite(mu_loss_lambda) or mu_loss_lambda < 0):
         raise ValueError(f"mu_loss_lambda must be finite and non-negative, got {mu_loss_lambda}.")
     if mu_loss_enabled and reduction != "mean":
@@ -172,6 +192,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             shift=params.shift,
             targets=targets,
             return_mean_logit=params.mile_gamma is not None,
+            return_topk=params.return_topk,
         )
         lse = ret.lse
         mean_logit = ret.mean_logit
@@ -192,6 +213,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                 c.size(0),
                 params.mile_gamma,
                 params.return_loss_metrics,
+                params.mile_group_fraction,
             )
             nll = None
             token_loss = None
@@ -299,6 +321,8 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                     mu_loss_metric,
                 )
             ).detach()
+            if params.return_topk:
+                loss_metrics = torch.cat((loss_metrics, ret.topk_counts)).detach()
             ctx.mark_non_differentiable(loss_metrics)
         else:
             loss_metrics = None
@@ -446,7 +470,13 @@ def cce_linear_cross_entropy(
     mu_loss_enabled: bool = False,
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
+    mile_group_fraction: torch.Tensor | None = None,
+    return_topk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if return_topk and (
+        not return_loss_metrics or reduction != "mean" or vocab_parallel_options is not None
+    ):
+        raise ValueError("Top-k requires mean loss metrics without vocabulary parallelism.")
     _validate_cce_inputs(
         e,
         c,
@@ -459,6 +489,7 @@ def cce_linear_cross_entropy(
         mu_loss_lambda,
         patch_training_enabled,
         mile_group_mask,
+        mile_group_fraction,
     )
 
     if patch_training_enabled:
@@ -484,6 +515,8 @@ def cce_linear_cross_entropy(
         # use the same one-sided, out-of-range-safe target predicate.
         targets = torch.where(targets == ignore_index, -1, targets)
         valids = None
+        if mile_group_fraction is not None:
+            mile_group_fraction = mile_group_fraction.to(torch.float32).contiguous().flatten()
     else:
         batch_shape = targets.size()
         global_vocab_size = c.size(0) * (
@@ -524,6 +557,8 @@ def cce_linear_cross_entropy(
         mile_group_mask=mile_group_mask,
         mu_loss_lambda=mu_loss_lambda if mu_loss_enabled else None,
         patch_training_enabled=patch_training_enabled,
+        mile_group_fraction=mile_group_fraction,
+        return_topk=return_topk,
     )
 
     return linear_cross_entropy_apply(e, c, bias, cce_params)

@@ -45,12 +45,104 @@ CCE_PROVENANCE_FILES = (
 )
 
 
-def _profile_phase(step: int) -> str:
+def _profile_phase(step: int, patch_steps: int = 0) -> str:
     """One-based phase for the fixed wait=1, warmup=1, active=2 schedule."""
     if step < 1:
         raise ValueError("optimizer step must be one-based")
-    return {1: "cold_wait", 2: "profile_warmup", 3: "profile_active",
-            4: "profile_active"}.get(step, "stable_unprofiled")
+    if patch_steps > 4 and step in (patch_steps, patch_steps + 1, patch_steps + 2):
+        return "transition_profile_warmup" if step == patch_steps else "transition_profile_active"
+    return {1: "cold_wait", 2: "profile_warmup", 3: "profile_active", 4: "profile_active"}.get(
+        step, "stable_unprofiled"
+    )
+
+
+def _configure_patch_training(
+    training: Any, patch_size: int | None, patch_steps: int
+) -> dict[str, Any]:
+    """Opt into the existing original-sequence producer, not example packing."""
+    if patch_size is None:
+        if hasattr(training, "USE_PATCH_TRAINING"):
+            training.USE_PATCH_TRAINING = False
+        return {"enabled": False, "patch_steps": 0}
+    required = ("USE_PATCH_TRAINING", "PATCH_SIZE", "PATCH_TRAINING_STEPS")
+    if (
+        patch_size != 4
+        or not 0 <= patch_steps < REAL_TRAIN_STEPS
+        or any(not hasattr(training, name) for name in required)
+        or not callable(
+            getattr(getattr(training, "AdEMAMixTrainer", None), "prewarm_patch_signatures", None)
+        )
+    ):
+        raise ValueError(
+            "Patch comparison requires K=4, steps in [0,99] and the prewarm Trainer API."
+        )
+    training.USE_PATCH_TRAINING = True
+    training.PATCH_SIZE = patch_size
+    training.PATCH_TRAINING_STEPS = patch_steps
+    return {
+        "enabled": True,
+        "patch_size": patch_size,
+        "patch_steps": patch_steps,
+        "token_steps": REAL_TRAIN_STEPS - patch_steps,
+        "raw_sequence_length": 512,
+        "patch_core_length": 512 // patch_size,
+        "token_core_length": 512,
+        "validation": "ordinary_unpatched_tokens",
+        "optimizer_transition": "continuous",
+        "matched_token_control": patch_steps == 0,
+        "concatenate_examples": False,
+    }
+
+
+def _trace_output_path(path: Path, phase: str) -> Path:
+    return path.with_name(f"{path.stem}-{phase}{path.suffix}")
+
+
+def _assert_prewarmed_signatures_stable(warm: dict[str, Any], current: dict[str, Any]) -> None:
+    # General Inductor counters also include cache hits: growth there does not
+    # mean compilation. These fields specifically measure new code/capture.
+    fields = (
+        "unique_graphs",
+        "graph_breaks",
+        "recompiles",
+        "generated_inductor_kernels",
+        "compilation_event_counts",
+        "cuda_graph_tree_nodes",
+        "cuda_graph_rerecord_count",
+        "cuda_graph_new_recording_events",
+        "cce_triton_jit_entries",
+        "cute_jit_entries",
+    )
+    changed = [key for key in fields if current.get(key) != warm.get(key)]
+    if changed:
+        raise RuntimeError("Prewarmed execution signatures changed: " + ", ".join(changed))
+
+
+def _external_jit_snapshot() -> dict[str, Any]:
+    from triton.runtime.jit import JITFunction
+
+    entries = {}
+    for name, module in tuple(sys.modules.items()):
+        if not name.startswith("cut_cross_entropy."):
+            continue
+        for function in tuple(vars(module).values()):
+            while (
+                not isinstance(function, JITFunction) and getattr(function, "fn", None) is not None
+            ):
+                function = function.fn
+            if isinstance(function, JITFunction) and function.device_caches:
+                entries[function.fn.__module__ + "." + function.fn.__name__] = {
+                    str(device): len(cache[0]) for device, cache in function.device_caches.items()
+                }
+    return {
+        "cce_triton_jit_entries": entries,
+        "cute_jit_entries": {
+            name: len(module._CACHE)
+            for name, module in tuple(sys.modules.items())
+            if name.startswith("cut_cross_entropy.")
+            and isinstance(getattr(module, "_CACHE", None), dict)
+        },
+    }
 
 
 def _step_statistics(values: list[float]) -> dict[str, Any]:
@@ -62,10 +154,15 @@ def _step_statistics(values: list[float]) -> dict[str, Any]:
     right = math.ceil(p95_index)
     p95 = ordered[left] + (ordered[right] - ordered[left]) * (p95_index - left)
     median = statistics.median(values)
-    return {"count": len(values), "median_seconds": median,
-            "steps_per_second": 1.0 / median, "p95_seconds": p95,
-            "min_seconds": min(values), "max_seconds": max(values),
-            "population_stddev_seconds": statistics.pstdev(values)}
+    return {
+        "count": len(values),
+        "median_seconds": median,
+        "steps_per_second": 1.0 / median,
+        "p95_seconds": p95,
+        "min_seconds": min(values),
+        "max_seconds": max(values),
+        "population_stddev_seconds": statistics.pstdev(values),
+    }
 
 
 def _stable_step_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -103,6 +200,174 @@ def _redact_text(value: object) -> str:
         text,
     )
     return text
+
+
+def _validate_perplexity_record(
+    metrics: dict[str, float], first_step: int, last_step: int, batch_size: int, patch_steps: int
+) -> None:
+    """Reject nonfinite/impossible telemetry before accepting a real-data run."""
+    patch_updates = max(0, min(last_step, patch_steps) - min(first_step - 1, patch_steps))
+    total_updates = last_step - first_step + 1
+    for stem, updates, exp_key in (
+        ("train_", total_updates - patch_updates, "ppl"),
+        ("train_patch_", patch_updates, "exp_ce"),
+    ):
+        count = metrics.get(stem + "valid_targets", 0.0)
+        if (
+            not math.isfinite(count)
+            or count < 0
+            or count != int(count)
+            or count > updates * batch_size * 512
+        ):
+            raise RuntimeError("Invalid perplexity target count for the logged curriculum window.")
+        if count:
+            for key in ("ce", exp_key):
+                value = metrics.get(stem + key, float("nan"))
+                if not math.isfinite(value) or value < 0 or (key == exp_key and value < 1):
+                    raise RuntimeError("Invalid perplexity loss or exponential.")
+            for key in ("mile_loss", "mile_ppl" if stem == "train_" else "mile_exp_loss"):
+                if stem + key not in metrics:
+                    continue
+                value = metrics[stem + key]
+                if not math.isfinite(value) or value < (1 if key != "mile_loss" else 0):
+                    raise RuntimeError("Invalid MiLe perplexity metric.")
+        elif any(
+            metrics.get(stem + key, 0.0) != 0.0
+            for key in ("ce", exp_key, "mile_loss", "mile_ppl", "mile_exp_loss")
+        ):
+            raise RuntimeError("Perplexity metrics exist without supervised targets.")
+
+
+def _compare_curriculum_runs(control: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Compare completed private runs, without repeating an existing control.
+
+    Source/runtime/policy must match; only the patch-step boundary may differ.
+    Token recovery compares the same unprofiled optimizer-step indices in both
+    runs, not late candidate steps against cold/profiled control updates. This
+    is one sequential comparison, not evidence of statistical equivalence.
+    """
+    for run in (control, candidate):
+        timing = run.get("timing", {})
+        if (
+            run.get("status") != "ok"
+            or timing.get("train_steps_completed") != REAL_TRAIN_STEPS
+            or timing.get("validation_steps_completed") != REAL_VALIDATION_STEPS
+        ):
+            raise ValueError("Curriculum comparison requires completed real100+100 runs.")
+        previous = 0
+        for entry in timing.get("perplexity_log_records", []):
+            _validate_perplexity_record(
+                entry["metrics"],
+                previous + 1,
+                entry["optimizer_step"],
+                run["batch_size"],
+                run["patch_curriculum"]["patch_steps"],
+            )
+            previous = entry["optimizer_step"]
+    for key in (
+        "mode",
+        "batch_size",
+        "sequence_length",
+        "seed",
+        "data_seed",
+        "data_policy",
+        "module_hashes",
+        "runtime",
+        "kernel_policy",
+        "normalization_comparison",
+        "perplexity_metrics",
+        "topk_metrics",
+        "imports",
+    ):
+        if key not in control or key not in candidate or control[key] != candidate[key]:
+            raise ValueError(f"Curriculum comparison has mismatched {key}.")
+    for key in (
+        "enabled",
+        "logging_steps",
+        "sample_tokens",
+        "parameter_samples_per_tensor",
+        "parameter_interval",
+    ):
+        if control.get("dynamics", {}).get(key) != candidate.get("dynamics", {}).get(key):
+            raise ValueError("Curriculum comparison has mismatched dynamics policy.")
+    baseline = control.get("patch_curriculum", {})
+    curriculum = candidate.get("patch_curriculum", {})
+    if (
+        not baseline.get("matched_token_control")
+        or not curriculum.get("enabled")
+        or baseline.get("patch_steps") != 0
+        or curriculum.get("patch_steps", 0) <= 0
+    ):
+        raise ValueError("Compare a matched all-K1 control with a positive patch curriculum.")
+    for key in (
+        "patch_size",
+        "raw_sequence_length",
+        "validation",
+        "optimizer_transition",
+        "concatenate_examples",
+    ):
+        if key not in baseline or baseline[key] != curriculum.get(key):
+            raise ValueError(f"Curriculum comparison has mismatched patch {key}.")
+    left = {
+        row["optimizer_step"]: row
+        for row in control["timing"]["step_records"]
+        if row["phase"] == "stable_unprofiled"
+    }
+    right = {
+        row["optimizer_step"]: row
+        for row in candidate["timing"]["step_records"]
+        if row["phase"] == "stable_unprofiled" and row["curriculum_phase"] == "token"
+    }
+    indices = sorted(left.keys() & right.keys())
+    if not indices:
+        raise ValueError("No common stable token-phase optimizer steps.")
+    reference = _step_statistics([left[index]["compute_seconds"] for index in indices])[
+        "median_seconds"
+    ]
+    restored = _step_statistics([right[index]["compute_seconds"] for index in indices])[
+        "median_seconds"
+    ]
+    result = {
+        "token_recovery": {
+            "optimizer_steps": indices,
+            "control_median_seconds": reference,
+            "curriculum_token_median_seconds": restored,
+            "latency_change_percent": 100 * (restored / reference - 1),
+            "note": "matched K1, not an untouched ordinary-training baseline",
+        },
+        "timing": {},
+        "memory": {},
+        "evidence": "one sequential profiled comparison; not a statistical equivalence claim",
+    }
+    for key in (
+        "train_wall_seconds",
+        "train_compute_seconds_sum",
+        "train_batch_ready_seconds_sum",
+        "validation_wall_seconds",
+        "validation_prediction_seconds_sum",
+    ):
+        before, after = control["timing"][key], candidate["timing"][key]
+        if not math.isfinite(before) or not math.isfinite(after) or before <= 0 or after <= 0:
+            raise ValueError("Comparison timings must be finite and positive.")
+        result["timing"][key] = {
+            "control": before,
+            "curriculum": after,
+            "change_percent": 100 * (after / before - 1),
+        }
+    for key in (
+        "train_peak_allocated_bytes",
+        "train_peak_reserved_bytes",
+        "validation_peak_allocated_bytes",
+        "validation_peak_reserved_bytes",
+    ):
+        before, after = control["memory"][key], candidate["memory"][key]
+        result["memory"][key] = {
+            "control": before,
+            "curriculum": after,
+            "change_bytes": after - before,
+            "change_percent": 100 * (after / before - 1) if before else None,
+        }
+    return result
 
 
 def _sha256_file(path: Path) -> str:
@@ -150,8 +415,10 @@ def _load_training_module(path: Path):
 def _configure_dynamics_metrics(training: Any, enabled: bool, logging_steps: int) -> dict[str, Any]:
     """Configure opt-in metrics without requiring their API on legacy controls."""
     required = (
-        "USE_DYNAMICS_METRICS", "DYNAMICS_SAMPLE_TOKENS",
-        "DYNAMICS_PARAMETER_SAMPLES", "DYNAMICS_INTERVAL",
+        "USE_DYNAMICS_METRICS",
+        "DYNAMICS_SAMPLE_TOKENS",
+        "DYNAMICS_PARAMETER_SAMPLES",
+        "DYNAMICS_INTERVAL",
     )
     missing = [name for name in required if not hasattr(training, name)]
     if enabled and missing:
@@ -162,10 +429,13 @@ def _configure_dynamics_metrics(training: Any, enabled: bool, logging_steps: int
     if supported:
         training.DYNAMICS_INTERVAL = logging_steps
     return {
-        "enabled": bool(enabled), "supported": supported, "logging_steps": logging_steps,
+        "enabled": bool(enabled),
+        "supported": supported,
+        "logging_steps": logging_steps,
         "sample_tokens": training.DYNAMICS_SAMPLE_TOKENS if supported else None,
         "parameter_samples_per_tensor": training.DYNAMICS_PARAMETER_SAMPLES if supported else None,
-        "parameter_interval": training.DYNAMICS_INTERVAL if supported else None, "log_records": [],
+        "parameter_interval": training.DYNAMICS_INTERVAL if supported else None,
+        "log_records": [],
         "note": "private observability output; benchmark cadence is explicit, not the production default",
     }
 
@@ -272,7 +542,9 @@ def _prepare_preexisting_splits(
 
     return (
         train_dataset.select(range(needed_rows)),
-        validation_dataset.select(range(validation_offset, validation_offset + needed_validation_rows)),
+        validation_dataset.select(
+            range(validation_offset, validation_offset + needed_validation_rows)
+        ),
     )
 
 
@@ -283,14 +555,46 @@ def _parse_args() -> argparse.Namespace:
     data_group.add_argument("--data-dir", type=Path)
     data_group.add_argument("--train-data-dir", type=Path)
     parser.add_argument("--validation-data-dir", type=Path)
-    parser.add_argument("--validation-from-train", action="store_true",
-                        help="Evaluate the next disjoint training-source rows, not the original held-out split.")
+    parser.add_argument(
+        "--validation-from-train",
+        action="store_true",
+        help="Evaluate the next disjoint training-source rows, not the original held-out split.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--train-script", type=Path, default=Path("/train.py"))
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--embedding-mode", choices=("leviathan", "table"), default="leviathan")
+    parser.add_argument("--siamesenorm-backend", choices=("off", "reference", "triton", "cute"))
     parser.add_argument("--candidate-manifest", type=Path)
     parser.add_argument("--dynamics-metrics", action="store_true")
+    parser.add_argument(
+        "--no-perplexity-metrics",
+        action="store_true",
+        help="Matched overhead control only; normal runs collect CCE CE/MiLe PPL.",
+    )
+    parser.add_argument(
+        "--no-topk-metrics",
+        action="store_true",
+        help="Matched overhead control; disable full-token Top-1/3/5.",
+    )
     parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        choices=(4,),
+        help="Keep each raw512 sequence; use core128 then core512, with full prewarm.",
+    )
+    parser.add_argument(
+        "--patch-steps",
+        type=int,
+        default=67,
+        help="Completed optimizer-update boundary; zero selects the matched K1 control.",
+    )
+    parser.add_argument(
+        "--control-results",
+        type=Path,
+        help="Reuse a completed private matched-K1 result for timing/memory/recovery comparison.",
+    )
     parser.add_argument(
         "--profile",
         type=Path,
@@ -337,6 +641,36 @@ def _require_strict_leviathan(model: Any, result: dict[str, Any]) -> Any:
     return model
 
 
+def _validate_leviathan_tile_overrides() -> None:
+    """Reporting labels such as 'auto' are not integer kernel overrides."""
+    for name in ("LEV_DDELTA_BM", "LEV_DDELTA_BD", "LEV_DDELTA_BR"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError(f"{name} must be a positive integer or unset") from error
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer or unset")
+
+
+def _forbid_leviathan_reference_fallbacks(compiler: Any, result: dict[str, Any]) -> None:
+    """Fail closed at the actual compiler boundary, not just model readiness."""
+    attempts = {"forward": 0, "backward": 0}
+    result["leviathan_reference_fallback_attempts"] = attempts
+
+    def forbidden(phase: str):
+        def reject(*_args: Any, **_kwargs: Any):
+            attempts[phase] += 1
+            raise RuntimeError(f"real validation forbids Leviathan reference {phase} fallback")
+
+        return reject
+
+    compiler.leviathan_forward_ref = forbidden("forward")
+    compiler.leviathan_backward = forbidden("backward")
+
+
 def _write_result(path: Path, result: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -344,8 +678,24 @@ def _write_result(path: Path, result: dict[str, Any]) -> None:
 
 def main() -> int:
     args = _parse_args()
+    if args.output.exists() or args.profile.exists():
+        raise FileExistsError(
+            "Choose fresh private result/profile paths; evidence is never overwritten."
+        )
+    if any(
+        _trace_output_path(args.profile, phase).exists()
+        for phase in ("prewarm", "initial", "transition", "validation")
+    ):
+        raise FileExistsError("A phase trace already exists; choose a fresh private run name.")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive")
+    if args.control_results is not None and (args.patch_size is None or args.patch_steps <= 0):
+        raise ValueError("--control-results requires a positive patch curriculum.")
+    control_results = (
+        json.loads(args.control_results.read_text(encoding="utf-8"))
+        if args.control_results is not None
+        else None
+    )
     if not 1 <= args.logging_steps <= REAL_TRAIN_STEPS:
         raise ValueError("--logging-steps must be between one and the train step count")
     if (args.train_data_dir is None) != (args.validation_data_dir is None):
@@ -379,13 +729,19 @@ def main() -> int:
             "source": "preexisting_tokenized_remote_data",
             "download_allowed": False,
             "synthetic_allowed_for_gate": False,
-            "validation_source": ("disjoint_preexisting_train_rows" if args.validation_from_train
-                                  else "preexisting_validation_split"),
+            "validation_source": (
+                "disjoint_preexisting_train_rows"
+                if args.validation_from_train
+                else "preexisting_validation_split"
+            ),
             "validation_is_original_heldout_split": not args.validation_from_train,
             "training_row_range": [0, REAL_TRAIN_STEPS * args.batch_size],
-            "validation_row_range": [REAL_TRAIN_STEPS * args.batch_size,
-                                     (REAL_TRAIN_STEPS + REAL_VALIDATION_STEPS) * args.batch_size]
-                                    if args.validation_from_train else [0, REAL_VALIDATION_STEPS * args.batch_size],
+            "validation_row_range": [
+                REAL_TRAIN_STEPS * args.batch_size,
+                (REAL_TRAIN_STEPS + REAL_VALIDATION_STEPS) * args.batch_size,
+            ]
+            if args.validation_from_train
+            else [0, REAL_VALIDATION_STEPS * args.batch_size],
         },
         "kernel_policy": {
             "jtok_route_vjp_factor": os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0"),
@@ -397,9 +753,7 @@ def main() -> int:
             "d_delta_block_m": os.environ.get("LEV_DDELTA_BM", "auto"),
             "d_delta_block_d": os.environ.get("LEV_DDELTA_BD", "auto"),
             "d_delta_block_r": os.environ.get("LEV_DDELTA_BR", "auto"),
-            "fused_chain_d_delta": os.environ.get(
-                "LEV_FUSE_CHAIN_DDELTA", "auto"
-            ),
+            "fused_chain_d_delta": os.environ.get("LEV_FUSE_CHAIN_DDELTA", "auto"),
         },
         "timing": {"train_step_seconds": []},
     }
@@ -410,12 +764,58 @@ def main() -> int:
         "step_records": [],
         "train_losses": [],
         "eval_prediction_steps": 0,
+        "validation_step_seconds": [],
+        "perplexity_log_records": [],
     }
     profile_holder: dict[str, Any] = {"profiler": None}
 
     try:
         import torch
+        from torch._dynamo.utils import counters
         from transformers import TrainerCallback
+
+        def compiler_snapshot():
+            from torch._dynamo.utils import compilation_time_metrics
+            from torch._inductor import metrics
+            from torch._inductor.cudagraph_trees import get_manager
+
+            snapshot = {
+                "unique_graphs": counters["stats"]["unique_graphs"],
+                "graph_breaks": sum(counters["graph_break"].values()),
+                "recompiles": sum(counters["recompiles"].values()),
+                "generated_inductor_kernels": metrics.generated_kernel_count,
+                "compilation_event_counts": {
+                    str(k): len(v) for k, v in compilation_time_metrics.items()
+                },
+                "inductor_counters": dict(counters["inductor"]),
+            }
+            # Read only an existing manager: observing must not create one.
+            manager = get_manager(create_if_none_exists=False)
+            if manager is not None:
+                pending = [n for nodes in manager.roots.values() for n in nodes]
+                seen = set()
+                while pending:
+                    node = pending.pop()
+                    if id(node) in seen:
+                        continue
+                    seen.add(id(node))
+                    pending.extend(n for nodes in node.children.values() for n in nodes)
+                snapshot["cuda_graph_tree_nodes"] = len(seen)
+                snapshot["cuda_graph_rerecord_count"] = sum(
+                    sum(v.values()) for v in manager.num_rerecord.values()
+                )
+                # Despite its name, debug_fail_counter counts tree replay
+                # misses that require a new recording, not capture failures.
+                snapshot["cuda_graph_new_recording_events"] = manager.debug_fail_counter
+            else:
+                snapshot["cuda_graph_tree_nodes"] = None
+            # External JIT caches are distinct from Dynamo/Inductor graphs.
+            cute_module = sys.modules.get("cut_cross_entropy.siamesenorm._cute")
+            snapshot["siamesenorm_cute_jit_entries"] = (
+                len(cute_module._CACHE) if cute_module is not None else 0
+            )
+            snapshot.update(_external_jit_snapshot())
+            return snapshot
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for the remote real validation")
@@ -423,8 +823,28 @@ def main() -> int:
         torch.cuda.manual_seed_all(1729)
 
         training = _load_training_module(args.train_script)
+        if not hasattr(training, "USE_PERPLEXITY_METRICS"):
+            raise RuntimeError("The training script lacks CCE/MiLe perplexity collection.")
+        training.USE_PERPLEXITY_METRICS = not args.no_perplexity_metrics
+        if not hasattr(training, "USE_TOPK_METRICS"):
+            raise RuntimeError("Private Trainer lacks explicit full-token Top-k configuration.")
+        training.USE_TOPK_METRICS = not args.no_topk_metrics
+        result["topk_metrics"] = {
+            "enabled": not args.no_topk_metrics,
+            "coverage": "all_valid_supervised_token_targets",
+            "scope": "ordinary_token_phase_and_validation_only",
+            "weighting": "unweighted_for_both_ce_and_mile",
+        }
+        result["perplexity_metrics"] = {
+            "enabled": not args.no_perplexity_metrics,
+            "source": "cce_ce_and_mile_before_auxiliary_losses",
+        }
+        result["patch_curriculum"] = _configure_patch_training(
+            training, args.patch_size, args.patch_steps
+        )
         result["dynamics"] = _configure_dynamics_metrics(
-            training, args.dynamics_metrics, args.logging_steps)
+            training, args.dynamics_metrics, args.logging_steps
+        )
         result["runtime"] = _runtime_snapshot(torch)
         result["runtime_verification"] = {
             "leviathan_triton_required": True,
@@ -432,9 +852,7 @@ def main() -> int:
         }
         result["module_hashes"] = {
             "train.py": _sha256_file(args.train_script),
-            "modeling_neollm.py": _sha256_file(
-                args.train_script.parent / "modeling_neollm.py"
-            ),
+            "modeling_neollm.py": _sha256_file(args.train_script.parent / "modeling_neollm.py"),
             "configuration_neollm.py": _sha256_file(
                 args.train_script.parent / "configuration_neollm.py"
             ),
@@ -442,15 +860,28 @@ def main() -> int:
 
         import cut_cross_entropy
 
+        if args.embedding_mode == "leviathan":
+            from cut_cross_entropy.leviathan import compiler as leviathan_compiler
+
+            _validate_leviathan_tile_overrides()
+            _forbid_leviathan_reference_fallbacks(leviathan_compiler, result)
+
         cce_origin = Path(cut_cross_entropy.__file__).resolve()
         from cut_cross_entropy.leviathan.runtime_policy import compact_spline_requested
+
         projection_candidate = os.environ.get("JTOK_PROJECTION_SPLIT", "0") == "1"
         compact_jtok_candidate = os.environ.get("JTOK_COMPACT_SPLINE_VJP", "0") == "1"
         route_vjp_candidate = os.environ.get("JTOK_ROUTE_VJP_FACTOR", "0") == "1"
-        native_jtok_candidate = (os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
-                                 or projection_candidate or compact_jtok_candidate or route_vjp_candidate)
+        native_jtok_candidate = (
+            os.environ.get("JTOK_SPARSE_COEFF_UPDATES", "0") == "1"
+            or projection_candidate
+            or compact_jtok_candidate
+            or route_vjp_candidate
+        )
 
-        if (compact_spline_requested() or native_jtok_candidate) and args.candidate_manifest is None:
+        if (
+            compact_spline_requested() or native_jtok_candidate
+        ) and args.candidate_manifest is None:
             raise ValueError("candidate validation requires --candidate-manifest")
         if native_jtok_candidate and args.mode == "off":
             raise ValueError("native JTok candidate cannot be claimed when JTok is disabled")
@@ -485,8 +916,27 @@ def main() -> int:
         original_setup_model = training.setup_model
 
         def strict_setup_model(config_params: dict[str, Any], tokenizer: Any = None):
-            model = original_setup_model(config_params, tokenizer=tokenizer)
-            return _require_strict_leviathan(model, result)
+            params = dict(config_params)
+            if args.embedding_mode == "table":
+                if args.mode != "off":
+                    raise ValueError("table baseline requires JToK disabled")
+                params["use_token_generator"] = False
+            if args.siamesenorm_backend is not None:
+                params["use_siamesenorm"] = args.siamesenorm_backend != "off"
+            model = original_setup_model(params, tokenizer=tokenizer)
+            result["normalization_comparison"] = {
+                "embedding_mode": args.embedding_mode,
+                "siamesenorm_backend": args.siamesenorm_backend,
+            }
+            if args.siamesenorm_backend in ("triton", "cute"):
+                if not getattr(model, "_supports_siamesenorm_kernel", False):
+                    raise RuntimeError("private model lacks the SiameseNorm kernel integration")
+                for module in model.modules():
+                    module.siamesenorm_kernel_backend = args.siamesenorm_backend
+            if args.embedding_mode == "leviathan":
+                return _require_strict_leviathan(model, result)
+            result["runtime_verification"]["leviathan_triton_required"] = False
+            return model
 
         training.setup_model = strict_setup_model
 
@@ -547,13 +997,56 @@ def main() -> int:
         result_output_path = args.output
 
         class TimingCallback(TrainerCallback):
+            def __init__(self, trainer=None):
+                self.trainer = trainer
+
             def on_train_begin(self, args, state, control, **kwargs):
                 if compact_jtok_candidate:
                     from cut_cross_entropy.leviathan.jtok_compact import prepare_compact_jtok_grids
+
                     count = prepare_compact_jtok_grids(kwargs["model"])
                     if not count:
                         raise RuntimeError("compact JTok candidate found no grids to prevalidate")
                     result["runtime_verification"]["compact_jtok_grids_prevalidated"] = count
+                if result["patch_curriculum"]["enabled"]:
+                    trainer = self.trainer
+                    indices = (
+                        [0, trainer.train_dataset.boundary]
+                        if result["patch_curriculum"]["patch_steps"]
+                        else [0]
+                    )
+                    batches = [
+                        trainer.data_collator(
+                            [
+                                trainer.train_dataset[index + row]
+                                for row in range(args.per_device_train_batch_size)
+                            ]
+                        )
+                        for index in indices
+                    ]
+                    evaluation = trainer.data_collator(
+                        [
+                            trainer.eval_dataset[row]
+                            for row in range(args.per_device_eval_batch_size)
+                        ]
+                    )
+                    timing["_prewarming"] = True
+                    torch.cuda.synchronize()
+                    prewarm_start = time.perf_counter()
+                    try:
+                        result["prewarm"] = trainer.prewarm_patch_signatures(batches, evaluation)
+                    finally:
+                        timing["_prewarming"] = False
+                    torch.cuda.synchronize()
+                    result["prewarm"]["seconds"] = time.perf_counter() - prewarm_start
+                    result["prewarm"]["peak_allocated_bytes"] = int(
+                        torch.cuda.max_memory_allocated()
+                    )
+                    result["prewarm"]["peak_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+                    result["compiler_after_prewarm"] = compiler_snapshot()
+                    profiler = profile_holder.get("profiler")
+                    if profiler is not None:
+                        profiler.step()  # Save warmup separately, before counted update1.
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 timing["train_begin"] = time.perf_counter()
@@ -561,11 +1054,34 @@ def main() -> int:
 
             def on_step_begin(self, args, state, control, **kwargs):
                 torch.cuda.synchronize()
-                if int(state.global_step) == 4:
-                    result["memory"] = {
-                        "cold_profile_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-                        "cold_profile_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                curriculum = result.get("patch_curriculum", {})
+                if (
+                    curriculum.get("patch_steps", 0)
+                    and state.global_step == curriculum["patch_steps"]
+                ):
+                    result["compiler_before_transition"] = compiler_snapshot()
+                    _assert_prewarmed_signatures_stable(
+                        result["compiler_after_prewarm"], result["compiler_before_transition"]
+                    )
+                    result.setdefault("memory", {}).setdefault("by_curriculum_phase", {})[
+                        "patch"
+                    ] = {
+                        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
                     }
+                    torch.cuda.reset_peak_memory_stats()
+                if int(state.global_step) == 4:
+                    result["compiler_after_warmup"] = compiler_snapshot()
+                    result.setdefault("memory", {}).update(
+                        {
+                            "cold_profile_peak_allocated_bytes": int(
+                                torch.cuda.max_memory_allocated()
+                            ),
+                            "cold_profile_peak_reserved_bytes": int(
+                                torch.cuda.max_memory_reserved()
+                            ),
+                        }
+                    )
                     torch.cuda.reset_peak_memory_stats()
                 timing.setdefault("_step_starts", []).append(time.perf_counter())
                 return control
@@ -575,27 +1091,51 @@ def main() -> int:
                 step_end = time.perf_counter()
                 starts = timing.get("_step_starts", [])
                 if starts:
-                    timing["train_step_seconds"].append(
-                        step_end - starts[-1]
-                    )
+                    timing["train_step_seconds"].append(step_end - starts[-1])
                 compute_start = timing.pop("_compute_start", None)
                 e2e_start = timing.pop("_e2e_start", None)
                 if compute_start is None or e2e_start is None:
                     raise RuntimeError("batch-ready compute/e2e timing boundary was not observed")
                 step = len(timing["train_step_seconds"])
-                timing["step_records"].append({
-                    "optimizer_step": step, "phase": _profile_phase(step),
+                curriculum = result.get("patch_curriculum", {})
+                patch_steps = curriculum.get("patch_steps", 0)
+                record = {
+                    "optimizer_step": step,
+                    "phase": _profile_phase(step, patch_steps),
                     "compute_seconds": step_end - compute_start,
                     "e2e_seconds": step_end - e2e_start,
-                })
+                }
+                if curriculum.get("enabled"):
+                    record.update(
+                        {
+                            "curriculum_phase": "patch" if step <= patch_steps else "token",
+                            "patch_size": curriculum["patch_size"] if step <= patch_steps else 1,
+                        }
+                    )
+                    if patch_steps and step == patch_steps + 1:
+                        result["compiler_after_transition"] = compiler_snapshot()
+                        _assert_prewarmed_signatures_stable(
+                            result["compiler_after_prewarm"], result["compiler_after_transition"]
+                        )
+                timing["step_records"].append(record)
                 loss = timing.pop("_loss_snapshot").item()
                 if not math.isfinite(loss):
                     raise RuntimeError("nonfinite training loss")
                 timing["train_losses"].append(float(loss))
-                result.setdefault("memory", {}).update({
-                    "train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-                    "train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-                })
+                result.setdefault("memory", {}).update(
+                    {
+                        "train_peak_allocated_bytes": max(
+                            result.get("memory", {}).get("train_peak_allocated_bytes", 0),
+                            int(torch.cuda.max_memory_allocated()),
+                        ),
+                        "train_peak_reserved_bytes": max(
+                            result.get("memory", {}).get("train_peak_reserved_bytes", 0),
+                            int(torch.cuda.max_memory_reserved()),
+                        ),
+                    }
+                )
+                record["peak_allocated_bytes"] = int(torch.cuda.max_memory_allocated())
+                record["peak_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
                 result["timing"]["step_records"] = timing["step_records"]
                 _write_result(result_output_path, result)
                 profiler = profile_holder.get("profiler")
@@ -605,6 +1145,9 @@ def main() -> int:
 
             def on_prediction_step(self, args, state, control, **kwargs):
                 timing["eval_prediction_steps"] += 1
+                profiler = profile_holder.get("profiler")
+                if profiler is not None and not timing.get("_prewarming"):
+                    profiler.step()
                 return control
 
             def on_evaluate(self, args, state, control, metrics=None, **kwargs):
@@ -619,12 +1162,24 @@ def main() -> int:
                 return control
 
             def on_train_end(self, args, state, control, **kwargs):
+                result["compiler_after_train"] = compiler_snapshot()
+                if "compiler_after_prewarm" in result:
+                    _assert_prewarmed_signatures_stable(
+                        result["compiler_after_prewarm"], result["compiler_after_train"]
+                    )
                 torch.cuda.synchronize()
                 timing["train_end"] = time.perf_counter()
-                result.setdefault("memory", {}).update({
-                    "stable_train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-                    "stable_train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-                })
+                result.setdefault("memory", {}).update(
+                    {
+                        "stable_train_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                        "stable_train_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    }
+                )
+                if result.get("patch_curriculum", {}).get("enabled"):
+                    result["memory"].setdefault("by_curriculum_phase", {})["token"] = {
+                        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    }
                 torch.cuda.reset_peak_memory_stats()
                 return control
 
@@ -636,6 +1191,8 @@ def main() -> int:
             original_step = self.training_step
             original_loss = self.compute_loss
             original_log = self.log
+            original_prediction_step = self.prediction_step
+            original_evaluation_loop = self.evaluation_loop
 
             def measured_log(logs, *log_args, **log_kwargs):
                 is_training_step = "loss" in logs
@@ -649,12 +1206,56 @@ def main() -> int:
                     record = timing["step_records"][-1]
                     record["logging_seconds"] = seconds
                     record["compute_plus_logging_seconds"] = record["compute_seconds"] + seconds
-                    snapshot = {name: float(value) for name, value in logs.items()
-                                if name.startswith("dynamics/")}
-                    result["dynamics"]["log_records"].append({
-                        "optimizer_step": record["optimizer_step"], "logging_seconds": seconds,
-                        "metrics": snapshot,
-                    })
+                    snapshot = {
+                        name: float(value)
+                        for name, value in logs.items()
+                        if name.startswith("dynamics/")
+                    }
+                    timing["perplexity_log_records"].append(
+                        {
+                            "optimizer_step": record["optimizer_step"],
+                            "metrics": {
+                                name: float(value)
+                                for name, value in logs.items()
+                                if name.startswith("train_")
+                            },
+                        }
+                    )
+                    if not args.no_perplexity_metrics:
+                        records = timing["perplexity_log_records"]
+                        previous = records[-2]["optimizer_step"] if len(records) > 1 else 0
+                        _validate_perplexity_record(
+                            records[-1]["metrics"],
+                            previous + 1,
+                            record["optimizer_step"],
+                            args.batch_size,
+                            result["patch_curriculum"]["patch_steps"],
+                        )
+                    result["dynamics"]["log_records"].append(
+                        {
+                            "optimizer_step": record["optimizer_step"],
+                            "logging_seconds": seconds,
+                            "metrics": snapshot,
+                        }
+                    )
+                return output
+
+            def measured_prediction_step(*prediction_args, **prediction_kwargs):
+                if timing.get("_prewarming"):
+                    return original_prediction_step(*prediction_args, **prediction_kwargs)
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                output = original_prediction_step(*prediction_args, **prediction_kwargs)
+                torch.cuda.synchronize()
+                timing["validation_step_seconds"].append(time.perf_counter() - start)
+                return output
+
+            def measured_evaluation_loop(*evaluation_args, **evaluation_kwargs):
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                output = original_evaluation_loop(*evaluation_args, **evaluation_kwargs)
+                torch.cuda.synchronize()
+                timing["validation_wall_seconds"] = time.perf_counter() - start
                 return output
 
             def measured_batches(*batch_args, **batch_kwargs):
@@ -670,15 +1271,17 @@ def main() -> int:
                     timing["_inside_training_step"] = False
 
             def measured_loss(*loss_args, **loss_kwargs):
-                if timing.get("_inside_training_step"):
+                if timing.get("_inside_training_step") and not timing.get("_prewarming"):
                     if "_compute_start" in timing:
-                        raise RuntimeError("multiple loss calls in one fixed-contract optimizer step")
+                        raise RuntimeError(
+                            "multiple loss calls in one fixed-contract optimizer step"
+                        )
                     # Trainer has placed/prepared inputs before compute_loss.
                     # Synchronize outstanding H2D before the wall-clock compute boundary.
                     torch.cuda.synchronize()
                     timing["_compute_start"] = time.perf_counter()
                 output = original_loss(*loss_args, **loss_kwargs)
-                if timing.get("_inside_training_step"):
+                if timing.get("_inside_training_step") and not timing.get("_prewarming"):
                     loss = output[0] if isinstance(output, tuple) else output
                     # Own a tiny scalar copy: cudagraph replay may reuse output storage.
                     timing["_loss_snapshot"] = loss.detach().float().clone()
@@ -688,7 +1291,9 @@ def main() -> int:
             self.training_step = measured_step
             self.compute_loss = measured_loss
             self.log = measured_log
-            self.add_callback(TimingCallback())
+            self.prediction_step = measured_prediction_step
+            self.evaluation_loop = measured_evaluation_loop
+            self.add_callback(TimingCallback(self))
 
         training.AdEMAMixTrainer.__init__ = timed_trainer_init
 
@@ -697,14 +1302,54 @@ def main() -> int:
             args.profile.parent.mkdir(parents=True, exist_ok=True)
 
             def trace_handler(profiler: Any) -> None:
-                profiler.export_chrome_trace(str(args.profile))
+                index = len(result["profile"]["outputs"])
+                labels = ["initial"]
+                if result["patch_curriculum"]["enabled"]:
+                    labels = ["prewarm", "initial"]
+                    if result["patch_curriculum"]["patch_steps"]:
+                        labels.append("transition")
+                labels.append("validation")
+                label = labels[index]
+                path = (
+                    args.profile
+                    if label == "initial" and not result["patch_curriculum"]["enabled"]
+                    else _trace_output_path(args.profile, label)
+                )
+                if path.exists():
+                    raise FileExistsError("Refusing to overwrite a private execution trace.")
+                profiler.export_chrome_trace(str(path))
+                result["profile"]["outputs"].append({"phase": label, "output_name": path.name})
+
+            def profile_schedule(index):
+                prewarm = result["patch_curriculum"]["enabled"]
+                if prewarm and index == 0:
+                    return torch.profiler.ProfilerAction.RECORD_AND_SAVE
+                step = index if prewarm else index + 1
+                if step > REAL_TRAIN_STEPS:
+                    validation_step = step - REAL_TRAIN_STEPS
+                    return {
+                        2: torch.profiler.ProfilerAction.WARMUP,
+                        3: torch.profiler.ProfilerAction.RECORD,
+                        4: torch.profiler.ProfilerAction.RECORD_AND_SAVE,
+                    }.get(validation_step, torch.profiler.ProfilerAction.NONE)
+                phase = _profile_phase(step, result["patch_curriculum"]["patch_steps"])
+                if "warmup" in phase:
+                    return torch.profiler.ProfilerAction.WARMUP
+                if "active" in phase:
+                    last = step in (4, result["patch_curriculum"]["patch_steps"] + 2)
+                    return (
+                        torch.profiler.ProfilerAction.RECORD_AND_SAVE
+                        if last
+                        else torch.profiler.ProfilerAction.RECORD
+                    )
+                return torch.profiler.ProfilerAction.NONE
 
             profile_context = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                schedule=torch.profiler.schedule(wait=1, warmup=1, active=2, repeat=1),
+                schedule=profile_schedule,
                 on_trace_ready=trace_handler,
                 record_shapes=False,
                 profile_memory=True,
@@ -714,6 +1359,7 @@ def main() -> int:
                 "requested": True,
                 "diagnostic_only": True,
                 "output_name": args.profile.name,
+                "outputs": [],
             }
         else:
             result["profile"] = {"requested": False, "diagnostic_only": True}
@@ -721,6 +1367,12 @@ def main() -> int:
         with profile_context as profiler:
             profile_holder["profiler"] = profiler
             training.main()
+
+        result["compiler_after_validation"] = compiler_snapshot()
+        if "compiler_after_prewarm" in result:
+            _assert_prewarmed_signatures_stable(
+                result["compiler_after_prewarm"], result["compiler_after_validation"]
+            )
 
         if len(timing["train_step_seconds"]) != REAL_TRAIN_STEPS:
             raise RuntimeError("real validation completed an unexpected train step count")
@@ -736,16 +1388,20 @@ def main() -> int:
             )
 
         result["status"] = "ok"
-        result.setdefault("memory", {}).update({
-            "validation_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-            "validation_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-        })
+        result.setdefault("memory", {}).update(
+            {
+                "validation_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "validation_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+        )
         if args.dynamics_metrics:
             snapshots = result["dynamics"]["log_records"]
             if len(snapshots) != REAL_TRAIN_STEPS // args.logging_steps or any(
                 not record["metrics"] for record in snapshots
             ):
-                raise RuntimeError("dynamics metrics were not exposed at the requested logging cadence")
+                raise RuntimeError(
+                    "dynamics metrics were not exposed at the requested logging cadence"
+                )
             for record in snapshots:
                 observed = record["metrics"]
                 if any(not math.isfinite(value) for value in observed.values()):
@@ -759,9 +1415,7 @@ def main() -> int:
                 ):
                     raise RuntimeError("missing surface usage metric")
         train_step_median = statistics.median(timing["train_step_seconds"])
-        train_step_median_after_first = statistics.median(
-            timing["train_step_seconds"][1:]
-        )
+        train_step_median_after_first = statistics.median(timing["train_step_seconds"][1:])
         result["timing"] = {
             "train_step_seconds": timing["train_step_seconds"],
             "train_step_median_seconds": train_step_median,
@@ -769,7 +1423,19 @@ def main() -> int:
             "train_steps_per_second": 1.0 / train_step_median,
             "train_steps_per_second_after_first": 1.0 / train_step_median_after_first,
             "train_steps_completed": len(timing["train_step_seconds"]),
+            "train_wall_seconds": timing["train_end"] - timing["train_begin"],
+            "train_compute_seconds_sum": sum(
+                record["compute_seconds"] for record in timing["step_records"]
+            ),
+            "train_batch_ready_seconds_sum": sum(
+                record["e2e_seconds"] for record in timing["step_records"]
+            ),
             "validation_steps_completed": timing["eval_prediction_steps"],
+            "validation_wall_seconds": timing["validation_wall_seconds"],
+            "validation_step_seconds": timing["validation_step_seconds"],
+            "validation_prediction_seconds_sum": sum(timing["validation_step_seconds"]),
+            "validation_prediction": _step_statistics(timing["validation_step_seconds"]),
+            "perplexity_log_records": timing["perplexity_log_records"],
             "eval_metrics": timing.get("eval_metrics", {}),
             "train_losses": timing["train_losses"],
             "step_records": timing["step_records"],
@@ -777,10 +1443,40 @@ def main() -> int:
             "instrumentation": "host_cuda_sync_at_batch_fetch_compute_start_and_optimizer_end",
         }
         stable_records = [r for r in timing["step_records"] if r["phase"] == "stable_unprofiled"]
-        result["timing"]["stable"]["compute_plus_logging"] = _step_statistics([
-            r.get("compute_plus_logging_seconds", r["compute_seconds"]) for r in stable_records])
-        result["timing"]["stable"]["logging_events"] = _step_statistics([
-            r["logging_seconds"] for r in stable_records if "logging_seconds" in r])
+        result["timing"]["stable"]["compute_plus_logging"] = _step_statistics(
+            [r.get("compute_plus_logging_seconds", r["compute_seconds"]) for r in stable_records]
+        )
+        result["timing"]["stable"]["logging_events"] = _step_statistics(
+            [r["logging_seconds"] for r in stable_records if "logging_seconds" in r]
+        )
+        if result["patch_curriculum"]["enabled"]:
+            for phase in ("patch", "token"):
+                rows = [
+                    record
+                    for record in timing["step_records"]
+                    if record["curriculum_phase"] == phase
+                ]
+                if rows:
+                    result["memory"].setdefault("by_curriculum_phase", {})[phase] = {
+                        key: max(row[key] for row in rows)
+                        for key in ("peak_allocated_bytes", "peak_reserved_bytes")
+                    }
+            result["timing"]["by_curriculum_phase"] = {
+                phase: _stable_step_statistics(
+                    [
+                        record
+                        for record in timing["step_records"]
+                        if record["curriculum_phase"] == phase
+                    ]
+                )
+                for phase in ("patch", "token")
+                if any(
+                    record["curriculum_phase"] == phase and record["phase"] == "stable_unprofiled"
+                    for record in timing["step_records"]
+                )
+            }
+        if control_results is not None:
+            result["matched_control_comparison"] = _compare_curriculum_runs(control_results, result)
     except BaseException as error:
         result["status"] = "error"
         result["error_type"] = type(error).__name__
@@ -796,12 +1492,8 @@ def main() -> int:
         raise
     finally:
         result.setdefault("timing", {})
-        result["timing"].setdefault(
-            "train_steps_completed", len(timing["train_step_seconds"])
-        )
-        result["timing"].setdefault(
-            "validation_steps_completed", timing["eval_prediction_steps"]
-        )
+        result["timing"].setdefault("train_steps_completed", len(timing["train_step_seconds"]))
+        result["timing"].setdefault("validation_steps_completed", timing["eval_prediction_steps"])
         _write_result(args.output, result)
 
     return 0

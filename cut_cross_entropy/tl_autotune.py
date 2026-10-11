@@ -439,11 +439,7 @@ def _heuristics_from_config(
         return triton.heuristics(
             {
                 k: (
-                    (
-                        lambda args, _v=v, _fp32_v=fp32_v: block_b(
-                            args, _v, _fp32_v
-                        )
-                    )
+                    (lambda args, _v=v, _fp32_v=fp32_v: block_b(args, _v, _fp32_v))
                     if k == "BLOCK_B"
                     else (
                         lambda args, _v=v, _fp32_v=fp32_v: (
@@ -510,6 +506,15 @@ def _cce_backward_heuristic_config() -> Config:
     return config
 
 
+def _topk_forward_num_warps(args) -> int:
+    # The 32-bit indexed reduction keeps only five uint64 winners, but its
+    # large-tile epilogue still benefits from more register-bearing threads.
+    # Preserve the B/V/D arithmetic and leave metrics-disabled runs unchanged.
+    if args.get("TopK") is not None and args["BLOCK_B"] >= 64:
+        return max(8, args["num_warps"])
+    return args["num_warps"]
+
+
 def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
     if _AUTOTUNE:
         return _cce_autotune(
@@ -521,16 +526,22 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
                 "top_k": 6,
             },
             restore_value=["LSE", "MeanLogit"],
-            reset_to_zero=["LA"],
+            reset_to_zero=["LA", "TopK"],
             cache_results=True,
         )
     else:
-        return _heuristics_from_config(
+        configured = _heuristics_from_config(
             _cce_best_config(),
             _cce_best_config_fp32(),
             "E",
             adaptive_block_b=True,
         )
+
+        def decorate(fn):
+            topk_heuristics = triton.heuristics({"num_warps": _topk_forward_num_warps})(fn)
+            return configured(topk_heuristics)
+
+        return decorate
 
 
 def _bw_total_ops_fn(B, V, D) -> float:
@@ -539,6 +550,23 @@ def _bw_total_ops_fn(B, V, D) -> float:
 
 def _bw_total_store_fn(B, V, D, dtsize, num_cta_b, num_cta_v):
     return 0.2 * (num_cta_v * B * D * dtsize + num_cta_b * D * V * dtsize)
+
+
+def _patch_backward_num_warps(args) -> int:
+    """Give the large low-SMEM BF16 patch tile more register-bearing threads."""
+    configured = args["num_warps"]
+    if (
+        1 <= args.get("PATCH_SIZE", 0) <= 4
+        and args["E"].dtype == torch.bfloat16
+        and args["D"] >= 128
+        and args["BLOCK_B"] == 128
+        and args["BLOCK_V"] == 128
+        and args["BLOCK_D"] == 16
+        and configured == 4
+        and args["num_stages"] == 2
+    ):
+        return 8
+    return configured
 
 
 def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
@@ -561,12 +589,20 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
             cache_results=True,
         )
     else:
-        return _heuristics_from_config(
+        configured_heuristics = _heuristics_from_config(
             _cce_backward_heuristic_config(),
             _cce_backward_best_config_fp32(),
             "E",
             adaptive_block_b=True,
         )
+
+        def decorate(fn):
+            # Outer heuristics selects dtype/tile first; only then choose the
+            # patch warp count. Explicit autotuning above remains untouched.
+            patch_heuristics = triton.heuristics({"num_warps": _patch_backward_num_warps})(fn)
+            return configured_heuristics(patch_heuristics)
+
+        return decorate
 
 
 def _indexed_dot_best_config() -> Config:

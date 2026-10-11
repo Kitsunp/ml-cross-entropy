@@ -390,6 +390,7 @@ def _cce_backward_kernel(
     Bias,
     LSE,
     MiLeWeight,
+    PatchTargetWeight,
     dOut,
     grad_scale,
     dLSE,
@@ -414,6 +415,8 @@ def _cce_backward_kernel(
     stride_cd,
     stride_biasv,
     stride_vb,
+    stride_patch_b,
+    stride_patch_k,
     filter_eps,
     de_accum_scale,
     dc_accum_scale,
@@ -450,6 +453,7 @@ def _cce_backward_kernel(
     SCALE_DC: tl.constexpr,
     SHARED_ACCUM_SCALE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    PATCH_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_b_chunks = tl.cdiv(B, BLOCK_B)
@@ -521,7 +525,7 @@ def _cce_backward_kernel(
         probabilities = tl.where(v_mask[None, :], probabilities, 0.0)
     d_accum = probabilities
 
-    if HAS_TARGETS:
+    if HAS_TARGETS and PATCH_SIZE == 0:
         if HAS_SHIFT:
             target_offs_b = offs_b + shift
         else:
@@ -541,6 +545,36 @@ def _cce_backward_kernel(
         mile_row_mask = mile_offs_b < B
         mile_weight = tl.load(MiLeWeight + mile_offs_b, mask=mile_row_mask, other=0.0)[:, None]
         d_accum = mile_weight * d_accum
+
+    if PATCH_SIZE > 0:
+        # Form the COMPLETE cotangent before the low-precision dot cast.
+        # Rounding the dense term before a separate sparse subtraction is not
+        # equivalent, even for one active target in a fixed Kmax-wide row.
+        # Count duplicates on row vectors, not a second FP32 vocabulary tile.
+        # Apply each distinct target once: repeated subtraction can leave a
+        # residue, e.g. 1 - FP32(1/3) - FP32(1/3) - FP32(1/3) != 0.
+        target_weight = tl.load(PatchTargetWeight + offs_b, mask=offs_b < B, other=0.0)
+        for slot in tl.static_range(PATCH_SIZE):
+            target = tl.load(
+                Targets + offs_b * stride_patch_b + slot * stride_patch_k,
+                mask=offs_b < BMax,
+                other=-1,
+            ).to(tl.int64)
+            first = (target >= 0) & (target < V)
+            count = tl.full((BLOCK_B,), 1, tl.int32)
+            for other_slot in tl.static_range(PATCH_SIZE):
+                if other_slot != slot:
+                    other_target = tl.load(
+                        Targets + offs_b * stride_patch_b + other_slot * stride_patch_k,
+                        mask=offs_b < BMax,
+                        other=-1,
+                    ).to(tl.int64)
+                    if other_slot < slot:
+                        first &= target != other_target
+                    else:
+                        count += (target == other_target).to(tl.int32)
+            matches = first[:, None] & (target[:, None] == offs_v[None, :])
+            d_accum -= tl.where(matches, (target_weight * count)[:, None], 0.0)
 
     should_skip = False
     if not (HAS_MILE and HAS_DLSE):
@@ -907,10 +941,15 @@ def cce_backward_kernel(
     # problems keep the already-supported fused path, where launch latency is
     # more expensive than the target comparison.
     patch_targets = patch_target_weight is not None
+    # Keep Kmax=1..4's small comparison budget inside the dense tile. Larger
+    # public patch widths retain the sparse path to avoid unbounded unrolling.
+    fused_patch_targets = patch_targets and targets.size(1) <= 4
     separate_target = (
         targets is not None and not patch_targets and softcap is None and B * c.size(0) >= 1 << 24
     )
-    kernel_targets = None if separate_target or patch_targets else targets
+    kernel_targets = (
+        None if separate_target or (patch_targets and not fused_patch_targets) else targets
+    )
 
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None and not use_atomic_e:
@@ -946,6 +985,7 @@ def cce_backward_kernel(
             bias_slice,
             lse,
             mile_weight,
+            patch_target_weight if fused_patch_targets else None,
             do,
             grad_scale,
             dlse,
@@ -970,6 +1010,8 @@ def cce_backward_kernel(
             c_slice.stride(1),
             1 if bias_slice is None else bias_slice.stride(0),
             1 if valids is None else valids.stride(0),
+            targets.stride(0) if fused_patch_targets else 0,
+            targets.stride(1) if fused_patch_targets else 0,
             filter_eps,
             de_accum_scale,
             dc_accum_scale,
@@ -993,6 +1035,7 @@ def cce_backward_kernel(
                 )
                 | ((do.numel() == 1) << 7)
                 | ((use_atomic_e or use_atomic_c) << 8)
+                | (fused_patch_targets << 9)
             ),
             B_BIN=b_bin_fn(B),
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
@@ -1009,6 +1052,7 @@ def cce_backward_kernel(
             ),
             FILTER_E_GRAD=filter_e_grad and de is not None,
             FILTER_C_GRAD=filter_c_grad and dc_slice is not None,
+            PATCH_SIZE=targets.size(1) if fused_patch_targets else 0,
         )
 
     launch_vocab_slice(
@@ -1061,7 +1105,7 @@ def cce_backward_kernel(
             num_warps=4,
         )
 
-    if patch_targets:
+    if patch_targets and not fused_patch_targets:
         assert targets is not None
         assert patch_target_weight is not None
         patch_target_backward(
