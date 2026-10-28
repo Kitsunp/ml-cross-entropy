@@ -483,6 +483,7 @@ def _cce_lse_forward_kernel(
     HAS_TARGETS: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     PATCH_SIZE: tl.constexpr,
+    SKIP_EMPTY_TARGETS: tl.constexpr,
     HAS_TOPK: tl.constexpr,
     VOCAB_OFFSET: tl.constexpr,
 ):
@@ -508,6 +509,20 @@ def _cce_lse_forward_kernel(
                 other=BMax,
             ).to(tl.int64)
 
+    if SKIP_EMPTY_TARGETS:
+        if HAS_VALIDS:
+            # Copy-Paste packs valid row indices first and pads with BMax.
+            has_target = offs_b < BMax
+        else:
+            has_target = tl.full((BLOCK_B,), False, tl.int1)
+            for slot in tl.static_range(PATCH_SIZE):
+                target = tl.load(
+                    Targets + offs_b * stride_tb + slot * stride_tk, mask=offs_b < BMax, other=-1
+                )
+                has_target |= (target >= 0) & (target < V)
+        if tl.sum(has_target.to(tl.int32), 0) == 0:
+            return
+
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
     e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
@@ -515,7 +530,9 @@ def _cce_lse_forward_kernel(
 
     accum = tl.zeros((BLOCK_B, BLOCK_V), dtype=tl.float32)
     for d in range(0, tl.cdiv(D, BLOCK_D)):
-        e_mask = True if (HAS_VALIDS and FULL_B) else offs_b[:, None] < BMax
+        e_mask = (
+            True if (HAS_VALIDS and FULL_B and not SKIP_EMPTY_TARGETS) else offs_b[:, None] < BMax
+        )
         if not EVEN_D:
             e_mask = e_mask & (offs_d[None, :] < (D - d * BLOCK_D))
 
@@ -703,10 +720,13 @@ def cce_lse_forward_kernel(
     return_mean_logit: bool = False,
     return_topk: bool | int = False,
     return_topk_keys: bool = False,
+    skip_empty_targets: bool = False,
 ) -> LSEReturn:
     return_topk = normalize_return_topk(return_topk)
     if return_topk_keys and not return_topk:
         raise ValueError("return_topk_keys requires return_topk=3 or 5.")
+    if skip_empty_targets and (targets is None or targets.ndim != 2 or shift or return_logit_avg):
+        raise ValueError("Empty-target skipping requires unshifted, full-domain patch targets.")
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
@@ -747,7 +767,8 @@ def cce_lse_forward_kernel(
             e.new_empty(0, dtype=torch.float32) if return_mean_logit else None,
             e.new_zeros(5, dtype=torch.float32) if return_topk and not return_topk_keys else None,
             e.new_empty((0, return_topk), dtype=_topk_key_dtype(e, c, bias, softcap))
-            if return_topk_keys else None,
+            if return_topk_keys
+            else None,
         )
 
     reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
@@ -776,6 +797,7 @@ def cce_lse_forward_kernel(
                 return_mean_logit,
                 return_topk,
                 return_topk_keys,
+                skip_empty_targets,
             )
         )
 
@@ -869,11 +891,13 @@ def cce_lse_forward_kernel(
                 | ((logit_avg_slice is not None) << 3)
                 | ((kernel_targets is not None) << 4)
                 | (bool(return_topk) << 5)
+                | (skip_empty_targets << 6)
             ),
             B_BIN=b_bin_fn(slice_b),
             TOPK_K=return_topk,
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
             PATCH_SIZE=patch_size,
+            SKIP_EMPTY_TARGETS=skip_empty_targets,
             VOCAB_OFFSET=vocab_offset,
         )
 
@@ -923,6 +947,7 @@ def cce_lse_forward_kernel(
         neg_correct_logit,
         mean_logit,
         _topk_counts(topk, targets, valids, shift, e.size(0), V)
-        if return_topk and not return_topk_keys else None,
+        if return_topk and not return_topk_keys
+        else None,
         topk if return_topk_keys else None,
     )

@@ -55,6 +55,7 @@ def _cce_lse_split_partials_kernel(
     HAS_SHIFT: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     PATCH_SIZE: tl.constexpr,
+    SKIP_EMPTY_TARGETS: tl.constexpr,
     HAS_TOPK: tl.constexpr,
     TOPK_K: tl.constexpr,
 ):
@@ -65,6 +66,29 @@ def _cce_lse_split_partials_kernel(
     offs_b = direct_offs_b
     if HAS_VALIDS:
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
+
+    if SKIP_EMPTY_TARGETS:
+        if HAS_VALIDS:
+            has_target = offs_b < BMax
+        else:
+            has_target = tl.full((BLOCK_B,), False, tl.int1)
+            for slot in tl.static_range(PATCH_SIZE):
+                target = tl.load(
+                    Targets + offs_b * stride_tb + slot * stride_tk, mask=offs_b < BMax, other=-1
+                )
+                has_target |= (target >= 0) & (target < V)
+        if tl.sum(has_target.to(tl.int32), 0) == 0:
+            # Neutral finite partials let the normal reduction finish without
+            # reading uninitialized memory; these rows have no supervised use.
+            offsets = pid_split * B + direct_offs_b
+            mask = direct_offs_b < B
+            tl.store(PartialLSE + offsets, 0.0, mask=mask)
+            if HAS_MEAN_LOGIT:
+                tl.store(PartialMeanLogit + offsets, 0.0, mask=mask)
+            if HAS_TOPK:
+                for rank in tl.static_range(TOPK_K):
+                    tl.store(PartialTopK + offsets * TOPK_K + rank, 0, mask=mask)
+            return
 
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     running_lse = tl.full((BLOCK_B,), -float("inf"), tl.float32)
@@ -280,9 +304,14 @@ def cce_lse_forward_split(
     return_mean_logit: bool,
     return_topk: bool | int = False,
     return_topk_keys: bool = False,
+    skip_empty_targets: bool = False,
 ) -> tuple[
-    torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None,
-    torch.Tensor | None, torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     return_topk = normalize_return_topk(return_topk)
     if valids is not None:
@@ -350,6 +379,7 @@ def cce_lse_forward_split(
         BLOCK_D=block_d,
         SPLITS=splits,
         PATCH_SIZE=patch_size,
+        SKIP_EMPTY_TARGETS=skip_empty_targets,
         TOPK_K=return_topk,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -376,6 +406,7 @@ def cce_lse_forward_split(
         neg_correct_logit,
         mean_logit,
         _topk_counts(topk, targets, valids, shift, e.size(0), v)
-        if return_topk and not return_topk_keys else None,
+        if return_topk and not return_topk_keys
+        else None,
         topk if return_topk_keys else None,
     )

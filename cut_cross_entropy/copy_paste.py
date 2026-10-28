@@ -45,6 +45,8 @@ def _cp_softplus(x):
 
 @triton.jit
 def _cp_decode_key(key, PACKED32: tl.constexpr, BF16_SCORE: tl.constexpr):
+    # Inverse of cce_lse_forward._topk_keys: monotone score bits followed by
+    # a complemented token ID; zero and all ones are empty/nonfinite sentinels.
     if PACKED32:
         token = (0xFFFF - (key & 0xFFFF)).to(tl.int64)
         ordered = (key >> 16).to(tl.uint32)
@@ -89,6 +91,8 @@ def _copy_paste_sparse_forward_kernel(
     BLOCK_S: tl.constexpr,
     NEED_ENTROPY: tl.constexpr,
     NEED_TOPK: tl.constexpr,
+    NEED_COPY_METRICS: tl.constexpr,
+    COUNT_COLS: tl.constexpr,
     PACKED32: tl.constexpr,
     BF16_SCORE: tl.constexpr,
 ):
@@ -113,6 +117,9 @@ def _copy_paste_sparse_forward_kernel(
     target_prob = 0.0
     target_token = tl.full((), -1, tl.int64)
     target_valid = tl.full((), False, tl.int1)
+    valid_count = 0.0
+    available_count = 0.0
+    responsibility_sum = 0.0
     for slot in tl.static_range(K):
         y = tl.load(Targets + row * K + slot).to(tl.int64)
         valid = (y >= 0) & (y < V)
@@ -127,10 +134,31 @@ def _copy_paste_sparse_forward_kernel(
         base_log = log_a - negative - lse
         log_probability = _cp_logaddexp(base_log, log_c + log_r)
         tl.store(NLL + row * K + slot, tl.where(valid, -log_probability, 0.0))
+        if NEED_COPY_METRICS:
+            valid_count += valid.to(tl.float32)
+            available_count += (valid & (match_sum > 0.0)).to(tl.float32)
+            responsibility = tl.exp(log_c + log_r - log_probability)
+            responsibility_sum += tl.where(valid, responsibility, 0.0)
         if slot == 0:
             target_prob = tl.exp(base_log) + tl.exp(log_c + log_r)
             target_token = y
             target_valid = valid
+
+    if NEED_COPY_METRICS:
+        # Each statistic is a sum over valid target slots, not over rows.
+        # This makes partial patches and uneven batches composable without
+        # a CPU synchronization or a mean-of-means bias.
+        c = tl.exp(log_c)
+        s = tl.exp(sink - normalizer)
+        tl.store(Counts + row * COUNT_COLS + 5, tl.where(valid_count > 0, c * valid_count, 0.0))
+        tl.store(Counts + row * COUNT_COLS + 6, tl.where(valid_count > 0, s * valid_count, 0.0))
+        tl.store(
+            Counts + row * COUNT_COLS + 7,
+            tl.where(valid_count > 0, c * (1.0 - s) * valid_count, 0.0),
+        )
+        tl.store(Counts + row * COUNT_COLS + 8, responsibility_sum)
+        tl.store(Counts + row * COUNT_COLS + 9, available_count)
+        tl.store(Counts + row * COUNT_COLS + 10, valid_count)
 
     if NEED_ENTROPY or NEED_TOPK:
         sorted_pos = tl.load(SortedIndices + batch * S + i, i < S, 0).to(tl.int64)
@@ -178,7 +206,7 @@ def _copy_paste_sparse_forward_kernel(
                         | ((candidate_prob == target_prob) & (candidate < target_token))
                     )
                 ).to(tl.int32)
-                excluded |= sorted_ids == candidate
+                excluded |= key_valid & (sorted_ids == candidate)
             rank += tl.sum(
                 (
                     active
@@ -190,13 +218,20 @@ def _copy_paste_sparse_forward_kernel(
                 ).to(tl.int32),
                 0,
             )
-            finite = tl.abs(target_prob) < float("inf")
+            # A +inf vocabulary logit can make the target probability collapse
+            # to finite zero. The LSE must also be finite before counting hits.
+            first_key = tl.load(BaseTopKeys + row * 3)
+            if PACKED32:
+                bad_key = first_key == 0xFFFFFFFF
+            else:
+                bad_key = first_key == 0xFFFFFFFFFFFFFFFF
+            finite = (tl.abs(target_prob) < float("inf")) & (tl.abs(lse) < float("inf")) & ~bad_key
             keep = target_valid & finite
-            tl.store(Counts + row * 5, (keep & (rank == 0)).to(tl.float32))
-            tl.store(Counts + row * 5 + 1, (keep & (rank < 3)).to(tl.float32))
-            tl.store(Counts + row * 5 + 2, 0.0)
-            tl.store(Counts + row * 5 + 3, target_valid.to(tl.float32))
-            tl.store(Counts + row * 5 + 4, (target_valid & ~finite).to(tl.float32))
+            tl.store(Counts + row * COUNT_COLS, (keep & (rank == 0)).to(tl.float32))
+            tl.store(Counts + row * COUNT_COLS + 1, (keep & (rank < 3)).to(tl.float32))
+            tl.store(Counts + row * COUNT_COLS + 2, 0.0)
+            tl.store(Counts + row * COUNT_COLS + 3, target_valid.to(tl.float32))
+            tl.store(Counts + row * COUNT_COLS + 4, (target_valid & ~finite).to(tl.float32))
 
 
 @triton.jit
@@ -243,6 +278,8 @@ def _copy_paste_sparse_backward_kernel(
     log_a = _cp_logaddexp(log_not_c, log_c + sink - normalizer)
     c = tl.exp(log_c)
     a_sink_fraction = tl.exp(log_c + sink - normalizer - log_a)
+    # d(log a)/d(gate-lse) = -c(1-c)(1-s)/a. Clamp 1-s only
+    # against roundoff; the chain rule gives opposite signs for gate and LSE.
     dlog_a_dgate = -tl.exp(log_not_c + log_c - log_a) * tl.maximum(1.0 - s, 0.0)
     dscores = tl.full((BLOCK_S,), 0.0, tl.float32)
     dlse = tl.full((), 0.0, tl.float32)
@@ -263,6 +300,7 @@ def _copy_paste_sparse_backward_kernel(
         log_probability = _cp_logaddexp(base_log, log_c + log_r)
         base_responsibility = tl.exp(base_log - log_probability)
         copy_responsibility = tl.exp(log_c + log_r - log_probability)
+        # Keep unmatched lanes finite even though the outer mask discards them.
         target_alpha = tl.where(
             match, tl.exp(score - tl.where(match_sum > 0.0, log_match, 0.0)), 0.0
         )
@@ -305,12 +343,14 @@ def _copy_paste_sparse(
     need_entropy: bool,
     need_topk: bool,
     bf16_score: bool,
+    need_copy_metrics: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, time, source = scores.shape
     slots = targets.shape[-1]
     nll = torch.empty_like(neg_correct, dtype=torch.float32)
     entropy = torch.zeros_like(lse, dtype=torch.float32)
-    counts = lse.new_zeros((batch * time, 5), dtype=torch.float32)
+    count_cols = 11 if need_copy_metrics else 5
+    counts = lse.new_zeros((batch * time, count_cols), dtype=torch.float32)
     if batch * time:
         _copy_paste_sparse_forward_kernel[(batch * time,)](
             scores,
@@ -337,6 +377,8 @@ def _copy_paste_sparse(
             triton.next_power_of_2(source),
             need_entropy,
             need_topk,
+            need_copy_metrics,
+            count_cols,
             base_topkeys.dtype == torch.uint32,
             bf16_score,
         )
@@ -362,11 +404,14 @@ def _copy_paste_sparse_fake(
     need_entropy,
     need_topk,
     bf16_score,
+    need_copy_metrics=False,
 ):
     return (
         torch.empty_like(neg_correct, dtype=torch.float32),
         torch.empty_like(lse, dtype=torch.float32),
-        lse.new_empty((scores.shape[0] * scores.shape[1], 5), dtype=torch.float32),
+        lse.new_empty(
+            (scores.shape[0] * scores.shape[1], 11 if need_copy_metrics else 5), dtype=torch.float32
+        ),
     )
 
 
@@ -460,6 +505,7 @@ def _copy_paste_sparse_setup(ctx, inputs, output):
         _need_entropy,
         _need_topk,
         _bf16_score,
+        _need_copy_metrics,
     ) = inputs
     ctx.save_for_backward(scores, source_ids, source_mask, targets, neg_correct, lse, gate, sink)
     ctx.vocab_size = vocab_size
@@ -493,6 +539,7 @@ def _copy_paste_sparse_autograd(ctx, grad_nll, _grad_entropy, _grad_counts):
         None,
         d_gate,
         d_sink,
+        None,
         None,
         None,
         None,
@@ -559,28 +606,83 @@ def _copy_paste_target_backward_kernel(
     )
 
 
+@triton.jit
+def _copy_paste_pack_valid_rows(Valid, Prefix, Indices, N: tl.constexpr, BLOCK: tl.constexpr):
+    """Write stable valid-row indices into a statically sized sentinel buffer."""
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = tl.load(Valid + row, row < N, False)
+    destination = tl.load(Prefix + row, row < N, 0).to(tl.int64) - 1
+    tl.store(Indices + destination, row.to(tl.int64), (row < N) & valid)
+
+
+@triton.jit
+def _copy_paste_scatter_stats(
+    Indices,
+    CompactLSE,
+    CompactNegative,
+    CompactMean,
+    CompactKeys,
+    LSE,
+    Negative,
+    Mean,
+    Keys,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    HAS_MEAN: tl.constexpr,
+    HAS_KEYS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Restore CCE's compact outputs to the original prediction-row order."""
+    compact = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(Indices + compact, compact < N, N).to(tl.int64)
+    valid = (compact < N) & (row < N)
+    tl.store(LSE + row, tl.load(CompactLSE + compact, compact < N, 0.0), valid)
+    for slot in tl.static_range(K):
+        value = tl.load(CompactNegative + compact * K + slot, compact < N, 0.0)
+        tl.store(Negative + row * K + slot, value, valid)
+    if HAS_MEAN:
+        tl.store(Mean + row, tl.load(CompactMean + compact, compact < N, 0.0), valid)
+    if HAS_KEYS:
+        for rank in tl.static_range(3):
+            key = tl.load(CompactKeys + compact * 3 + rank, compact < N, 0)
+            tl.store(Keys + row * 3 + rank, key, valid)
+
+
 @torch.library.custom_op(
-    "cut_cross_entropy::copy_paste_stats", mutates_args=(), device_types="cuda"
+    "cut_cross_entropy::copy_paste_compact_stats", mutates_args=(), device_types="cuda"
 )
-def _copy_paste_stats(
+def _copy_paste_stats_op(
     hidden: torch.Tensor,
     classifier: torch.Tensor,
     targets: torch.Tensor,
     bias: torch.Tensor | None,
     need_entropy: bool,
     need_topk: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    skip_empty_targets: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, time, dimensions = hidden.shape
     rows = batch * time
     slots = targets.shape[-1]
+    flat_targets = targets.contiguous().reshape(rows, slots)
+    if skip_empty_targets:
+        valid_rows = ((flat_targets >= 0) & (flat_targets < classifier.shape[0])).any(-1)
+        prefix = valid_rows.to(torch.int32).cumsum(0, dtype=torch.int32)
+        valids = torch.full((rows,), rows, device=hidden.device, dtype=torch.int64)
+        _copy_paste_pack_valid_rows[(triton.cdiv(rows, 256),)](
+            valid_rows, prefix, valids, rows, 256
+        )
+    else:
+        valids = None
     result = cce_lse_forward_kernel(
         hidden.contiguous().reshape(rows, dimensions),
         classifier.contiguous(),
         bias,
-        targets=targets.contiguous().reshape(rows, slots),
+        valids=valids,
+        targets=flat_targets,
         return_mean_logit=need_entropy,
         return_topk=3 if need_topk else False,
         return_topk_keys=need_topk,
+        skip_empty_targets=skip_empty_targets,
     )
     assert result.neg_correct_logit is not None
     mean = (
@@ -593,16 +695,49 @@ def _copy_paste_stats(
         if need_topk
         else hidden.new_empty(0, dtype=torch.uint64)
     )
+    if skip_empty_targets:
+        lse = hidden.new_zeros((rows,), dtype=torch.float32)
+        negative = hidden.new_zeros((rows, slots), dtype=torch.float32)
+        full_mean = hidden.new_zeros((rows,), dtype=torch.float32) if need_entropy else mean
+        full_keys = hidden.new_zeros((rows, 3), dtype=keys.dtype) if need_topk else keys
+        _copy_paste_scatter_stats[(triton.cdiv(rows, 256),)](
+            valids,
+            result.lse,
+            result.neg_correct_logit,
+            mean,
+            keys,
+            lse,
+            negative,
+            full_mean,
+            full_keys,
+            rows,
+            slots,
+            need_entropy,
+            need_topk,
+            256,
+        )
+        mean = full_mean.reshape(batch, time) if need_entropy else full_mean
+        keys = full_keys.reshape(batch, time, 3) if need_topk else full_keys
+        compact_lse = result.lse
+    else:
+        lse = result.lse
+        negative = result.neg_correct_logit
+        valids = hidden.new_empty(0, dtype=torch.int64)
+        compact_lse = hidden.new_empty(0, dtype=torch.float32)
     return (
-        result.lse.reshape(batch, time),
-        result.neg_correct_logit.reshape(batch, time, slots),
+        lse.reshape(batch, time),
+        negative.reshape(batch, time, slots),
         mean,
         keys,
+        valids,
+        compact_lse,
     )
 
 
-@_copy_paste_stats.register_fake
-def _copy_paste_stats_fake(hidden, classifier, targets, bias, need_entropy, need_topk):
+@_copy_paste_stats_op.register_fake
+def _copy_paste_stats_fake(
+    hidden, classifier, targets, bias, need_entropy, need_topk, skip_empty_targets=False
+):
     batch, time, _ = hidden.shape
     dtype = (
         torch.uint32
@@ -618,11 +753,22 @@ def _copy_paste_stats_fake(hidden, classifier, targets, bias, need_entropy, need
         hidden.new_empty(
             (batch, time, 3) if need_topk else (0,), dtype=dtype if need_topk else torch.uint64
         ),
+        hidden.new_empty((batch * time,) if skip_empty_targets else (0,), dtype=torch.int64),
+        hidden.new_empty((batch * time,) if skip_empty_targets else (0,), dtype=torch.float32),
     )
 
 
+def _copy_paste_stats(
+    hidden, classifier, targets, bias, need_entropy, need_topk, skip_empty_targets=False
+):
+    """Return public statistics; compact indices stay inside the autograd op."""
+    return _copy_paste_stats_op(
+        hidden, classifier, targets, bias, need_entropy, need_topk, skip_empty_targets
+    )[:4]
+
+
 @torch.library.custom_op(
-    "cut_cross_entropy::copy_paste_stats_backward", mutates_args=(), device_types="cuda"
+    "cut_cross_entropy::copy_paste_compact_stats_backward", mutates_args=(), device_types="cuda"
 )
 def _copy_paste_stats_backward(
     hidden: torch.Tensor,
@@ -632,6 +778,8 @@ def _copy_paste_stats_backward(
     lse: torch.Tensor,
     grad_lse: torch.Tensor,
     grad_negative: torch.Tensor,
+    valids: torch.Tensor,
+    compact_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, time, dimensions = hidden.shape
     rows = batch * time
@@ -647,13 +795,13 @@ def _copy_paste_stats_backward(
         c_info=TensorInfo(torch.float32, True),
         bias=bias,
         bias_info=TensorInfo(torch.float32, True) if bias is not None else None,
-        lse=lse.contiguous().reshape(rows),
+        lse=compact_lse if valids.numel() else lse.contiguous().reshape(rows),
         mile_weight=None,
         patch_target_weight=None,
         mu=None,
         mu_vocab_size=None,
         mu_loss_lambda=None,
-        valids=None,
+        valids=valids if valids.numel() else None,
         softcap=None,
         filter_eps=None,
         targets=None,
@@ -663,6 +811,7 @@ def _copy_paste_stats_backward(
         auto_mixed_grad_accum=False,
         filter_e_grad=False,
         filter_c_grad=False,
+        skip_zero_rows=rows > 1,
     )
     assert grad_e is not None and grad_c is not None
     if rows:
@@ -691,7 +840,7 @@ def _copy_paste_stats_backward(
 
 @_copy_paste_stats_backward.register_fake
 def _copy_paste_stats_backward_fake(
-    hidden, classifier, targets, bias, lse, grad_lse, grad_negative
+    hidden, classifier, targets, bias, lse, grad_lse, grad_negative, valids, compact_lse
 ):
     return (
         torch.empty_like(hidden),
@@ -701,13 +850,15 @@ def _copy_paste_stats_backward_fake(
 
 
 def _copy_paste_stats_setup(ctx, inputs, output):
-    hidden, classifier, targets, bias, _need_entropy, _need_topk = inputs
-    ctx.save_for_backward(hidden, classifier, targets, bias, output[0])
-    ctx.mark_non_differentiable(output[2], output[3])
+    hidden, classifier, targets, bias, _need_entropy, _need_topk, _skip_empty_targets = inputs
+    ctx.save_for_backward(hidden, classifier, targets, bias, output[0], output[4], output[5])
+    ctx.mark_non_differentiable(output[2], output[3], output[4], output[5])
 
 
-def _copy_paste_stats_autograd(ctx, grad_lse, grad_negative, _grad_mean, _grad_keys):
-    hidden, classifier, targets, bias, lse = ctx.saved_tensors
+def _copy_paste_stats_autograd(
+    ctx, grad_lse, grad_negative, _grad_mean, _grad_keys, _grad_valids, _grad_compact_lse
+):
+    hidden, classifier, targets, bias, lse, valids, compact_lse = ctx.saved_tensors
     if grad_lse is None:
         grad_lse = torch.zeros_like(lse)
     if grad_negative is None:
@@ -720,11 +871,13 @@ def _copy_paste_stats_autograd(ctx, grad_lse, grad_negative, _grad_mean, _grad_k
         lse,
         grad_lse,
         grad_negative,
+        valids,
+        compact_lse,
     )
-    return grad_e, grad_c, None, grad_bias if bias is not None else None, None, None
+    return grad_e, grad_c, None, grad_bias if bias is not None else None, None, None, None
 
 
-_copy_paste_stats.register_autograd(
+_copy_paste_stats_op.register_autograd(
     _copy_paste_stats_autograd, setup_context=_copy_paste_stats_setup
 )
 
@@ -748,7 +901,8 @@ def copy_paste_loss(
     use_mu: bool = False,
     mu_lambda: float = 1e-4,
     need_topk: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    return_copy_metrics: bool = False,
+) -> tuple:
     """Compute mixed NTP loss and detached CE/MiLe/mu/Top-1/3 statistics.
 
     ``hidden`` and ``query`` describe the predicted rows [B,T,D]; ``keys``
@@ -759,6 +913,10 @@ def copy_paste_loss(
     mixture entropy and are detached; fractional MEAP groups are normalized
     using the same valid-target counts as the reference implementation.
     Top-1/3 use slot zero in the token phase, including a padded slot layout.
+    If ``return_copy_metrics`` is true, a sixth, detached tensor contains
+    sums of gate, sink, effective copy gate, target responsibility, target
+    availability and valid-target count, in that order. The first five sums
+    are weighted by valid target slots, including partial patches.
 
     The vocabulary projection uses CCE rather than storing [B,T,V] logits.
     Pointer scores and, when requested, sparse candidate logits require
@@ -824,13 +982,14 @@ def copy_paste_loss(
     if batch == 0 or rows == 0:
         zero = hidden.sum() * 0.0
         mu = float(mu_lambda) * classifier.float().mean(0).square().sum() if use_mu else zero
-        return (
+        result = (
             zero + mu,
             zero.detach(),
             zero.detach(),
             mu.detach(),
             zero.new_zeros(5) if need_topk else None,
         )
+        return result + (zero.new_zeros(6),) if return_copy_metrics else result
 
     compute_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden.dtype
@@ -848,6 +1007,7 @@ def copy_paste_loss(
         projected_bias,
         use_mile,
         need_topk,
+        True,
     )
     scores = (
         torch.matmul(query.float(), keys.float().transpose(-1, -2)) * (dimensions**-0.5)
@@ -885,6 +1045,7 @@ def copy_paste_loss(
         use_mile,
         need_topk,
         compute_dtype == torch.bfloat16,
+        return_copy_metrics,
     )
     valid = (targets >= 0) & (targets < classifier.shape[0])
     valid_count = valid.sum().to(torch.float32)
@@ -892,24 +1053,39 @@ def copy_paste_loss(
     ce = nll.sum() / denominator
     weighted = ce
     if use_mile:
-        log_base = torch.log1p(entropy.detach())
-        raw = torch.exp(float(mile_gamma) * (log_base - log_base.amax()))
         row_count = valid.sum(-1).to(torch.float32)
+        active = row_count > 0
+        # Invalid rows have placeholder statistics after compaction. They
+        # must not determine the numerical scale of MiLe's valid weights.
+        log_base = torch.where(active, torch.log1p(entropy.detach()), 0.0)
         if group_fraction is None:
+            raw = torch.exp(float(mile_gamma) * (log_base - log_base.amax()))
             weights = raw * (valid_count / (raw * row_count).sum().clamp_min(1e-20))
         else:
             group = group_fraction.float()
             other = 1.0 - group
-            group_scale = (row_count * group).sum() / (row_count * group * raw).sum().clamp_min(
-                1e-20
-            )
-            other_scale = (row_count * other).sum() / (row_count * other * raw).sum().clamp_min(
-                1e-20
-            )
-            weights = raw * (group * group_scale + other * other_scale)
+            group_active = active & (group > 0)
+            other_active = active & (other > 0)
+            group_peak = torch.where(group_active, log_base, -torch.inf).amax()
+            other_peak = torch.where(other_active, log_base, -torch.inf).amax()
+            group_peak = torch.where(torch.isfinite(group_peak), group_peak, 0.0)
+            other_peak = torch.where(torch.isfinite(other_peak), other_peak, 0.0)
+            group_offset = torch.where(group_active, log_base - group_peak, 0.0)
+            other_offset = torch.where(other_active, log_base - other_peak, 0.0)
+            group_raw = torch.where(group_active, torch.exp(float(mile_gamma) * group_offset), 0.0)
+            other_raw = torch.where(other_active, torch.exp(float(mile_gamma) * other_offset), 0.0)
+            group_scale = (row_count * group).sum() / (
+                row_count * group * group_raw
+            ).sum().clamp_min(1e-20)
+            other_scale = (row_count * other).sum() / (
+                row_count * other * other_raw
+            ).sum().clamp_min(1e-20)
+            weights = group * group_raw * group_scale + other * other_raw * other_scale
         weighted = (nll * weights.unsqueeze(-1)).sum() / denominator
     mu = (
         float(mu_lambda) * classifier.float().mean(0).square().sum() if use_mu else ce.new_zeros(())
     )
-    topk = partial_counts.sum(0) if need_topk else None
-    return weighted + mu, ce.detach(), (weighted - ce).detach(), mu.detach(), topk
+    totals = partial_counts.sum(0) if (need_topk or return_copy_metrics) else None
+    topk = totals[:5] if need_topk else None
+    result = weighted + mu, ce.detach(), (weighted - ce).detach(), mu.detach(), topk
+    return result + (totals[5:],) if return_copy_metrics else result
