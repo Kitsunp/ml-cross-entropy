@@ -6,11 +6,12 @@ import triton
 import triton.language as tl
 
 from cut_cross_entropy.cce_lse_forward import (
-    _merge_topk5,
-    _topk5_keys,
+    _merge_topk,
     _topk_counts,
     _topk_key_dtype,
+    _topk_keys,
 )
+from cut_cross_entropy.cce_utils import normalize_return_topk
 from cut_cross_entropy.tl_utils import tl_logaddexp, tl_softcapping
 
 
@@ -55,6 +56,7 @@ def _cce_lse_split_partials_kernel(
     DOT_PRECISION: tl.constexpr,
     PATCH_SIZE: tl.constexpr,
     HAS_TOPK: tl.constexpr,
+    TOPK_K: tl.constexpr,
 ):
     pid_b = tl.program_id(0).to(tl.int64)
     pid_split = tl.program_id(1).to(tl.int64)
@@ -68,7 +70,9 @@ def _cce_lse_split_partials_kernel(
     running_lse = tl.full((BLOCK_B,), -float("inf"), tl.float32)
     if HAS_TOPK:
         zero_key = tl.full((BLOCK_B,), 0, PartialTopK.dtype.element_ty)
-        running_topk = (zero_key, zero_key, zero_key, zero_key, zero_key)
+        running_topk = ()
+        for _ in tl.static_range(TOPK_K):
+            running_topk += (zero_key,)
     if HAS_MEAN_LOGIT:
         running_mean_logit = tl.zeros((BLOCK_B,), tl.float32)
 
@@ -146,21 +150,24 @@ def _cce_lse_split_partials_kernel(
                 )
             running_lse = new_lse
             if HAS_TOPK:
-                tile_topk = _topk5_keys(
+                tile_topk = _topk_keys(
                     logits,
                     offs_v[None, :],
                     offs_v[None, :] < V,
                     score_dtype,
                     PartialTopK.dtype.element_ty == tl.uint32,
+                    TOPK_K,
                 )
-                running_topk = _merge_topk5(*running_topk, tile_topk)
+                running_topk = _merge_topk(running_topk, tile_topk)
 
     partial_offsets = pid_split * B + direct_offs_b
     output_mask = direct_offs_b < B
     tl.store(PartialLSE + partial_offsets, running_lse, mask=output_mask)
     if HAS_TOPK:
-        for rank in tl.static_range(5):
-            tl.store(PartialTopK + partial_offsets * 5 + rank, running_topk[rank], mask=output_mask)
+        for rank in tl.static_range(TOPK_K):
+            tl.store(
+                PartialTopK + partial_offsets * TOPK_K + rank, running_topk[rank], mask=output_mask
+            )
     if HAS_MEAN_LOGIT:
         tl.store(PartialMeanLogit + partial_offsets, running_mean_logit, mask=output_mask)
 
@@ -178,13 +185,16 @@ def _cce_lse_split_reduce_kernel(
     SPLITS: tl.constexpr,
     HAS_MEAN_LOGIT: tl.constexpr,
     HAS_TOPK: tl.constexpr,
+    TOPK_K: tl.constexpr,
 ):
     offs_b = (tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
     mask = offs_b < B
     running_lse = tl.full((BLOCK_B,), -float("inf"), tl.float32)
     if HAS_TOPK:
         zero_key = tl.full((BLOCK_B,), 0, PartialTopK.dtype.element_ty)
-        running_topk = (zero_key, zero_key, zero_key, zero_key, zero_key)
+        running_topk = ()
+        for _ in tl.static_range(TOPK_K):
+            running_topk += (zero_key,)
     if HAS_MEAN_LOGIT:
         running_mean_logit = tl.zeros((BLOCK_B,), tl.float32)
 
@@ -193,9 +203,11 @@ def _cce_lse_split_reduce_kernel(
         partial_lse = tl.load(PartialLSE + partial_offsets, mask=mask, other=-float("inf"))
         if HAS_TOPK:
             incoming = ()
-            for rank in tl.static_range(5):
-                incoming += (tl.load(PartialTopK + partial_offsets * 5 + rank, mask=mask, other=0),)
-            running_topk = _merge_topk5(*running_topk, incoming)
+            for rank in tl.static_range(TOPK_K):
+                incoming += (
+                    tl.load(PartialTopK + partial_offsets * TOPK_K + rank, mask=mask, other=0),
+                )
+            running_topk = _merge_topk(running_topk, incoming)
         new_lse = tl_logaddexp(running_lse, partial_lse)
         if HAS_MEAN_LOGIT:
             partial_mean_logit = tl.load(PartialMeanLogit + partial_offsets, mask=mask, other=0.0)
@@ -207,8 +219,8 @@ def _cce_lse_split_reduce_kernel(
 
     tl.store(LSE + offs_b, running_lse, mask=mask)
     if HAS_TOPK:
-        for rank in tl.static_range(5):
-            tl.store(TopK + offs_b * 5 + rank, running_topk[rank], mask=mask)
+        for rank in tl.static_range(TOPK_K):
+            tl.store(TopK + offs_b * TOPK_K + rank, running_topk[rank], mask=mask)
     if HAS_MEAN_LOGIT:
         tl.store(MeanLogit + offs_b, running_mean_logit, mask=mask)
 
@@ -266,10 +278,11 @@ def cce_lse_forward_split(
     shift: int,
     return_logit_avg: bool,
     return_mean_logit: bool,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
 ]:
+    return_topk = normalize_return_topk(return_topk)
     if valids is not None:
         b = valids.numel()
     else:
@@ -286,8 +299,8 @@ def cce_lse_forward_split(
 
     partial_lse = e.new_empty((splits, b), dtype=torch.float32)
     key_dtype = _topk_key_dtype(e, c, bias, softcap) if return_topk else torch.uint64
-    partial_topk = e.new_empty((splits, b, 5), dtype=key_dtype) if return_topk else None
-    topk = e.new_empty((b, 5), dtype=key_dtype) if return_topk else None
+    partial_topk = e.new_empty((splits, b, return_topk), dtype=key_dtype) if return_topk else None
+    topk = e.new_empty((b, return_topk), dtype=key_dtype) if return_topk else None
     partial_mean = e.new_empty((splits, b), dtype=torch.float32) if return_mean_logit else None
     lse = e.new_empty((b,), dtype=torch.float32)
     mean_logit = e.new_empty((b,), dtype=torch.float32) if return_mean_logit else None
@@ -335,6 +348,7 @@ def cce_lse_forward_split(
         BLOCK_D=block_d,
         SPLITS=splits,
         PATCH_SIZE=patch_size,
+        TOPK_K=return_topk,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -350,7 +364,8 @@ def cce_lse_forward_split(
         BLOCK_B=reduce_block_b,
         SPLITS=splits,
         HAS_MEAN_LOGIT=return_mean_logit,
-        HAS_TOPK=return_topk,
+        HAS_TOPK=bool(return_topk),
+        TOPK_K=return_topk,
         num_warps=4,
     )
     return (

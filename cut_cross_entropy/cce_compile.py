@@ -349,7 +349,7 @@ def _cce_forward_op(
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: int = 0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -495,7 +495,7 @@ def _cce_forward_fake(
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: int = 0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -752,7 +752,7 @@ def compiler_cce_linear_cross_entropy(
     compute_dtype_is_bf16: bool,
     forward_used_autocast: bool,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the supported training subset as one compiler-visible custom op."""
     outputs = _cce_forward_op(

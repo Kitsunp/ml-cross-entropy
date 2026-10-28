@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from cut_cross_entropy import PatchTrainingSchedule, linear_cross_entropy
-from cut_cross_entropy.cce_lse_forward import _merge_topk5, _topk5_keys, _topk_key_dtype
+from cut_cross_entropy.cce_lse_forward import _merge_topk, _topk_key_dtype, _topk_keys
 from cut_cross_entropy.cce_patch import patch_loss_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -21,7 +21,7 @@ def _topk_leaf_contract_kernel(
     row = tl.program_id(0)
     column = tl.arange(0, WIDTH)
     values = tl.load(X + row * WIDTH + column)[None, :]
-    winners = _topk5_keys(
+    winners = _topk_keys(
         values if NATIVE else values.to(tl.float32),
         (column + OFFSET)[None, :],
         (column < VALID)[None, :],
@@ -40,7 +40,7 @@ def _topk_merge_contract_kernel(A, B, Out):
     for rank in tl.static_range(5):
         left += (tl.load(A + row * 5 + rank),)
         right += (tl.load(B + row * 5 + rank),)
-    merged = _merge_topk5(*left, right)
+    merged = _merge_topk(left, right)
     for rank in tl.static_range(5):
         tl.store(Out + row * 5 + rank, merged[rank])
 

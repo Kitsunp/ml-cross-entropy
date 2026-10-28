@@ -49,7 +49,7 @@ class CCEParams:
     mu_loss_lambda: float | None
     patch_training_enabled: bool
     mile_group_fraction: torch.Tensor | None = None
-    return_topk: bool = False
+    return_topk: int = 0
 
 
 @torch.compiler.assume_constant_result
@@ -471,7 +471,7 @@ def cce_linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     if return_topk and (
         not return_loss_metrics or reduction != "mean" or vocab_parallel_options is not None

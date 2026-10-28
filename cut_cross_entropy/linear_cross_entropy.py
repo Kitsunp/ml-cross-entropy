@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Literal, overload
 import torch
 import torch.nn as nn
 
-from cut_cross_entropy.cce_utils import CCEPreset, CCEPresets, LinearCrossEntropyImpl
+from cut_cross_entropy.cce_utils import (
+    CCEPreset,
+    CCEPresets,
+    LinearCrossEntropyImpl,
+    normalize_return_topk,
+)
 from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.doc import (
     CCE_OPTS_DOC,
@@ -80,7 +85,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> torch.Tensor: ...
 
 
@@ -110,7 +115,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -140,7 +145,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]: ...
 
 
@@ -170,7 +175,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: ...
 
 
@@ -200,7 +205,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
@@ -238,7 +243,7 @@ def linear_cross_entropy(
     mu_loss_lambda: float = 1e-4,
     patch_training_enabled: bool = False,
     mile_group_fraction: torch.Tensor | None = None,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
@@ -248,6 +253,7 @@ def linear_cross_entropy(
     """
     :param vocab_parallel_options: Used to enable vocab parallelism."""
 
+    return_topk = normalize_return_topk(return_topk)
     if return_topk and (
         not return_loss_metrics or reduction != "mean" or vocab_parallel_options is not None
     ):
@@ -496,7 +502,7 @@ class LinearCrossEntropy(nn.Module):
         bias: torch.Tensor | None = None,
         mile_group_mask: torch.Tensor | None = None,
         mile_group_fraction: torch.Tensor | None = None,
-        return_topk: bool = False,
+        return_topk: bool | int = False,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]

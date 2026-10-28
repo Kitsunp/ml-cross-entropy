@@ -6,13 +6,19 @@ import torch
 import triton
 import triton.language as tl
 
+from cut_cross_entropy.cce_utils import normalize_return_topk
 from cut_cross_entropy.tl_autotune import CCE_LOCK_BLOCK_B, cce_forward_autotune
 from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
 @triton.jit
-def _topk5_keys(
-    logits, ids, valid, SCORE_DTYPE: tl.constexpr = tl.float32, PACKED_GLOBAL: tl.constexpr = False
+def _topk_keys(
+    logits,
+    ids,
+    valid,
+    SCORE_DTYPE: tl.constexpr = tl.float32,
+    PACKED_GLOBAL: tl.constexpr = False,
+    MAX_K: tl.constexpr = 5,
 ):
     # Lexicographic score-descending/ID-ascending order, including signed-zero
     # ties. Reuse the actual projected/rounded CCE logits, not another GEMM.
@@ -25,7 +31,7 @@ def _topk5_keys(
         # The *actual* logits have 16 significant storage bits. Pack their
         # monotone score and local tie-break ID into one scalar reduction;
         # unlike quantizing FP32, this loses no information. Widen only the
-        # five winners only when a global score/ID key needs 64 bits.
+        # requested winners when a global score/ID key needs 64 bits.
         bits16 = logits.to(SCORE_DTYPE).to(tl.uint16, bitcast=True).to(tl.uint32)
         bits16 = tl.where(logits == 0.0, 0, bits16)
         ordered16 = tl.where((bits16 & 0x8000) != 0, (~bits16) & 0xFFFF, bits16 ^ 0x8000)
@@ -38,7 +44,7 @@ def _topk5_keys(
         )
         bad_key: tl.constexpr = 0xFFFFFFFF if PACKED_GLOBAL else 0xFFFFFFFFFFFFFFFF
         winners = ()
-        for _ in tl.static_range(5):
+        for _ in tl.static_range(MAX_K):
             winner = tl.max(packed, 1)
             column = 0xFFFF - (winner & 0xFFFF)
             score = winner >> 16
@@ -64,7 +70,7 @@ def _topk5_keys(
         ordered = tl.where(valid, ordered, 0)
         ordered = tl.where(valid & ~(tl.abs(logits) < float("inf")), 0xFFFFFFFF, ordered)
         winners = ()
-        for _ in tl.static_range(5):
+        for _ in tl.static_range(MAX_K):
             value, column = tl.max(
                 ordered, 1, return_indices=True, return_indices_tie_break_left=True
             )
@@ -77,28 +83,32 @@ def _topk5_keys(
 
 
 @triton.jit
-def _merge_topk5(a, b, c, d, e, incoming):
-    # Both inputs are descending. The r-th order statistic is
-    # max(A[r], B[r], max_i min(A[i], B[r-1-i])). Independent balanced
-    # outputs replace 45 serial compare/exchanges with 25 comparisons,
-    # especially important while holding the shared LSE lock.
-    u, v, w, x, y = incoming
-    return (
+def _merge_topk(previous, incoming):
+    # Balanced order statistics for sorted inputs, specialized to 3 or 5.
+    a, b, c = previous[0], previous[1], previous[2]
+    u, v, w = incoming[0], incoming[1], incoming[2]
+    result = (
         tl.maximum(a, u),
         tl.maximum(tl.maximum(b, v), tl.minimum(a, u)),
         tl.maximum(tl.maximum(c, w), tl.maximum(tl.minimum(a, v), tl.minimum(b, u))),
-        tl.maximum(
-            tl.maximum(d, x),
-            tl.maximum(tl.maximum(tl.minimum(a, w), tl.minimum(b, v)), tl.minimum(c, u)),
-        ),
-        tl.maximum(
-            tl.maximum(e, y),
-            tl.maximum(
-                tl.maximum(tl.minimum(a, x), tl.minimum(b, w)),
-                tl.maximum(tl.minimum(c, v), tl.minimum(d, u)),
-            ),
-        ),
     )
+    if len(previous) == 5:
+        d, e = previous[3], previous[4]
+        x, y = incoming[3], incoming[4]
+        result += (
+            tl.maximum(
+                tl.maximum(d, x),
+                tl.maximum(tl.maximum(tl.minimum(a, w), tl.minimum(b, v)), tl.minimum(c, u)),
+            ),
+            tl.maximum(
+                tl.maximum(e, y),
+                tl.maximum(
+                    tl.maximum(tl.minimum(a, x), tl.minimum(b, w)),
+                    tl.maximum(tl.minimum(c, v), tl.minimum(d, u)),
+                ),
+            ),
+        )
+    return result
 
 
 @triton.jit
@@ -117,6 +127,7 @@ def _topk_counts_kernel(
     BK: tl.constexpr,
     HAS_VALIDS: tl.constexpr,
     BLOCK: tl.constexpr,
+    TOPK_K: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     original = tl.load(Valids + rows, rows < B, BMax) if HAS_VALIDS else rows
@@ -130,8 +141,8 @@ def _topk_counts_kernel(
     id_mask: tl.constexpr = 0xFFFF if Keys.dtype.element_ty == tl.uint32 else 0xFFFFFFFF
     bad_key: tl.constexpr = 0xFFFFFFFF if Keys.dtype.element_ty == tl.uint32 else 0xFFFFFFFFFFFFFFFF
     hit = tl.full((BLOCK, BK), False, tl.int1)
-    for rank in tl.static_range(5):
-        key = tl.load(Keys + rows * 5 + rank, rows < B, 0)
+    for rank in tl.static_range(TOPK_K):
+        key = tl.load(Keys + rows * TOPK_K + rank, rows < B, 0)
         hit |= ((id_mask - (key & id_mask)).to(tl.int64)[:, None] == y) & (key[:, None] != 0)
         if rank == 0:
             tl.store(Out + tl.program_id(0) * 5, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0))
@@ -147,6 +158,8 @@ def _topk_counts_kernel(
             tl.store(
                 Out + tl.program_id(0) * 5 + 2, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0)
             )
+    if TOPK_K == 3:
+        tl.store(Out + tl.program_id(0) * 5 + 2, 0.0)
     tl.store(Out + tl.program_id(0) * 5 + 3, tl.sum(tl.sum(valid.to(tl.float32), 1), 0))
 
 
@@ -186,6 +199,7 @@ def _topk_counts(keys, targets, valids, shift, bmax, vocab_size):
         triton.next_power_of_2(k),
         valids is not None,
         256,
+        keys.size(1),
     )
     return partials.sum(0)
 
@@ -449,6 +463,7 @@ def _cce_lse_forward_kernel(
     stride_tb,
     stride_tk,
     MODE,
+    TOPK_K: tl.constexpr,
     # Meta-parameters
     B_BIN,
     LOCK_BLOCK_B: tl.constexpr,
@@ -579,12 +594,13 @@ def _cce_lse_forward_kernel(
         this_exp_sum = tl.sum(this_exp, axis=1)
     this_lse = this_mx + tl.log(this_exp_sum)
     if HAS_TOPK:
-        tile_topk = _topk5_keys(
+        tile_topk = _topk_keys(
             logits,
             offs_v[None, :] + VOCAB_OFFSET,
             offs_v[None, :] < V,
             score_dtype,
             TopK.dtype.element_ty == tl.uint32,
+            TOPK_K,
         )
 
     o_mask = None if FULL_B else offs_b < B
@@ -625,11 +641,11 @@ def _cce_lse_forward_kernel(
     tl.store(lse_ptrs, new_lse, mask=o_mask, eviction_policy="evict_last")
     if HAS_TOPK:
         previous = ()
-        for rank in tl.static_range(5):
-            previous += (tl.load(TopK + offs_b * 5 + rank, mask=offs_b < B, other=0),)
-        merged = _merge_topk5(*previous, tile_topk)
-        for rank in tl.static_range(5):
-            tl.store(TopK + offs_b * 5 + rank, merged[rank], mask=o_mask)
+        for rank in tl.static_range(TOPK_K):
+            previous += (tl.load(TopK + offs_b * TOPK_K + rank, mask=offs_b < B, other=0),)
+        merged = _merge_topk(previous, tile_topk)
+        for rank in tl.static_range(TOPK_K):
+            tl.store(TopK + offs_b * TOPK_K + rank, merged[rank], mask=o_mask)
 
     tl.atomic_xchg(this_locks, 0, sem="release", scope="gpu")
 
@@ -684,8 +700,9 @@ def cce_lse_forward_kernel(
     shift: int = 0,
     return_logit_avg: bool = False,
     return_mean_logit: bool = False,
-    return_topk: bool = False,
+    return_topk: bool | int = False,
 ) -> LSEReturn:
+    return_topk = normalize_return_topk(return_topk)
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
@@ -757,7 +774,11 @@ def cce_lse_forward_kernel(
 
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
-    topk = e.new_zeros((B, 5), dtype=_topk_key_dtype(e, c, bias, softcap)) if return_topk else None
+    topk = (
+        e.new_zeros((B, return_topk), dtype=_topk_key_dtype(e, c, bias, softcap))
+        if return_topk
+        else None
+    )
     mean_logit = e.new_zeros((B,), dtype=torch.float32) if return_mean_logit else None
     # The fixed K=32 single-target path reconstructs targets with a diagonal
     # tl.dot. Patch targets stay fused because every slot must observe the exact
@@ -840,9 +861,10 @@ def cce_lse_forward_kernel(
                 | (return_mean_logit << 2)
                 | ((logit_avg_slice is not None) << 3)
                 | ((kernel_targets is not None) << 4)
-                | (return_topk << 5)
+                | (bool(return_topk) << 5)
             ),
             B_BIN=b_bin_fn(slice_b),
+            TOPK_K=return_topk,
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
             PATCH_SIZE=patch_size,
             VOCAB_OFFSET=vocab_offset,
