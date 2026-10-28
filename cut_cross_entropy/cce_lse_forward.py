@@ -84,6 +84,10 @@ def _topk_keys(
 
 @triton.jit
 def _merge_topk(previous, incoming):
+    tl.static_assert(
+        len(previous) == len(incoming) and (len(previous) == 3 or len(previous) == 5),
+        "_merge_topk only supports 3- or 5-key merges",
+    )
     # Balanced order statistics for sorted inputs, specialized to 3 or 5.
     a, b, c = previous[0], previous[1], previous[2]
     u, v, w = incoming[0], incoming[1], incoming[2]
@@ -143,7 +147,11 @@ def _topk_counts_kernel(
     hit = tl.full((BLOCK, BK), False, tl.int1)
     for rank in tl.static_range(TOPK_K):
         key = tl.load(Keys + rows * TOPK_K + rank, rows < B, 0)
-        hit |= ((id_mask - (key & id_mask)).to(tl.int64)[:, None] == y) & (key[:, None] != 0)
+        hit |= (
+            ((id_mask - (key & id_mask)).to(tl.int64)[:, None] == y)
+            & (key[:, None] != 0)
+            & (key[:, None] != bad_key)
+        )
         if rank == 0:
             tl.store(Out + tl.program_id(0) * 5, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0))
             tl.store(
@@ -159,6 +167,9 @@ def _topk_counts_kernel(
                 Out + tl.program_id(0) * 5 + 2, tl.sum(tl.sum((hit & valid).to(tl.float32), 1), 0)
             )
     if TOPK_K == 3:
+        # `partials` is new_empty and the rank==4 store never runs in 3-key
+        # mode; zero the inactive hits@5 slot so the fixed 5-scalar count
+        # format never leaks uninitialized memory into published accuracy.
         tl.store(Out + tl.program_id(0) * 5 + 2, 0.0)
     tl.store(Out + tl.program_id(0) * 5 + 3, tl.sum(tl.sum(valid.to(tl.float32), 1), 0))
 

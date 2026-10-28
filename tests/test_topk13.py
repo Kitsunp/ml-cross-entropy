@@ -2,9 +2,90 @@ from __future__ import annotations
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from cut_cross_entropy import SUPPORTED_TOPK, linear_cross_entropy
+from cut_cross_entropy.cce_lse_forward import (
+    _merge_topk,
+    _topk_counts,
+    cce_lse_forward_kernel,
+)
 from cut_cross_entropy.cce_utils import normalize_return_topk
+
+
+@triton.jit
+def _merge_arity_contract_kernel(Out, LEFT: tl.constexpr, RIGHT: tl.constexpr):
+    previous = ()
+    incoming = ()
+    for _ in tl.static_range(LEFT):
+        previous += (tl.full((), 1, tl.uint32),)
+    for _ in tl.static_range(RIGHT):
+        incoming += (tl.full((), 1, tl.uint32),)
+    merged = _merge_topk(previous, incoming)
+    tl.store(Out, merged[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("left,right", [(2, 2), (4, 4), (3, 5)])
+def test_merge_rejects_unsupported_or_mismatched_arities(left, right):
+    output = torch.empty((), device="cuda", dtype=torch.uint32)
+    with pytest.raises(triton.CompilationError) as error:
+        _merge_arity_contract_kernel[(1,)](output, left, right)
+    # Triton wraps assertions from nested JIT functions in CompilationError.
+    messages = []
+    cause = error.value
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    assert "only supports 3- or 5-key merges" in "\n".join(messages)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rank", [3, 5])
+@pytest.mark.parametrize("dtype", [torch.uint32, torch.uint64])
+def test_nonfinite_sentinel_never_counts_as_token_zero(rank, dtype):
+    bits = torch.iinfo(dtype).bits
+    id_mask = (1 << (bits // 2)) - 1
+    bad_key = (1 << bits) - 1
+    # A finite zero logit has ordered score 0x8000/0x80000000. Its
+    # vocabulary id 0 must still count; empty and nonfinite keys must not.
+    token_zero = (1 << (bits - 1)) | id_mask
+    token_one = token_zero - 1
+    keys = torch.tensor(
+        [
+            [bad_key] * rank,
+            [token_zero] + [0] * (rank - 1),
+            [token_one, bad_key] + [0] * (rank - 2),
+            [bad_key, token_zero] + [0] * (rank - 2),
+            [0] * rank,
+            [bad_key] * rank,
+        ],
+        device="cuda",
+        dtype=dtype,
+    )
+    targets = torch.tensor([0, 0, 0, 0, 0, -100], device="cuda")
+    counts = _topk_counts(keys, targets, None, 0, targets.numel(), 9)
+    # A real finite id 0 after a sentinel can hit Top-3, never Top-1.
+    expected = torch.tensor([1, 2, 2 if rank == 5 else 0, 5, 2], device="cuda").float()
+    torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rank", [3, 5])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("reduction", ["lock", "split"])
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_token_zero_forward_counts(monkeypatch, rank, dtype, reduction, nonfinite):
+    monkeypatch.setenv("CCE_FORWARD_REDUCTION", reduction)
+    embeddings = torch.zeros(4, 16, device="cuda", dtype=dtype)
+    classifier = torch.zeros(9, 16, device="cuda", dtype=dtype)
+    bias = torch.zeros(9, device="cuda", dtype=dtype)
+    bias[0] = nonfinite
+    targets = torch.zeros(4, device="cuda", dtype=torch.int64)
+    result = cce_lse_forward_kernel(embeddings, classifier, bias, targets=targets, return_topk=rank)
+    expected = torch.tensor([0, 0, 0, 4, 4], device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(result.topk_counts, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("value,expected", [(False, 0), (True, 5), (0, 0), (1, 5), (3, 3), (5, 5)])
