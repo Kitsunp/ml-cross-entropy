@@ -10,6 +10,7 @@ from cut_cross_entropy.meap import (
     meap_attention_diagnostics,
     meap_mask_inputs,
 )
+from cut_cross_entropy.metrics import finalize_lm_metrics
 from cut_cross_entropy.mile import linear_mile_loss
 from cut_cross_entropy.patch import PatchTrainingPhase, PatchTrainingSchedule, pool_patch_inputs
 from cut_cross_entropy.vocab_parallel import VocabParallelOptions
@@ -19,6 +20,7 @@ __all__ = [
     "LinearCrossEntropyImpl",
     "linear_cross_entropy",
     "linear_mile_loss",
+    "finalize_lm_metrics",
     "MEAPEmbeddingOverride",
     "apply_meap_embedding_override",
     "meap_attention_diagnostics",

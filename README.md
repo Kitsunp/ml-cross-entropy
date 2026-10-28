@@ -183,6 +183,12 @@ returns `(loss, metrics)`. The compact device scalars
 `ntp_ce_unweighted`, `mile_reweighting_delta`, and `mu_loss` sum back to
 `loss`; no full-logit tensor is reconstructed.
 
+After accumulating CE/MiLe and Top-k scalar totals over a reporting interval,
+[`finalize_lm_metrics`](docs/metrics.md) computes token-weighted PPL,
+`exp(MiLe objective)`, and accuracies in one CUDA kernel. Call it after any
+distributed sum; it adds no work to ordinary CCE forwards and performs no
+host scalar reads or transfers.
+
 ### Mu loss
 
 ![Mu-loss kernel data flow](assets/mu_loss_kernel.svg)
