@@ -247,6 +247,7 @@ def test_compacted_loss_and_gradients_with_partial_rows(patch_size, dtype):
         group_fraction=group,
         use_mile=True,
         use_mu=True,
+        need_topk=patch_size == 1,
         return_copy_metrics=True,
     )
 
@@ -270,10 +271,35 @@ def test_compacted_loss_and_gradients_with_partial_rows(patch_size, dtype):
     other = 1 - group
     other_scale = (row_count * other).sum() / (row_count * other * raw).sum().clamp_min(1e-20)
     weights = raw * (group * group_scale + other * other_scale)
-    expected = (nll * weights[..., None]).sum() / valid.sum().clamp_min(1)
-    expected = expected + 1e-4 * c.float().mean(0).square().sum()
+    expected_ce = nll.sum() / valid.sum().clamp_min(1)
+    expected_weighted = (nll * weights[..., None]).sum() / valid.sum().clamp_min(1)
+    expected_mu = 1e-4 * c.float().mean(0).square().sum()
+    expected = expected_weighted + expected_mu
     tolerance = 0.03 if dtype == torch.bfloat16 else 2e-4
     torch.testing.assert_close(actual[0], expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(actual[1], expected_ce, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(
+        actual[2], expected_weighted - expected_ce, rtol=tolerance, atol=tolerance
+    )
+    torch.testing.assert_close(actual[3], expected_mu, rtol=tolerance, atol=tolerance)
+    if patch_size == 1:
+        y = safe[..., 0]
+        target_probability = p.gather(-1, y[..., None])
+        token_ids = torch.arange(vocab, device="cuda")
+        rank = (
+            (p > target_probability) | ((p == target_probability) & (token_ids < y[..., None]))
+        ).sum(-1)
+        target_valid = valid[..., 0]
+        expected_topk = torch.stack(
+            (
+                (target_valid & (rank == 0)).sum(),
+                (target_valid & (rank < 3)).sum(),
+                torch.zeros((), device="cuda"),
+                target_valid.sum(),
+                torch.zeros((), device="cuda"),
+            )
+        ).float()
+        torch.testing.assert_close(actual[4], expected_topk, rtol=0, atol=0)
     actual_grads = torch.autograd.grad(actual[0], variables, retain_graph=True)
     expected_grads = torch.autograd.grad(expected, variables)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
