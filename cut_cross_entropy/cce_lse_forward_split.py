@@ -279,8 +279,10 @@ def cce_lse_forward_split(
     return_logit_avg: bool,
     return_mean_logit: bool,
     return_topk: bool | int = False,
+    return_topk_keys: bool = False,
 ) -> tuple[
-    torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+    torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None,
+    torch.Tensor | None, torch.Tensor | None,
 ]:
     return_topk = normalize_return_topk(return_topk)
     if valids is not None:
@@ -373,5 +375,7 @@ def cce_lse_forward_split(
         logit_avg,
         neg_correct_logit,
         mean_logit,
-        _topk_counts(topk, targets, valids, shift, e.size(0), v) if return_topk else None,
+        _topk_counts(topk, targets, valids, shift, e.size(0), v)
+        if return_topk and not return_topk_keys else None,
+        topk if return_topk_keys else None,
     )

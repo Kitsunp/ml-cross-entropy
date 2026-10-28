@@ -688,6 +688,7 @@ class LSEReturn:
     neg_correct_logit: torch.Tensor | None
     mean_logit: torch.Tensor | None
     topk_counts: torch.Tensor | None = None
+    topk_keys: torch.Tensor | None = None
 
 
 def cce_lse_forward_kernel(
@@ -701,8 +702,11 @@ def cce_lse_forward_kernel(
     return_logit_avg: bool = False,
     return_mean_logit: bool = False,
     return_topk: bool | int = False,
+    return_topk_keys: bool = False,
 ) -> LSEReturn:
     return_topk = normalize_return_topk(return_topk)
+    if return_topk_keys and not return_topk:
+        raise ValueError("return_topk_keys requires return_topk=3 or 5.")
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
@@ -741,7 +745,9 @@ def cce_lse_forward_kernel(
             e.new_zeros(V, dtype=torch.float32) if return_logit_avg else None,
             correct,
             e.new_empty(0, dtype=torch.float32) if return_mean_logit else None,
-            e.new_zeros(5, dtype=torch.float32) if return_topk else None,
+            e.new_zeros(5, dtype=torch.float32) if return_topk and not return_topk_keys else None,
+            e.new_empty((0, return_topk), dtype=_topk_key_dtype(e, c, bias, softcap))
+            if return_topk_keys else None,
         )
 
     reduction = os.getenv("CCE_FORWARD_REDUCTION", "auto")
@@ -769,6 +775,7 @@ def cce_lse_forward_kernel(
                 return_logit_avg,
                 return_mean_logit,
                 return_topk,
+                return_topk_keys,
             )
         )
 
@@ -915,5 +922,7 @@ def cce_lse_forward_kernel(
         logit_avg,
         neg_correct_logit,
         mean_logit,
-        _topk_counts(topk, targets, valids, shift, e.size(0), V) if return_topk else None,
+        _topk_counts(topk, targets, valids, shift, e.size(0), V)
+        if return_topk and not return_topk_keys else None,
+        topk if return_topk_keys else None,
     )

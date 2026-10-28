@@ -34,3 +34,12 @@ __all__ = [
 
 
 __version__ = "25.9.3"
+
+
+def __getattr__(name):
+    """Load the CUDA-only Copy-Paste extension only when requested."""
+    if name == "copy_paste_loss":
+        from cut_cross_entropy.copy_paste import copy_paste_loss
+
+        return copy_paste_loss
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
