@@ -8,7 +8,7 @@ from cut_cross_entropy.copy_paste import _copy_paste_sparse, _copy_paste_stats, 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("slots,patch_size", [(1, 1), (4, 1), (4, 4)])
 def test_cce_sparse_composition(dtype, slots, patch_size):
     torch.manual_seed(42)
@@ -77,7 +77,7 @@ def test_cce_sparse_composition(dtype, slots, patch_size):
     safe = target.clamp(0, v - 1)
     expected_nll = torch.where((target >= 0) & (target < v), -probs.gather(-1, safe).log(), 0.0)
     expected_entropy = -(probs * probs.clamp_min(torch.finfo(torch.float32).tiny).log()).sum(-1)
-    tol = 0.025 if dtype == torch.bfloat16 else 3e-5
+    tol = 0.025 if dtype == torch.bfloat16 else (0.004 if dtype == torch.float16 else 3e-5)
     torch.testing.assert_close(nll, expected_nll, rtol=tol, atol=tol)
     torch.testing.assert_close(entropy, expected_entropy, rtol=tol, atol=tol)
     if patch_size == 1:
@@ -104,8 +104,8 @@ def test_cce_sparse_composition(dtype, slots, patch_size):
         torch.testing.assert_close(
             actual,
             expected,
-            rtol=0.07 if dtype == torch.bfloat16 else 2e-4,
-            atol=0.04 if dtype == torch.bfloat16 else 2e-5,
+            rtol=0.07 if dtype == torch.bfloat16 else (0.02 if dtype == torch.float16 else 2e-4),
+            atol=0.04 if dtype == torch.bfloat16 else (0.005 if dtype == torch.float16 else 2e-5),
         )
 
 
@@ -176,7 +176,7 @@ def test_topk_ties_and_repeated_copy_ids(vocab, empty, reduction, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_stats_bias_and_repeated_targets(dtype):
     torch.manual_seed(19)
     h = torch.randn(2, 3, 32, device="cuda", dtype=dtype, requires_grad=True)
@@ -188,7 +188,7 @@ def test_stats_bias_and_repeated_targets(dtype):
     expected_lse = logits.logsumexp(-1)
     expected_neg = -logits.gather(-1, targets.clamp_min(0))
     expected_neg = torch.where(targets >= 0, expected_neg, 0.0)
-    tol = 0.1 if dtype == torch.bfloat16 else 2e-5
+    tol = 0.1 if dtype == torch.bfloat16 else (0.02 if dtype == torch.float16 else 2e-5)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=tol)
     torch.testing.assert_close(neg, expected_neg, rtol=1e-5, atol=tol)
     upstream_lse, upstream_neg = torch.randn_like(lse), torch.randn_like(neg)
@@ -199,7 +199,12 @@ def test_stats_bias_and_repeated_targets(dtype):
         (expected_lse * upstream_lse).sum() + (expected_neg * upstream_neg).sum(), (h, c, bias)
     )
     for a, e in zip(actual, expected):
-        torch.testing.assert_close(a, e, rtol=0.05 if dtype == torch.bfloat16 else 2e-4, atol=tol)
+        torch.testing.assert_close(
+            a,
+            e,
+            rtol=0.05 if dtype == torch.bfloat16 else (0.02 if dtype == torch.float16 else 2e-4),
+            atol=tol,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
