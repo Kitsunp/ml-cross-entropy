@@ -68,3 +68,14 @@ class CCEPresets:
             return opts
 
         raise NotImplementedError(f"{impl=}")
+
+
+# Supported active ranks; False disables diagnostics and True retains legacy 5.
+SUPPORTED_TOPK = (3, 5)
+
+
+def normalize_return_topk(value: bool | int) -> int:
+    """Normalize legacy bool requests or an explicit maximum diagnostic rank."""
+    if type(value) not in (bool, int) or value not in (0, 1, 3, 5):
+        raise ValueError("return_topk must be False, True, 3 or 5")
+    return 5 if value == 1 else int(value)

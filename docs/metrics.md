@@ -11,6 +11,13 @@ mu-loss and other auxiliary losses. Accumulate the existing `topk_counts`
 returned by `return_topk=True`. Keep ordinary-token and patch K>1 totals
 separate; do not collect ordinary-token Top-k for K>1 patches.
 
+`return_topk=3` requests only Top-1/3 and reduces candidate workspace from
+five keys to three. Its compatible `topk_counts` vector is `(hits1,hits3,0,N,bad)`;
+the hits5 slot and final accuracy5 slot are inactive placeholders. Do not
+publish them as a measured zero accuracy. In this mode validate only
+`0 <= hits1 <= hits3 <= N`, plus a zero placeholder and zero nonfinite flag.
+The PPL finalizer and its wire format need no change.
+
 Use FP64 scalar accumulators from the start of the interval to preserve large
 counts. Sum them across workers before finalization. The helper neither runs
 a collective nor changes the model's arithmetic/gradients.

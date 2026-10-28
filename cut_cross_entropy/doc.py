@@ -44,8 +44,12 @@ LINEAR_CROSS_ENTROPY_DOC = """Computes cross-entropy loss using the logits gener
         entropy, the MiLe reweighting delta, and mu loss. Supported by CCE implementations
         with ``reduction="mean"`` only; no token-by-vocabulary tensor is materialized.
     :param return_topk: Add detached ``topk_counts`` to the loss-metrics dictionary.
+        ``3`` selects/counts only Top-1/3; ``True`` or ``5`` retains Top-1/3/5.
+        ``False`` disables diagnostics. The request is static before compilation.
         Requires ``return_loss_metrics=True``, CCE, mean reduction, and no vocabulary
         parallelism. Counts are ``(hits@1, hits@3, hits@5, valid_targets, nonfinite_targets)``;
+        with ``return_topk=3``, the unused hits@5 slot is a zero placeholder, not a
+        measured accuracy. Do not publish it or apply hits@3 <= hits@5 validation.
         divide the first three by the fourth to obtain accuracies. Every valid supervised
         target is measured using the actual rounded CCE logits, with lower vocabulary ID
         breaking ties. Ignored targets and positions excluded by causal shift do not count.

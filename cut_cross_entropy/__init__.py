@@ -1,5 +1,5 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
-from cut_cross_entropy.cce_utils import LinearCrossEntropyImpl
+from cut_cross_entropy.cce_utils import SUPPORTED_TOPK, LinearCrossEntropyImpl
 from cut_cross_entropy.linear_cross_entropy import (
     LinearCrossEntropy,
     linear_cross_entropy,
@@ -16,6 +16,7 @@ from cut_cross_entropy.patch import PatchTrainingPhase, PatchTrainingSchedule, p
 from cut_cross_entropy.vocab_parallel import VocabParallelOptions
 
 __all__ = [
+    "SUPPORTED_TOPK",
     "LinearCrossEntropy",
     "LinearCrossEntropyImpl",
     "linear_cross_entropy",

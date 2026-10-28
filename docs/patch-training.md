@@ -109,6 +109,14 @@ or average batch PPLs.
 
 ### Ordinary-token Top-1/3/5 diagnostics
 
+To collect only Top-1/3, use `return_topk=3`. Both lock and split kernels
+specialize selection, merge networks and candidate allocations to three keys;
+ranks 4/5 are not selected or counted. `True` and `5` preserve the legacy
+Top-1/3/5 behavior. The five-scalar count layout is unchanged: its hits@5 slot
+is zero when inactive, and must not be reported or used for ordering checks.
+Validate `0 <= hits1 <= hits3 <= N` in this mode. `SUPPORTED_TOPK` exposes
+the active ranks supported by the installed package.
+
 `return_topk=True` with `return_loss_metrics=True` adds detached counts
 `(hits@1, hits@3, hits@5, N, nonfinite_targets)` to CCE's metrics dictionary.
 For k in {1,3,5}, accuracy is `sum_i 1[y_i in Top_k(z_i)] / N`, over **all**
