@@ -102,6 +102,11 @@ and `patch_mile_exp_loss`, not autoregressive PPL, and do not collect token
 Top-k. Ordinary training and validation remain monitorable with patching off.
 The measured Top-k overhead below must not be described as negligible.
 
+[`finalize_lm_metrics`](metrics.md) performs the final divisions/exponentials
+on device after interval accumulation and the distributed sum. It reuses these
+existing components/counts; it does not calculate batch PPL on every forward
+or average batch PPLs.
+
 ### Ordinary-token Top-1/3/5 diagnostics
 
 `return_topk=True` with `return_loss_metrics=True` adds detached counts
