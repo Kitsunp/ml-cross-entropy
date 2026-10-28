@@ -446,6 +446,7 @@ def _cce_backward_kernel(
     HAS_DLSE: tl.constexpr,
     HAS_MILE: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
+    SKIP_ZERO_DOUT: tl.constexpr,
     COMPUTE_DC: tl.constexpr,
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
@@ -468,6 +469,15 @@ def _cce_backward_kernel(
     offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
     if HAS_VALIDS:
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
+
+    if SKIP_ZERO_DOUT:
+        # Copy-Paste supplies the full row domain so compiled shapes stay
+        # static. Rows with no valid target have an exactly zero LSE
+        # cotangent. Skip a whole vocabulary tile only when every row in it
+        # has zero cotangent; NaNs remain nonzero and are never hidden.
+        row_gradient = tl.load(dOut + offs_b, mask=offs_b < BMax, other=0.0)
+        if tl.sum((row_gradient != 0.0).to(tl.int32), 0) == 0:
+            return
 
     direct_offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
     v_mask = True if EVEN_V else direct_offs_v < V
@@ -775,10 +785,20 @@ def cce_backward_kernel(
     reduce_e_grad: bool = False,
     pg: torch.distributed.ProcessGroup | None = None,
     mile_gamma: float | None = None,
+    skip_zero_rows: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
     assert lse.size(0) == e.size(0) or (valids is not None and lse.size(0) == valids.size(0))
+    if skip_zero_rows and (
+        do.numel() == 1
+        or dlse is not None
+        or targets is not None
+        or mile_weight is not None
+        or patch_target_weight is not None
+        or shift != 0
+    ):
+        raise ValueError("Zero-row skipping requires a per-row dense LSE cotangent only.")
 
     do = do.contiguous()
     lse = lse.contiguous()
@@ -1036,6 +1056,7 @@ def cce_backward_kernel(
                 | ((do.numel() == 1) << 7)
                 | ((use_atomic_e or use_atomic_c) << 8)
                 | (fused_patch_targets << 9)
+                | (skip_zero_rows << 10)
             ),
             B_BIN=b_bin_fn(B),
             LOCK_BLOCK_B=CCE_LOCK_BLOCK_B,
@@ -1052,6 +1073,7 @@ def cce_backward_kernel(
             ),
             FILTER_E_GRAD=filter_e_grad and de is not None,
             FILTER_C_GRAD=filter_c_grad and dc_slice is not None,
+            SKIP_ZERO_DOUT=skip_zero_rows,
             PATCH_SIZE=targets.size(1) if fused_patch_targets else 0,
         )
 

@@ -147,6 +147,12 @@ There are several other implementations available depending on your needs.
 | cce_kahan_full_c_full_e (cce_exact) | Same compatibility family with both gradient filters disabled. It is retained as an audit/reference point rather than a claim that the reduction uses classic Kahan arithmetic. |
 
 
+### Copy-Paste language-model loss
+
+The optional CUDA Copy-Paste mixture reuses CCE vocabulary reductions and
+handles repeated source IDs without dense vocabulary logits. See the
+[API, mathematical contract, and memory notes](docs/copy_paste.md).
+
 ### MiLe Loss
 
 ![MiLe kernel data flow](assets/mile_kernel.svg)
