@@ -120,6 +120,7 @@ def _saved_or_reference(
             params,
             cfg,
             save_intermediates=save_intermediates or return_seed,
+            mask_token_id=mask_token_id if mask_embedding is not None else None,
         )
         if mask_embedding is not None:
             positions = ids.eq(int(mask_token_id)).unsqueeze(-1)
@@ -239,10 +240,14 @@ def _leviathan_forward_impl(
         modes = codebooks.new_empty((ids.numel(), num_modes, krank))
     else:
         modes = modes.contiguous()
-    # Reuse the existing scalar metadata output without changing the custom
-    # op schema: 0=reference checkpoints, 1=dense Triton, 2=compact Triton.
+    # Keep the backward custom-op schema stable for cached compiled graphs.
+    # The low base-3 digit retains the checkpoint mode; the remaining digits
+    # encode the optional MEAP ID (zero means no MEAP). The former int8 scalar
+    # could not represent arbitrary vocabulary IDs.
     mode_value = (2 if saved.get("compact_spline", False) else 1) if has_modes else 0
-    mode_flag = codebooks.new_tensor(mode_value, dtype=torch.int8)
+    if has_meap:
+        mode_value += 3 * (int(mask_token_id) + 1)
+    mode_flag = codebooks.new_tensor(mode_value, dtype=torch.int64)
     if TORCH_2_14_MEMORY_ANNOTATIONS:
         annotate_tensors(
             "leviathan.forward",
@@ -489,7 +494,7 @@ def _leviathan_forward_fake(
     )
     rsqrt = torch.empty_like(mean)
     modes = codebooks.new_empty((n_tokens, num_modes, krank))
-    mode_flag = torch.empty((), dtype=torch.int8, device=codebooks.device)
+    mode_flag = torch.empty((), dtype=torch.int64, device=codebooks.device)
     return embeds, z, xhat, mean, rsqrt, modes, mode_flag
 
 
@@ -727,6 +732,7 @@ def _compute_leviathan_grads(
     ids: torch.Tensor,
     has_modes: bool,
     seed_grad: torch.Tensor | None = None,
+    mask_token_id: int | None = None,
 ) -> dict[str, torch.Tensor]:
     grads = None
     compact_required = bool(saved.get("compact_spline", False))
@@ -739,6 +745,7 @@ def _compute_leviathan_grads(
                 saved,
                 ids,
                 seed_grad=seed_grad,
+                mask_token_id=mask_token_id,
             )
         except (TypeError, ValueError, AttributeError):
             if compact_required:
@@ -760,6 +767,7 @@ def _compute_leviathan_grads(
             ids=ids,
             chunk=chunk,
             seed_grad=seed_grad,
+            mask_token_id=mask_token_id,
         )
     return grads
 
@@ -830,9 +838,13 @@ def _leviathan_backward_op(
         "rsqrt_por_head": rsqrt,
         "knot_grid": knot_grid,
     }
-    mode_value = int(modes_available.item())
-    if mode_value not in (0, 1, 2):
+    mode_metadata = int(modes_available.item())
+    if mode_metadata < 0:
         raise ValueError("invalid Leviathan checkpoint mode")
+    mode_value = mode_metadata % 3
+    mask_token_id = mode_metadata // 3 - 1
+    if mask_token_id >= vocab_size:
+        raise ValueError("invalid Leviathan checkpoint mask token ID")
     has_modes = mode_value != 0
     saved["compact_spline"] = mode_value == 2
     if has_modes:
@@ -843,11 +855,13 @@ def _leviathan_backward_op(
             grads = _compute_leviathan_grads(
                 grad_out, params, cfg, saved, ids, has_modes,
                 seed_grad=seed_grad,
+                mask_token_id=mask_token_id if mask_token_id >= 0 else None,
             )
     else:
         grads = _compute_leviathan_grads(
             grad_out, params, cfg, saved, ids, has_modes,
             seed_grad=seed_grad,
+            mask_token_id=mask_token_id if mask_token_id >= 0 else None,
         )
     if TORCH_2_14_MEMORY_ANNOTATIONS:
         annotate_tensors("leviathan.backward", **grads)
@@ -1277,7 +1291,14 @@ def leviathan_embedding_compiler_safe(
 
         fallback_params = dict(params)
         fallback_params["knot_grid"] = knot_grid
-        embeds = leviathan_apply(ids, fallback_params, cfg)
+        # The generic autograd wrapper does not know about MEAP. Calculate
+        # only the selected branch safely before applying its mask.
+        if has_meap:
+            embeds, _ = leviathan_forward_ref(
+                ids, fallback_params, cfg, mask_token_id=mask_token_id,
+            )
+        else:
+            embeds = leviathan_apply(ids, fallback_params, cfg)
         if not has_meap:
             return embeds
         return torch.where(

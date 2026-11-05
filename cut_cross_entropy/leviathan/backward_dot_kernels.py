@@ -30,7 +30,7 @@ NORM_EPS = 1e-5
 
 @triton.jit
 def _lev_bwd_chain_dot_kernel(
-    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr,
+    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr, ids_ptr,
     gamma_ptr, beta_ptr, delta_ptr, knot_grid_ptr,
     dxhat_ptr, dzh_ptr, dgamma_partial_ptr, dbeta_partial_ptr, N, NUM_BLOCKS,
     D_SEED: tl.constexpr, KAPPA: tl.constexpr, KAPPA_P: tl.constexpr,
@@ -38,13 +38,15 @@ def _lev_bwd_chain_dot_kernel(
     BLOCK_K: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
     PREMUL_DMM: tl.constexpr, USE_T: tl.constexpr,
-    COMPACT_SPLINE: tl.constexpr,
+    COMPACT_SPLINE: tl.constexpr, HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     m = pid_m
     rows = pid_b * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = rows < N
+    if HAS_MEAP:
+        is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
 
     dcols = tl.arange(0, D_SEED)
     rcols = tl.arange(0, KRANK)
@@ -66,6 +68,8 @@ def _lev_bwd_chain_dot_kernel(
     for dc in tl.range(0, D_SEED, loop_unroll_factor=1):
         xc = tl.load(xhat_ptr + m * (N * D_SEED) + rows * D_SEED + dc,
                      mask=mask, other=0.0).to(tl.float32)     # [BM]
+        if HAS_MEAP:
+            xc = tl.where(is_meap, 0.0, xc)
         gc = tl.load(gamma_ptr + m * D_SEED + dc)
         bc = tl.load(beta_ptr + m * D_SEED + dc)
         if USE_T:
@@ -74,6 +78,8 @@ def _lev_bwd_chain_dot_kernel(
         else:
             tc = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gc + bc)))
         tc = tl.minimum(tl.maximum(tc, 0.0), 1.0)             # [BM]
+        if HAS_MEAP:
+            tc = tl.where(is_meap, 0.5, tc)
         if COMPACT_SPLINE:
             support, b0, b1, b2, b3, db0, _, db2, db3 = _compact_quadratic_geometry(
                 tc, knot_grid_ptr, KAPPA, True,
@@ -99,22 +105,33 @@ def _lev_bwd_chain_dot_kernel(
                          + rcols[None, :],
                          mask=gmask[:, None], other=0.0)
             st = 1.0 + st.to(tl.float32)
-            st_t = tl.trans(st)
             if DOT_IEEE:
                 phi = tl.dot(bgn, st, input_precision="ieee")
             else:
                 phi = tl.dot(bgn, st, input_precision="tf32x3")
+        if HAS_MEAP:
+            phi = tl.where(is_meap[:, None], 1.0, phi)
+            if COMPACT_SPLINE:
+                phi_dt = tl.where(is_meap[:, None], 0.0, phi_dt)
+        # Match torch.sign at zero for the existing epsilon surrogate.
+        sign_phi = tl.where(phi > 0.0, 1.0, tl.where(phi < 0.0, -1.0, 0.0))
         dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
-                * tl.where(phi >= 0, 1.0, -1.0)
+                * sign_phi
                 / (tl.abs(phi) + LOG_EPS))                    # [BM, KRANK]
         if COMPACT_SPLINE:
             # Contract the normalized spline derivative directly with dphi.
             dt = tl.sum(dphi * phi_dt, axis=1)
         else:
+            st_t = tl.trans(st)
             if DOT_IEEE:
                 dB = tl.dot(dphi, st_t, input_precision="ieee")
             else:
                 dB = tl.dot(dphi, st_t, input_precision="tf32x3")
+            # Partition of unity lets us subtract the first knot's dB
+            # without loading another coefficient tile. Constant splines
+            # then cancel exactly, including for very large product modes.
+            anchor = tl.sum(tl.where(gcols_p[None, :] == 0, dB, 0.0), axis=1)
+            dB = dB - anchor[:, None]
             dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
                             tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
             sgn3 = tl.where(tc[:, None] - grid_v[None, :] >= 0, 1.0, -1.0)
@@ -148,6 +165,9 @@ def _lev_bwd_chain_dot_kernel(
     xhat = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
                    + dcols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
     rsqrt = tl.load(rsqrt_ptr + m * N + rows, mask=mask, other=0.0)
+    if HAS_MEAP:
+        xhat = tl.where(is_meap[:, None], 0.0, xhat)
+        rsqrt = tl.where(is_meap, 0.0, rsqrt)
     m1 = tl.sum(dxhat, 1, keep_dims=True) * (1.0 / D_SEED)
     m2 = tl.sum(dxhat * xhat, 1, keep_dims=True) * (1.0 / D_SEED)
     dzh = rsqrt[:, None] * (dxhat - m1 - xhat * m2)
@@ -157,7 +177,7 @@ def _lev_bwd_chain_dot_kernel(
 
 @triton.jit
 def _lev_bwd_ddelta_dot_kernel(
-    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr,
+    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr, ids_ptr,
     gamma_ptr, beta_ptr, delta_ptr, knot_grid_ptr, ddelta_ptr,
     ddelta_partial_ptr,
     dzh_ptr, dgamma_partial_ptr, dbeta_partial_ptr, N, NUM_BLOCKS,
@@ -168,7 +188,7 @@ def _lev_bwd_ddelta_dot_kernel(
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, DOT_IEEE: tl.constexpr,
     FUSE_CHAIN: tl.constexpr, PREMUL_DMM: tl.constexpr,
     USE_T: tl.constexpr, N_SPLITS: tl.constexpr,
-    COMPACT_SPLINE: tl.constexpr,
+    COMPACT_SPLINE: tl.constexpr, HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid_hs = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -203,6 +223,8 @@ def _lev_bwd_ddelta_dot_kernel(
         nb = block_id * BLOCK_M
         rows = nb + tl.arange(0, BLOCK_M)
         mask = rows < N
+        if HAS_MEAP:
+            is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
         block_valid = block_id < NUM_BLOCKS
         # dM and M are invariant across the seed dimensions in this tile.
         # Hoist their loads so the compiler can overlap them with the basis
@@ -219,12 +241,16 @@ def _lev_bwd_ddelta_dot_kernel(
             bcv = tl.load(beta_ptr + m * D_SEED + dc + di)
             xc = tl.load(xhat_ptr + m * (N * D_SEED) + rows * D_SEED
                          + (dc + di), mask=mask, other=0.0).to(tl.float32)
+            if HAS_MEAP:
+                xc = tl.where(is_meap, 0.0, xc)
             if USE_T:
                 tcv = tl.load(t_ptr + m * (N * D_SEED) + rows * D_SEED
                               + (dc + di), mask=mask, other=0.0).to(tl.float32)
             else:
                 tcv = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gcv + bcv)))
             tcv = tl.minimum(tl.maximum(tcv, 0.0), 1.0)
+            if HAS_MEAP:
+                tcv = tl.where(is_meap, 0.5, tcv)
             if COMPACT_SPLINE:
                 support, b0, b1, b2, b3, db0, _, db2, db3 = _compact_quadratic_geometry(
                     tcv, knot_grid_ptr, KAPPA, FUSE_CHAIN,
@@ -260,8 +286,13 @@ def _lev_bwd_ddelta_dot_kernel(
                 M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
                             + rcols[None, :], mask=mask[:, None],
                             other=0.0).to(tl.float32)
+            if HAS_MEAP:
+                phi = tl.where(is_meap[:, None], 1.0, phi)
+                if COMPACT_SPLINE and FUSE_CHAIN:
+                    phi_dt = tl.where(is_meap[:, None], 0.0, phi_dt)
+            sign_phi = tl.where(phi > 0.0, 1.0, tl.where(phi < 0.0, -1.0, 0.0))
             dphi = ((dM.to(tl.float32) if PREMUL_DMM else dM * M)
-                    * tl.where(phi >= 0, 1.0, -1.0)
+                    * sign_phi
                     / (tl.abs(phi) + LOG_EPS))
             if FUSE_CHAIN:
                 # The old chain kernel performed this same dB -> dt -> dy
@@ -275,6 +306,8 @@ def _lev_bwd_ddelta_dot_kernel(
                         dB = tl.dot(dphi, st_t, input_precision="ieee")
                     else:
                         dB = tl.dot(dphi, st_t, input_precision="tf32x3")
+                    anchor = tl.sum(tl.where(gcols_p[None, :] == 0, dB, 0.0), axis=1)
+                    dB = dB - anchor[:, None]
                     dwd3 = tl.where(d3 < 0.5, -2.0 * d3,
                                     tl.where(d3 < 1.5, -(1.5 - d3), 0.0))
                     sgn3 = tl.where(tcv[:, None] - grid_v[None, :] >= 0,
@@ -369,8 +402,9 @@ def _lev_bwd_ddelta_split_reduce_kernel(
 
 @triton.jit
 def _lev_bwd_ln_kernel(
-    xhat_ptr, rsqrt_ptr, dzh_ptr, N,
+    xhat_ptr, rsqrt_ptr, dzh_ptr, ids_ptr, N,
     D_SEED: tl.constexpr, H_: tl.constexpr, BLOCK_M: tl.constexpr,
+    HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     """LayerNorm reduction after fused ddelta writes dxhat into dzh."""
     pid_m = tl.program_id(0)
@@ -385,6 +419,10 @@ def _lev_bwd_ln_kernel(
                     + rows[:, None] * D_SEED + dcols[None, :],
                     mask=mask[:, None], other=0.0)
     rsqrt = tl.load(rsqrt_ptr + pid_m * N + rows, mask=mask, other=0.0)
+    if HAS_MEAP:
+        is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
+        xhat = tl.where(is_meap[:, None], 0.0, xhat)
+        rsqrt = tl.where(is_meap, 0.0, rsqrt)
     m1 = tl.sum(dxhat, 1, keep_dims=True) * (1.0 / D_SEED)
     m2 = tl.sum(dxhat * xhat, 1, keep_dims=True) * (1.0 / D_SEED)
     dzh = rsqrt[:, None] * (dxhat - m1 - xhat * m2)

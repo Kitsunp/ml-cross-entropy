@@ -167,6 +167,7 @@ def _lev_fused_auto(
     VEC: tl.constexpr, SPLINE_BF16: tl.constexpr,
     ROUND_ZH: tl.constexpr, SAVE_XH: tl.constexpr, SAVE_T: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr,
+    HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -263,7 +264,13 @@ def _lev_fused_auto(
             sign_acc ^= tl.sum((phi < 0).to(tl.int32), axis=1) & 1
 
         sgn = 1.0 - 2.0 * (sign_acc & 1).to(tl.float32)
+        if HAS_MEAP:
+            is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
+            # Mask before exp, not after an overflowing discarded product.
+            log_acc = tl.where(is_meap[:, None], 0.0, log_acc)
         modes = (sgn * tl.exp(log_acc)).to(tl.bfloat16)
+        if HAS_MEAP:
+            modes = tl.where(is_meap[:, None], 0.0, modes)
         tl.store(modes_ptr + rows[:, None] * (H_ * KRANK) + m * KRANK
                  + rcols_all[None, :], modes, mask=mask[:, None])
 
@@ -288,6 +295,7 @@ def _lev_fused_dot(
     EPS: tl.constexpr, LOG_EPS: tl.constexpr,
     SPLIT_HEAD: tl.constexpr,
     COMPACT_SPLINE: tl.constexpr,
+    HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_head = tl.program_id(1)
@@ -412,7 +420,12 @@ def _lev_fused_dot(
             sign_acc ^= (phi < 0).to(tl.int32) & 1
 
         sgn = 1.0 - 2.0 * (sign_acc & 1).to(tl.float32)
+        if HAS_MEAP:
+            is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
+            log_acc = tl.where(is_meap[:, None], 0.0, log_acc)
         modes = (sgn * tl.exp(log_acc)).to(tl.bfloat16)
+        if HAS_MEAP:
+            modes = tl.where(is_meap[:, None], 0.0, modes)
         tl.store(modes_ptr + rows[:, None] * (H_ * KRANK) + m * KRANK
                  + rcols_all[None, :], modes, mask=mask[:, None])
 
@@ -742,6 +755,7 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
                 LOG_EPS=LOG_EPS,
                 SPLIT_HEAD=split_head,
                 COMPACT_SPLINE=compact_spline,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 num_warps=cd.num_warps, num_stages=cd.num_stages)
         else:
             _lev_fused_auto.fn[grid_a](
@@ -753,6 +767,7 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
                 VEC=c.kwargs["VEC"], SPLINE_BF16=spline_bf16,
                 ROUND_ZH=ROUND_ZH, SAVE_XH=save_xh, SAVE_T=save_t,
                 EPS=NORM_EPS, LOG_EPS=LOG_EPS,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 num_warps=c.num_warps, num_stages=c.num_stages)
     else:
         _lev_fused_auto[grid_a](
@@ -763,7 +778,8 @@ def leviathan_forward(ids, params, cfg, save_intermediates=False,
             BLOCK_K=block_k, D_CHUNK=D_CHUNK,
             SPLINE_BF16=spline_bf16, ROUND_ZH=ROUND_ZH, SAVE_XH=save_xh,
             SAVE_T=save_t,
-            EPS=NORM_EPS, LOG_EPS=LOG_EPS)
+            EPS=NORM_EPS, LOG_EPS=LOG_EPS,
+            HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel)
 
     # ---- launch kernel B ----
     grid_b = (triton.cdiv(N, _B_CONFIGS[0].kwargs["BLOCK_M"]),

@@ -97,18 +97,21 @@ def _auto_fuse_chain_ddelta(device, kappa: int, krank: int) -> bool:
 @triton.autotune(configs=_BWD_CONFIGS, key=["N"])
 @triton.jit
 def _lev_bwd_chain_kernel(
-    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr,
+    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr, ids_ptr,
     gamma_ptr, beta_ptr, delta_ptr, knot_grid_ptr,
     dxhat_ptr, dzh_ptr, dgamma_partial_ptr, dbeta_partial_ptr, N, NUM_BLOCKS,
     D_SEED: tl.constexpr, KAPPA: tl.constexpr, KRANK: tl.constexpr,
     H_: tl.constexpr, BLOCK_M: tl.constexpr, D_CHUNK: tl.constexpr,
     EPS: tl.constexpr, LOG_EPS: tl.constexpr, USE_T: tl.constexpr,
+    HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     m = pid_m
     rows = pid_b * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = rows < N
+    if HAS_MEAP:
+        is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
 
     dcols = tl.arange(0, D_SEED)
     rcols = tl.arange(0, KRANK)
@@ -122,6 +125,9 @@ def _lev_bwd_chain_kernel(
     xhat = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
                    + dcols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
     rsqrt = tl.load(rsqrt_ptr + m * N + rows, mask=mask, other=0.0)
+    if HAS_MEAP:
+        xhat = tl.where(is_meap[:, None], 0.0, xhat)
+        rsqrt = tl.where(is_meap, 0.0, rsqrt)
     dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK + rcols[None, :],
                  mask=mask[:, None], other=0.0)
     M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK + rcols[None, :],
@@ -132,6 +138,8 @@ def _lev_bwd_chain_kernel(
         ccols = dc + tl.arange(0, D_CHUNK)
         xc = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
                      + ccols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
+        if HAS_MEAP:
+            xc = tl.where(is_meap[:, None], 0.0, xc)
         gc = tl.load(gamma_ptr + m * D_SEED + ccols)
         bc = tl.load(beta_ptr + m * D_SEED + ccols)
         if USE_T:
@@ -140,6 +148,8 @@ def _lev_bwd_chain_kernel(
         else:
             tc = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gc[None, :] + bc[None, :])))
         tc = tl.minimum(tl.maximum(tc, 0.0), 1.0)
+        if HAS_MEAP:
+            tc = tl.where(is_meap[:, None], 0.5, tc)
 
         # vectorized basis over g: d3/w3 (one shot), denom from w3
         grid_v = tl.load(knot_grid_ptr + gcols)                 # [KAPPA]
@@ -160,17 +170,25 @@ def _lev_bwd_chain_kernel(
                          axis=2) / denom
             phi += bgn[:, :, None] * s[None, :, :]
 
-        # dphi (exact derivative of the log|.|+sign implementation)
+        if HAS_MEAP:
+            phi = tl.where(is_meap[:, None, None], 1.0, phi)
+        # PyTorch's abs convention returns zero at phi == 0.
+        sign_phi = tl.where(phi > 0.0, 1.0, tl.where(phi < 0.0, -1.0, 0.0))
         dphi = (dM[:, None, :] * M[:, None, :]
-                * tl.where(phi >= 0, 1.0, -1.0) / (tl.abs(phi) + LOG_EPS))
+                * sign_phi / (tl.abs(phi) + LOG_EPS))
 
         # pass 3: dB tile (per-g where-accumulate over r)
         dB = tl.zeros([BLOCK_M, D_CHUNK, KAPPA], tl.float32)
+        anchor = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
+                         + ccols[:, None] * (KAPPA * KRANK)
+                         + rcols[None, :]).to(tl.float32)
         for g in tl.range(0, KAPPA, loop_unroll_factor=1):
             s = tl.load(delta_ptr + m * (D_SEED * KAPPA * KRANK)
                         + ccols[:, None] * (KAPPA * KRANK) + g * KRANK
                         + rcols[None, :])
-            s = 1.0 + s.to(tl.float32)
+            # Partition of unity permits subtracting a coordinate-independent
+            # coefficient and avoids cancellation for constant splines.
+            s = s.to(tl.float32) - anchor
             dB = tl.where(gcols[None, None, :] == g,
                           tl.sum(dphi * s[None, :, :], axis=2)[:, :, None], dB)
 
@@ -249,12 +267,12 @@ def _lev_bwd_stats_kernel(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _lev_bwd_ddelta_kernel(
-    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr,
+    xhat_ptr, t_ptr, rsqrt_ptr, modes_ptr, dm_ptr, ids_ptr,
     gamma_ptr, beta_ptr, delta_ptr, knot_grid_ptr, ddelta_ptr, N,
     D_SEED: tl.constexpr, KAPPA: tl.constexpr, KRANK: tl.constexpr,
     H_: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr, EPS: tl.constexpr, LOG_EPS: tl.constexpr,
-    USE_T: tl.constexpr,
+    USE_T: tl.constexpr, HAS_MEAP: tl.constexpr, MASK_TOKEN_ID: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -275,8 +293,12 @@ def _lev_bwd_ddelta_kernel(
     for nb in tl.range(0, N, BLOCK_M, loop_unroll_factor=1):
         rows = nb + tl.arange(0, BLOCK_M)
         mask = rows < N
+        if HAS_MEAP:
+            is_meap = tl.load(ids_ptr + rows, mask=mask, other=-1) == MASK_TOKEN_ID
         xc = tl.load(xhat_ptr + m * (N * D_SEED) + rows[:, None] * D_SEED
                      + ccols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
+        if HAS_MEAP:
+            xc = tl.where(is_meap[:, None], 0.0, xc)
         dM = tl.load(dm_ptr + rows[:, None] * hp + m * KRANK + rcols[None, :],
                      mask=mask[:, None], other=0.0)
         M = tl.load(modes_ptr + rows[:, None] * hp + m * KRANK
@@ -288,6 +310,8 @@ def _lev_bwd_ddelta_kernel(
         else:
             tc = 1.0 / (1.0 + tl.exp(-0.5 * (xc * gc[None, :] + bc[None, :])))
         tc = tl.minimum(tl.maximum(tc, 0.0), 1.0)
+        if HAS_MEAP:
+            tc = tl.where(is_meap[:, None], 0.5, tc)
         # pass 1: normalizer D = sum_g w_g
         denom = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
         for g in tl.range(0, KAPPA, loop_unroll_factor=1):
@@ -314,8 +338,11 @@ def _lev_bwd_ddelta_kernel(
                         + rcols[None, :])
             s = 1.0 + s.to(tl.float32)
             phi += bgn[:, :, None] * s[None, :, :]
-        dphi = (dM[:, None, :] * M[:, None, :]
-                * tl.where(phi >= 0, 1.0, -1.0) / (tl.abs(phi) + LOG_EPS))
+        if HAS_MEAP:
+            phi = tl.where(is_meap[:, None, None], 1.0, phi)
+        sign_phi = tl.where(phi > 0.0, 1.0, tl.where(phi < 0.0, -1.0, 0.0))
+        dphi = (dM[:, None, :] * M[:, None, :] * sign_phi
+                / (tl.abs(phi) + LOG_EPS))
         # pass 3: accumulate acc[d,g,r] += sum_n B[n,d,g]*dphi (bgn recompute)
         for g in tl.range(0, KAPPA, loop_unroll_factor=1):
             gv = tl.load(knot_grid_ptr + g + tl.arange(0, 1))
@@ -353,8 +380,19 @@ def supports(cfg, saved) -> bool:
         return False
 
 
+@triton.jit
+def _lev_masked_seed_to_fp32(z_ptr, ids_ptr, out_ptr, N, D: tl.constexpr,
+                              MASK_TOKEN_ID: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < N * D
+    rows = offsets // D
+    token = tl.load(ids_ptr + rows, mask=valid, other=-1)
+    value = tl.load(z_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offsets, tl.where(token == MASK_TOKEN_ID, 0.0, value), mask=valid)
+
+
 def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
-                              seed_grad=None):
+                              seed_grad=None, mask_token_id=None):
     """Grads dict with the same keys as params (Triton chain + cuBLAS GEMMs).
 
     Returns None when the config is unsupported (caller falls back to the
@@ -378,6 +416,12 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
     krank = cfg.generator_krank
     h = cfg.generator_num_modes
     D = cfg.hidden_size
+    has_meap = mask_token_id is not None and int(mask_token_id) >= 0
+    mask_token_id_kernel = int(mask_token_id) if has_meap else -1
+    if has_meap:
+        # Forward accepts noncontiguous token tensors; the fused masks index
+        # their flattened rows and must see the same logical order.
+        ids = ids.reshape(-1).contiguous()
 
     C = params["codebooks"]
     Wp = params["head_proj_weight"]
@@ -541,7 +585,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
             dbeta_partial = torch.empty_like(dgamma_partial)
             grid3 = (h * ddelta_splits, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
-                xhat_c, t_c, rsqrt_c, M_c, dM,
+                xhat_c, t_c, rsqrt_c, M_c, dM, ids,
                 gamma.contiguous(), beta.contiguous(), delta.contiguous(),
                 knot_grid, ddelta, ddelta_partial, dzh,
                 dgamma_partial, dbeta_partial,
@@ -552,6 +596,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=True, PREMUL_DMM=premul_dmm, USE_T=use_t,
                 N_SPLITS=ddelta_splits, COMPACT_SPLINE=compact_spline,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 **ddelta_launch_kwargs)
             if ddelta_splits > 1:
                 bdk._lev_bwd_ddelta_split_reduce_kernel[
@@ -565,8 +610,9 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 )
             grid_ln = (h, num_blocks)
             bdk._lev_bwd_ln_kernel[grid_ln](
-                xhat_c, rsqrt_c, dzh, N,
+                xhat_c, rsqrt_c, dzh, ids, N,
                 D_SEED=d, H_=h, BLOCK_M=block_m,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 num_warps=4, num_stages=1)
             grid2 = (h, d // 32)
             _lev_bwd_stats_kernel[grid2](
@@ -579,7 +625,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
             dbeta_partial = torch.empty_like(dgamma_partial)
             grid1 = (h, num_blocks)
             bdk._lev_bwd_chain_dot_kernel[grid1](
-                xhat_c, t_c, rsqrt_c, M_c, dM,
+                xhat_c, t_c, rsqrt_c, M_c, dM, ids,
                 gamma.contiguous(), beta.contiguous(), delta.contiguous(),
                 knot_grid, dzh, dzh, dgamma_partial, dbeta_partial,
                 N, num_blocks,
@@ -588,10 +634,11 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee, USE_T=use_t,
                 PREMUL_DMM=premul_dmm,
                 COMPACT_SPLINE=compact_spline,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 num_warps=4, num_stages=1)
             grid3 = (h * ddelta_splits, d // block_d, krank // block_r)
             bdk._lev_bwd_ddelta_dot_kernel[grid3](
-                xhat_c, t_c, rsqrt_c, M_c, dM,
+                xhat_c, t_c, rsqrt_c, M_c, dM, ids,
                 gamma.contiguous(), beta.contiguous(), delta.contiguous(),
                 knot_grid, ddelta, ddelta_partial, dzh,
                 dgamma_partial, dbeta_partial,
@@ -602,6 +649,7 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
                 EPS=NORM_EPS, LOG_EPS=EPS_LOG, DOT_IEEE=dot_ieee,
                 FUSE_CHAIN=False, PREMUL_DMM=premul_dmm, USE_T=use_t,
                 N_SPLITS=ddelta_splits, COMPACT_SPLINE=compact_spline,
+                HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
                 **ddelta_launch_kwargs)
             if ddelta_splits > 1:
                 bdk._lev_bwd_ddelta_split_reduce_kernel[
@@ -628,11 +676,12 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
         dbeta_partial = torch.empty_like(dgamma_partial)
         grid1 = (h, num_blocks)
         _lev_bwd_chain_kernel.fn[grid1](
-            xhat_c, t_c, rsqrt_c, M_c, dM,
+            xhat_c, t_c, rsqrt_c, M_c, dM, ids,
             gamma.contiguous(), beta.contiguous(), delta.contiguous(), knot_grid,
             dzh, dzh, dgamma_partial, dbeta_partial, N, num_blocks,
             D_SEED=d, KAPPA=kappa, KRANK=krank, H_=h,
             D_CHUNK=8, EPS=NORM_EPS, LOG_EPS=EPS_LOG, USE_T=use_t,
+            HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel,
             BLOCK_M=c1.kwargs["BLOCK_M"],
             num_warps=c1.num_warps, num_stages=c1.num_stages)
 
@@ -647,12 +696,13 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
         block_r = min(32, krank)
         grid3 = (h, d // 8, krank // block_r)
         _lev_bwd_ddelta_kernel[grid3](
-            xhat_c, t_c, rsqrt_c, M_c, dM,
+            xhat_c, t_c, rsqrt_c, M_c, dM, ids,
             gamma.contiguous(), beta.contiguous(), delta.contiguous(), knot_grid,
             ddelta, N,
             D_SEED=d, KAPPA=kappa, KRANK=krank, H_=h,
             BLOCK_M=16, BLOCK_D=8, BLOCK_R=block_r,
-            EPS=NORM_EPS, LOG_EPS=EPS_LOG, USE_T=use_t)
+            EPS=NORM_EPS, LOG_EPS=EPS_LOG, USE_T=use_t,
+            HAS_MEAP=has_meap, MASK_TOKEN_ID=mask_token_id_kernel)
 
     # The partial statistics are fully reduced now; release them before the
     # remaining parameter reductions so they cannot inflate the live peak.
@@ -667,7 +717,14 @@ def leviathan_backward_triton(grad_out, params, cfg, saved, ids,
 
     # ---- GEMM reductions (cuBLAS) ----
     Wf = Wp.float()                         # [h, d, d]
-    zf = z.float()                          # [N, d]
+    if has_meap:
+        # Preserve the original seed for JTok, but exclude discarded MEAP
+        # rows from dWp before any 0 * inf can enter the contraction.
+        zf = torch.empty((N, d), dtype=torch.float32, device=dev)
+        _lev_masked_seed_to_fp32[(triton.cdiv(N * d, 1024),)](
+            z, ids, zf, N, D=d, MASK_TOKEN_ID=mask_token_id_kernel, BLOCK=1024)
+    else:
+        zf = z.float()                      # [N, d]
     dWp = torch.einsum("hnd,ni->hdi", dzh, zf)      # [h, d, d]
     dz = torch.einsum("hnd,hdi->ni", dzh, Wf)       # [N, d]
     if seed_grad is not None and seed_grad.numel() != 0:

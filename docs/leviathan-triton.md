@@ -44,6 +44,28 @@ geometries retain the deterministic scalar kernels. No public API flag or
 global `torch.compile` setting is added. `LEV_DOT=0/1` remains a
 developer-only A/B override.
 
+### MEAP isolation and backward numerics
+
+The MEAP embedding replaces the LEV output for its reserved token ID. LEV
+therefore stores a zero product mode for that row, with the exponent input
+masked before `exp`; invalid values in a discarded row cannot reach the output
+projection's weight-gradient GEMM. Backward also neutralizes that row's
+recomputed spline factor, layer-normalization intermediates, and seed used by
+the projection-gradient GEMM. The shared seed itself remains unchanged for
+JTok/JTok-M, including its separate incoming gradient. The MEAP embedding
+continues to receive its own gradient. The reference MEAP path applies the
+same exclusion before evaluating the tensor product.
+
+The dense spline backward subtracts the first knot's contracted gradient
+before applying the normalized-basis derivative. Partition of unity makes
+this algebraically equivalent for valid coordinates, while a constant spline
+now gives an exact zero coordinate derivative in finite arithmetic. The
+implementation's existing sign/parity product includes an epsilon in each
+factor: at a factor of exactly zero the Triton backward follows PyTorch's
+`abs` gradient convention and returns zero for that factor. This convention is
+not the derivative of an exact product at its zero and does not introduce a
+bound on the modes. Large *unmasked* products can still grow or overflow.
+
 For long-token workloads the fused backward uses `BLOCK_M=128`,
 `BLOCK_D=1`, `BLOCK_R=64`, four warps, and one software stage. Short inputs
 keep `BLOCK_M=32`. The forward dot kernel uses BM32/w4/s1 with a split-head

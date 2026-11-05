@@ -189,6 +189,8 @@ def leviathan_forward_ref(
     cfg: Any,
     save_intermediates: bool = False,
     save_full: bool = False,
+    *,
+    mask_token_id: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
     """Forward LEV sobre dict de params -> (embeds [*ids.shape, D], saved).
 
@@ -224,6 +226,10 @@ def leviathan_forward_ref(
     z = torch.zeros(N, d_seed, dtype=target_dtype, device=ids.device)
     for r in range(k):
         z = z + C[r][coords[:, r]]
+    # Keep z itself available for the shared JTok geometry; the discarded LEV
+    # branch must not multiply a masked seed containing an infinity by zero.
+    is_meap = ids_l.eq(mask_token_id) if mask_token_id is not None else None
+    z_lev = torch.where(is_meap[:, None], 0.0, z) if is_meap is not None else z
 
     saved: Optional[Dict[str, Any]] = None
     knot_grid = params.get("knot_grid")
@@ -249,7 +255,7 @@ def leviathan_forward_ref(
         W_l, gamma_l, beta_l, delta_l, Wout_l = Wp[l], gamma[l], beta[l], delta[l], Wout[l]
 
         # Stage 2: proyección seed + LayerNorm + sigmoid(x/2)
-        zh = F.linear(z.to(W_l.dtype), W_l)  # matmul en dtype de W (referencia)
+        zh = F.linear(z_lev.to(W_l.dtype), W_l)  # matmul en dtype de W (referencia)
         zh = _promote(zh)                    # .float() de la referencia (fp64 si procede)
         mean = zh.mean(dim=-1, keepdim=True)
         var = zh.var(dim=-1, keepdim=True, unbiased=False)
@@ -261,6 +267,10 @@ def leviathan_forward_ref(
         B, _, _, _ = _bspline(t, cfg, knot_grid)
         S = 1.0 + _promote(delta_l)
         phi = torch.einsum("ndg,dgr->ndr", B, S)
+        if is_meap is not None:
+            # A neutral product avoids exp(inf) in a branch later discarded
+            # by MEAP. Masking the final embedding alone is too late.
+            phi = torch.where(is_meap[:, None, None], 1.0, phi)
         M = _sign_parity_product(phi)
 
         # Stage 4: salida (matmul en dtype de W_out, como la referencia)
@@ -345,6 +355,7 @@ def _head_backward(
     chunk: Optional[int],
     wd: torch.dtype,
     knot_grid: Optional[torch.Tensor],
+    is_meap: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gradientes de la head l. Devuelve (dS, dW_l, dgamma_l, dbeta_l, dWout_l, dz_l).
 
@@ -369,6 +380,9 @@ def _head_backward(
 
     # (x_hat, mean, rsqrt): guardados o recomputados
     x_hat, _, rsqrt = _get_xhat(z, W_l, cfg, sh, wd)
+    if is_meap is not None:
+        x_hat = torch.where(is_meap[:, None], 0.0, x_hat)
+        rsqrt = torch.where(is_meap[:, None], 0.0, rsqrt)
     t = torch.sigmoid((x_hat * gamma_wd + beta_wd) / 2.0).clamp(0.0, 1.0)
 
     # B/phi guardados (modo fat/debug) o None -> recomputar; M siempre se
@@ -404,6 +418,8 @@ def _head_backward(
             phi_c = _to_wd(phi_saved[s:e], wd)
         else:
             phi_c = torch.einsum("ndg,dgr->ndr", B_c, S_l)
+        if is_meap is not None:
+            phi_c = torch.where(is_meap[s:e, None, None], 1.0, phi_c)
         # Recompute M from the fp32 phi chain.  The Triton forward stores M in
         # bf16 to keep the saved state lean; reusing that rounded tensor here
         # amplifies error in dphi when sign-parity stress makes |M| large.
@@ -454,6 +470,7 @@ def leviathan_backward(
     ids: Optional[torch.Tensor] = None,
     chunk: Optional[int] = None,
     seed_grad: Optional[torch.Tensor] = None,
+    mask_token_id: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Gradientes de todos los parámetros LEV respecto a grad_out [..., D].
 
@@ -493,17 +510,28 @@ def leviathan_backward(
     G = grad_out.reshape(-1, D)
     G = _to_wd(G, wd)
     N = G.shape[0]
+    if mask_token_id is not None:
+        if ids is None:
+            raise ValueError("mask_token_id requires ids")
+        is_meap = ids.reshape(-1).eq(mask_token_id)
+        G = torch.where(is_meap[:, None], 0.0, G)
+    else:
+        is_meap = None
 
     if saved is None:
         if ids is None:
             raise ValueError(
                 "leviathan_backward: saved=None requiere `ids` para recomputar el forward"
             )
-        _, saved = leviathan_forward_ref(ids, params, cfg, save_intermediates=True)
+        _, saved = leviathan_forward_ref(
+            ids, params, cfg, save_intermediates=True, mask_token_id=mask_token_id,
+        )
     if not isinstance(saved, dict):
         raise TypeError("leviathan_backward: `saved` debe ser un dict o None")
 
     z = _to_wd(saved["z"], wd)
+    if is_meap is not None:
+        z = torch.where(is_meap[:, None], 0.0, z)
     coords = saved.get("coords")
     if coords is None:
         if ids is None:
@@ -543,7 +571,7 @@ def leviathan_backward(
 
     for l in range(h):
         dS_l, dW_l, dg_l, db_l, dWo_l, dz_l = _head_backward(
-            l, G, params, cfg, z, shs[l], chunk, wd, knot_grid
+            l, G, params, cfg, z, shs[l], chunk, wd, knot_grid, is_meap
         )
         ddelta[l] = dS_l
         dWp[l] = dW_l
