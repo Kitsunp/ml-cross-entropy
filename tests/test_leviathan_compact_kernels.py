@@ -151,10 +151,12 @@ def test_compact_compiled_seed_backward_keeps_forward_choice_and_fp32_scatter(mo
     visited = []
     original = compiler._compute_leviathan_grads
 
-    def checked(grad_out, params, cfg, saved, ids, has_modes, seed_grad=None):
+    def checked(grad_out, params, cfg, saved, ids, has_modes, seed_grad=None,
+                mask_token_id=None):
         assert saved["compact_spline"] is True
         visited.append(True)
-        return original(grad_out, params, cfg, saved, ids, has_modes, seed_grad)
+        return original(grad_out, params, cfg, saved, ids, has_modes,
+                        seed_grad, mask_token_id)
 
     monkeypatch.setattr(compiler, "_compute_leviathan_grads", checked)
     # The backward must use the forward's mode flag, even when the process
